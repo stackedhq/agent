@@ -7,7 +7,7 @@ The Stacked agent runs on your VPS and manages deployments, containers, and reve
 The agent is a single static binary that runs as a systemd service. It:
 
 - **Polls** the Stacked API every 5s for pending operations (deploy, stop, restart, etc.)
-- **Sends heartbeats** every 30s with CPU, memory, and disk metrics
+- **Sends heartbeats** every 10s with CPU, memory, and disk metrics
 - **Manages Docker Compose** services per deployment
 - **Manages Caddy** as a reverse proxy for automatic HTTPS
 - **Streams logs** back to the Stacked dashboard in real-time
@@ -57,6 +57,7 @@ Get your token from the Stacked dashboard under **Machines → Add Machine**.
 | `restart` | `docker compose restart` |
 | `setup` | Verify Docker, create network, start Caddy |
 | `proxy_config` | Regenerate Caddyfile, reload Caddy |
+| `self_update` | Download new binary, replace, restart |
 
 ## Managing the service
 
@@ -88,4 +89,4 @@ make build
 
 ## License
 
-MIT
+[BSL 1.1](LICENSE) — source available, not open source. Converts to Apache 2.0 on 2030-03-29.
