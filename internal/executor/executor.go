@@ -46,6 +46,8 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.Setup(op)
 	case "proxy_config":
 		err = e.ProxyConfig(op)
+	case "self_update":
+		err = e.SelfUpdate(op)
 	default:
 		err = fmt.Errorf("unknown operation type: %s", op.Type)
 	}
