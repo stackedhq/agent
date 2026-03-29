@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"log"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,6 +14,22 @@ import (
 )
 
 const Version = "0.1.0"
+
+// systemInfo holds static machine info collected once at startup.
+type systemInfo struct {
+	CPUCores int
+	MemoryMb int
+	DiskGb   int
+	OS       string
+	Arch     string
+	Hostname string
+}
+
+var sysInfo systemInfo
+
+func init() {
+	sysInfo = collectSystemInfo()
+}
 
 // Loop sends heartbeats at the given interval until the stop channel is closed.
 func Loop(c *client.Client, interval time.Duration, stop <-chan struct{}) {
@@ -42,11 +59,67 @@ func send(c *client.Client) {
 		CPUUsage:     cpu,
 		MemoryUsage:  mem,
 		DiskUsage:    disk,
+		CPUCores:     sysInfo.CPUCores,
+		MemoryMb:     sysInfo.MemoryMb,
+		DiskGb:       sysInfo.DiskGb,
+		OS:           sysInfo.OS,
+		Arch:         sysInfo.Arch,
+		Hostname:     sysInfo.Hostname,
 	}
 
 	if err := c.Heartbeat(req); err != nil {
 		log.Printf("Heartbeat failed: %v", err)
 	}
+}
+
+func collectSystemInfo() systemInfo {
+	info := systemInfo{
+		CPUCores: runtime.NumCPU(),
+		Arch:     runtime.GOARCH,
+	}
+
+	// Hostname
+	if h, err := os.Hostname(); err == nil {
+		info.Hostname = h
+	}
+
+	// Total memory from /proc/meminfo (MemTotal in kB)
+	if f, err := os.Open("/proc/meminfo"); err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "MemTotal:") {
+				kB := parseMemInfoValue(line)
+				info.MemoryMb = int(kB / 1024)
+				break
+			}
+		}
+		f.Close()
+	}
+
+	// Total disk from statfs
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs("/", &stat); err == nil {
+		totalBytes := stat.Blocks * uint64(stat.Bsize)
+		info.DiskGb = int(totalBytes / (1024 * 1024 * 1024))
+	}
+
+	// OS from /etc/os-release
+	if f, err := os.Open("/etc/os-release"); err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "PRETTY_NAME=") {
+				val := strings.TrimPrefix(line, "PRETTY_NAME=")
+				val = strings.Trim(val, "\"")
+				info.OS = val
+				break
+			}
+		}
+		f.Close()
+	}
+
+	return info
 }
 
 // cpuUsage reads /proc/stat and computes a rough CPU usage percentage.

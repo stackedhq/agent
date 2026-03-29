@@ -28,11 +28,17 @@ func New(server, token string) *Client {
 // --- Request types ---
 
 type HeartbeatRequest struct {
-	AgentVersion string              `json:"agentVersion"`
-	CPUUsage     float64             `json:"cpuUsage,omitempty"`
-	MemoryUsage  float64             `json:"memoryUsage,omitempty"`
-	DiskUsage    float64             `json:"diskUsage,omitempty"`
-	Containers   []ContainerStatus   `json:"containers,omitempty"`
+	AgentVersion string            `json:"agentVersion"`
+	CPUUsage     float64           `json:"cpuUsage,omitempty"`
+	MemoryUsage  float64           `json:"memoryUsage,omitempty"`
+	DiskUsage    float64           `json:"diskUsage,omitempty"`
+	CPUCores     int               `json:"cpuCores,omitempty"`
+	MemoryMb     int               `json:"memoryMb,omitempty"`
+	DiskGb       int               `json:"diskGb,omitempty"`
+	OS           string            `json:"os,omitempty"`
+	Arch         string            `json:"arch,omitempty"`
+	Hostname     string            `json:"hostname,omitempty"`
+	Containers   []ContainerStatus `json:"containers,omitempty"`
 }
 
 type ContainerStatus struct {
