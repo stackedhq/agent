@@ -16,7 +16,7 @@ import (
 
 const (
 	pollInterval      = 5 * time.Second
-	heartbeatInterval = 30 * time.Second
+	heartbeatInterval = 10 * time.Second
 )
 
 func main() {
