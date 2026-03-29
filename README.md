@@ -89,4 +89,4 @@ make build
 
 ## License
 
-[BSL 1.1](LICENSE) — source available, not open source. Converts to Apache 2.0 on 2030-03-29.
+[BSL 1.1](LICENSE) — source available, not open source.
