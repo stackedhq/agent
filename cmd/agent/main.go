@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -20,6 +21,11 @@ const (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		fmt.Println(heartbeat.Version)
+		return
+	}
+
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 	log.Println("Starting Stacked agent...")
 
