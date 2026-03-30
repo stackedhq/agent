@@ -73,6 +73,16 @@ type OperationsResponse struct {
 	Data []Operation `json:"data"`
 }
 
+type Credentials struct {
+	GitCloneUrl   string            `json:"gitCloneUrl"`
+	RegistryToken string            `json:"registryToken"`
+	EnvVars       map[string]string `json:"envVars"`
+}
+
+type CredentialsResponse struct {
+	Data Credentials `json:"data"`
+}
+
 // --- API methods ---
 
 func (c *Client) Heartbeat(req *HeartbeatRequest) error {
@@ -101,6 +111,19 @@ func (c *Client) UpdateStatus(operationID string, update *StatusUpdate) error {
 func (c *Client) SendLogs(operationID string, lines []string) error {
 	_, err := c.doJSON("POST", "/api/agent/operations/"+operationID+"/logs", &LogBatch{Lines: lines})
 	return err
+}
+
+func (c *Client) GetCredentials(serviceID string) (*Credentials, error) {
+	body, err := c.doJSON("GET", "/api/agent/credentials/"+serviceID, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp CredentialsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to decode credentials: %w", err)
+	}
+	return &resp.Data, nil
 }
 
 // --- HTTP helpers ---

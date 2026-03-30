@@ -13,7 +13,7 @@ import (
 	"github.com/stackedapp/stacked/agent/internal/client"
 )
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // systemInfo holds static machine info collected once at startup.
 type systemInfo struct {

@@ -4,21 +4,23 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 )
 
 func (e *Executor) Deploy(op client.Operation) error {
 	serviceID := getStringPayload(op.Payload, "serviceId")
-	gitRepo := getStringPayload(op.Payload, "gitRepo")
 	gitBranch := getStringPayload(op.Payload, "gitBranch")
 	commitSha := getStringPayload(op.Payload, "commitSha")
 	buildCommand := getStringPayload(op.Payload, "buildCommand")
 	startCommand := getStringPayload(op.Payload, "startCommand")
 
-	if serviceID == "" || gitRepo == "" {
-		return fmt.Errorf("deploy requires serviceId and gitRepo in payload")
+	if serviceID == "" {
+		return fmt.Errorf("deploy requires serviceId in payload")
 	}
 	if gitBranch == "" {
 		gitBranch = "main"
@@ -31,14 +33,58 @@ func (e *Executor) Deploy(op client.Operation) error {
 		return fmt.Errorf("create service dir: %w", err)
 	}
 
+	// Request fresh credentials from the server (short-lived token, env vars)
+	creds, err := e.Client.GetCredentials(serviceID)
+	if err != nil {
+		return fmt.Errorf("get credentials: %w", err)
+	}
+
+	gitRepo := creds.GitCloneUrl
+	if gitRepo == "" {
+		// Fallback to payload if credentials endpoint didn't return a URL
+		gitRepo = getStringPayload(op.Payload, "gitRepo")
+		if gitRepo == "" {
+			return fmt.Errorf("no git clone URL available")
+		}
+	}
+
+	// Authenticate with GHCR if a registry token was provided
+	if creds.RegistryToken != "" {
+		log.Printf("Logging in to ghcr.io for %s", serviceID)
+		cmd := exec.Command("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
+		cmd.Stdin = strings.NewReader(creds.RegistryToken)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("GHCR login failed (non-fatal): %s", string(out))
+		}
+	}
+
+	// Write .env file from server-managed env vars
+	if len(creds.EnvVars) > 0 {
+		envContent := buildEnvFile(creds.EnvVars)
+		envPath := filepath.Join(dir, ".env")
+		if err := writeFile(envPath, envContent); err != nil {
+			return fmt.Errorf("write .env: %w", err)
+		}
+	} else {
+		// Ensure .env exists (docker compose requires it with env_file directive)
+		envPath := filepath.Join(dir, ".env")
+		if _, err := os.Stat(envPath); os.IsNotExist(err) {
+			if err := writeFile(envPath, ""); err != nil {
+				return fmt.Errorf("write .env: %w", err)
+			}
+		}
+	}
+
 	// Clone or pull
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(err) {
-		log.Printf("Cloning %s into %s", gitRepo, repoDir)
+		log.Printf("Cloning into %s", repoDir)
 		if err := e.runCommand(op.ID, dir, "git", "clone", "--branch", gitBranch, "--single-branch", gitRepo, "repo"); err != nil {
 			return fmt.Errorf("git clone: %w", err)
 		}
 	} else {
 		log.Printf("Pulling latest for %s", serviceID)
+		// Update remote URL in case credentials changed
+		_, _ = runCommandSilent(repoDir, "git", "remote", "set-url", "origin", gitRepo)
 		if err := e.runCommand(op.ID, repoDir, "git", "fetch", "origin"); err != nil {
 			return fmt.Errorf("git fetch: %w", err)
 		}
@@ -69,6 +115,30 @@ func (e *Executor) Deploy(op client.Operation) error {
 
 	log.Printf("Deploy complete for %s", serviceID)
 	return nil
+}
+
+// buildEnvFile creates a .env file content from a key-value map.
+// Keys are sorted for deterministic output.
+func buildEnvFile(vars map[string]string) string {
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		// Quote values that contain spaces, newlines, or special chars
+		v := vars[k]
+		if strings.ContainsAny(v, " \t\n\"'$`\\#") {
+			v = "\"" + strings.ReplaceAll(strings.ReplaceAll(v, "\\", "\\\\"), "\"", "\\\"") + "\""
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(v)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 func generateCompose(serviceID, buildCommand, startCommand string) string {
