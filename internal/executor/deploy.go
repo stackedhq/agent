@@ -100,16 +100,35 @@ func (e *Executor) Deploy(op client.Operation) error {
 		}
 	}
 
-	// Generate docker-compose.yml
-	compose := generateCompose(serviceID, buildCommand, startCommand)
+	// Build image with Nixpacks
+	imageName := "stacked-" + serviceID
+	log.Printf("Building image with Nixpacks for %s", serviceID)
+
+	nixpacksArgs := []string{"build", repoDir, "--name", imageName}
+	if buildCommand != "" {
+		nixpacksArgs = append(nixpacksArgs, "--build-cmd", buildCommand)
+	}
+	if startCommand != "" {
+		nixpacksArgs = append(nixpacksArgs, "--start-cmd", startCommand)
+	}
+	for k, v := range creds.EnvVars {
+		nixpacksArgs = append(nixpacksArgs, "--env", k+"="+v)
+	}
+
+	if err := e.runCommand(op.ID, dir, "nixpacks", nixpacksArgs...); err != nil {
+		return fmt.Errorf("nixpacks build: %w", err)
+	}
+
+	// Generate docker-compose.yml using the built image
+	compose := generateCompose(serviceID, imageName)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return fmt.Errorf("write docker-compose.yml: %w", err)
 	}
 
-	// Build and start
-	log.Printf("Running docker compose up for %s", serviceID)
-	if err := e.runCommand(op.ID, dir, "docker", "compose", "up", "-d", "--build", "--remove-orphans"); err != nil {
+	// Start container
+	log.Printf("Starting container for %s", serviceID)
+	if err := e.runCommand(op.ID, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
 		return fmt.Errorf("docker compose up: %w", err)
 	}
 
@@ -141,22 +160,11 @@ func buildEnvFile(vars map[string]string) string {
 	return b.String()
 }
 
-func generateCompose(serviceID, buildCommand, startCommand string) string {
-	compose := fmt.Sprintf(`services:
+func generateCompose(serviceID, imageName string) string {
+	return fmt.Sprintf(`services:
   %s:
-    build:
-      context: ./repo
-`, serviceID)
-
-	if buildCommand != "" {
-		compose += fmt.Sprintf("      args:\n        BUILD_COMMAND: %q\n", buildCommand)
-	}
-
-	if startCommand != "" {
-		compose += fmt.Sprintf("    command: %s\n", startCommand)
-	}
-
-	compose += fmt.Sprintf(`    restart: unless-stopped
+    image: %s
+    restart: unless-stopped
     env_file:
       - .env
     networks:
@@ -166,6 +174,5 @@ networks:
   stacked:
     name: stacked
     external: true
-`)
-	return compose
+`, serviceID, imageName)
 }
