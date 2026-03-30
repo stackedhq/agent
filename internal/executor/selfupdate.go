@@ -50,17 +50,15 @@ func (e *Executor) SelfUpdate(op client.Operation) error {
 		return fmt.Errorf("replace binary: %w", err)
 	}
 
-	log.Printf("Agent binary replaced, restarting via systemd...")
+	log.Printf("Agent binary replaced, exiting so systemd restarts with new binary...")
 
-	// Report success before restarting — the restart will kill this process
+	// Report success before exiting — systemd Restart=always will start the new binary
 	_ = e.Client.UpdateStatus(op.ID, &client.StatusUpdate{Status: "success"})
 
-	// Restart the service — systemd will start the new binary
-	if out, err := runCommandSilent("", "sudo", "systemctl", "restart", "stacked-agent"); err != nil {
-		return fmt.Errorf("restart service: %s: %w", out, err)
-	}
+	// Exit cleanly — systemd will restart us with the new binary
+	os.Exit(0)
 
-	// Won't reach here if restart succeeds (process gets killed)
+	// Won't reach here
 	return nil
 }
 
