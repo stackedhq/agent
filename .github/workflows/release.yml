@@ -51,11 +51,26 @@ jobs:
       - name: Build binaries
         run: make build
 
+      - name: Generate release notes
+        id: notes
+        run: |
+          # Get previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1)
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s" HEAD)
+          else
+            COMMITS=$(git log --pretty=format:"- %s" "${PREV_TAG}..HEAD")
+          fi
+          # Write to file to preserve newlines
+          echo "$COMMITS" > /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ github.ref_name }}" >> /tmp/release-notes.md
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: /tmp/release-notes.md
           files: |
             dist/stacked-agent-linux-amd64
             dist/stacked-agent-linux-arm64
