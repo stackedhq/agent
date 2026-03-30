@@ -37,9 +37,18 @@ func (s *Streamer) SetProgress(p int) {
 	s.mu.Unlock()
 }
 
-// AddLine injects a synthetic log line (e.g. phase markers) into the buffer.
+// AddLine injects a synthetic log line into the buffer.
 func (s *Streamer) AddLine(msg string) {
 	line := "[" + time.Now().UTC().Format("15:04:05") + "] " + msg
+	s.mu.Lock()
+	s.buffer = append(s.buffer, line)
+	s.mu.Unlock()
+}
+
+// AddPhase injects a phase marker line (e.g. "Cloning repository...") that the
+// dashboard can highlight differently from regular command output.
+func (s *Streamer) AddPhase(msg string) {
+	line := "[" + time.Now().UTC().Format("15:04:05") + "] @@PHASE@@" + msg
 	s.mu.Lock()
 	s.buffer = append(s.buffer, line)
 	s.mu.Unlock()

@@ -110,7 +110,11 @@ func (c *Client) UpdateStatus(operationID string, update *StatusUpdate) error {
 }
 
 func (c *Client) SendLogs(operationID string, lines []string, progress *int) error {
-	_, err := c.doJSON("POST", "/api/agent/operations/"+operationID+"/logs", &LogBatch{Lines: lines, Progress: progress})
+	data, err := json.Marshal(&LogBatch{Lines: lines, Progress: progress})
+	if err != nil {
+		return fmt.Errorf("failed to marshal log batch: %w", err)
+	}
+	_, err = c.doRequest("POST", "/api/agent/operations/"+operationID+"/logs", bytes.NewReader(data))
 	return err
 }
 
