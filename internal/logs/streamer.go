@@ -51,7 +51,7 @@ func (s *Streamer) Stream(r io.Reader) {
 	}()
 
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := "[" + time.Now().UTC().Format("15:04:05") + "] " + scanner.Text()
 		s.mu.Lock()
 		s.buffer = append(s.buffer, line)
 		shouldFlush := len(s.buffer) >= maxBatchSize
