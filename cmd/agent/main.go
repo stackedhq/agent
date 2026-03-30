@@ -27,7 +27,7 @@ func main() {
 	}
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-	log.Println("Starting Stacked agent...")
+	log.Printf("Starting Stacked agent v%s", heartbeat.Version)
 
 	cfg, err := config.Load()
 	if err != nil {

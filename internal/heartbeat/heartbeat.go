@@ -13,7 +13,8 @@ import (
 	"github.com/stackedapp/stacked/agent/internal/client"
 )
 
-const Version = "0.5.0"
+// Version is set at build time via ldflags. Defaults to "dev" for local builds.
+var Version = "dev"
 
 // systemInfo holds static machine info collected once at startup.
 type systemInfo struct {

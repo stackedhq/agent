@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 )
@@ -63,7 +64,8 @@ func (e *Executor) SelfUpdate(op client.Operation) error {
 }
 
 func downloadFile(dest, url string) error {
-	resp, err := http.Get(url)
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}
