@@ -46,6 +46,8 @@ git push origin main v0.6.2
 
 Use **patch** version bumps (v0.6.x) unless there's a breaking change.
 
+If the release requires changes to `install.sh` (new system deps, config changes, etc.), include `REQUIRES-REINSTALL` in the GitHub release notes body. The dashboard checks for this keyword and shows a manual reinstall banner instead of the auto-update button.
+
 ## Development Guidelines
 
 - Use `pnpm` / `bun` only in the server repo — this is pure Go

@@ -75,6 +75,17 @@ sudo systemctl stop stacked-agent
 systemctl status stacked-agent
 ```
 
+## Releasing
+
+Tag and push — GitHub Actions builds binaries and creates a release:
+
+```bash
+git tag v0.6.5
+git push origin main --tags
+```
+
+If a release adds new system dependencies or changes `install.sh`, include `REQUIRES-REINSTALL` in the release notes. The dashboard will show users a manual reinstall command instead of the auto-update button.
+
 ## Building from source
 
 Requires Go 1.23+.
