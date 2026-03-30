@@ -38,7 +38,7 @@ func (e *Executor) Deploy(op client.Operation) error {
 
 	// Phase: Fetching credentials (0%)
 	streamer.SetProgress(0)
-	streamer.AddPhase("Fetching credentials...")
+	streamer.AddLine("Fetching credentials...")
 	streamer.Flush()
 
 	creds, err := e.Client.GetCredentials(serviceID)
@@ -47,7 +47,7 @@ func (e *Executor) Deploy(op client.Operation) error {
 	}
 
 	streamer.SetProgress(2)
-	streamer.AddPhase("Credentials received")
+	streamer.AddLine("Credentials received")
 	streamer.Flush()
 
 	// Authenticate with GHCR if a registry token was provided
@@ -83,7 +83,7 @@ func (e *Executor) Deploy(op client.Operation) error {
 		// Docker image mode: pull the pre-built image
 		imageName = dockerImage
 		streamer.SetProgress(2)
-		streamer.AddPhase("Pulling Docker image " + imageName + "...")
+		streamer.AddLine("Pulling Docker image " + imageName + "...")
 		streamer.Flush()
 
 		log.Printf("Pulling Docker image %s for %s", imageName, serviceID)
@@ -107,7 +107,7 @@ func (e *Executor) Deploy(op client.Operation) error {
 
 	// Phase: Docker compose up (85%)
 	streamer.SetProgress(85)
-	streamer.AddPhase("Starting container...")
+	streamer.AddLine("Starting container...")
 	streamer.Flush()
 
 	log.Printf("Starting container for %s", serviceID)
@@ -117,7 +117,7 @@ func (e *Executor) Deploy(op client.Operation) error {
 
 	// Phase: Complete (100%)
 	streamer.SetProgress(100)
-	streamer.AddPhase("Deploy complete")
+	streamer.AddLine("Deploy complete")
 	streamer.Flush()
 
 	log.Printf("Deploy complete for %s", serviceID)
@@ -147,7 +147,7 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 
 	// Phase: Git clone/pull (2%)
 	streamer.SetProgress(2)
-	streamer.AddPhase("Cloning repository...")
+	streamer.AddLine("Cloning repository...")
 	streamer.Flush()
 
 	// Clone or pull
@@ -176,7 +176,7 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 
 	// Phase: Nixpacks build (15%)
 	streamer.SetProgress(15)
-	streamer.AddPhase("Building with Nixpacks...")
+	streamer.AddLine("Building with Nixpacks...")
 	streamer.Flush()
 
 	imageName := "stacked-" + serviceID

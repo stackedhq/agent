@@ -45,15 +45,6 @@ func (s *Streamer) AddLine(msg string) {
 	s.mu.Unlock()
 }
 
-// AddPhase injects a phase marker line (e.g. "Cloning repository...") that the
-// dashboard can highlight differently from regular command output.
-func (s *Streamer) AddPhase(msg string) {
-	line := "[" + time.Now().UTC().Format("15:04:05") + "] @@PHASE@@" + msg
-	s.mu.Lock()
-	s.buffer = append(s.buffer, line)
-	s.mu.Unlock()
-}
-
 // Stream reads lines from r, batching and sending them to the server.
 // Blocks until r is closed/EOF. Call Flush() after to send remaining lines.
 func (s *Streamer) Stream(r io.Reader) {
