@@ -53,7 +53,8 @@ type StatusUpdate struct {
 }
 
 type LogBatch struct {
-	Lines []string `json:"lines"`
+	Lines    []string `json:"lines"`
+	Progress *int     `json:"progress,omitempty"`
 }
 
 // --- Response types ---
@@ -108,8 +109,8 @@ func (c *Client) UpdateStatus(operationID string, update *StatusUpdate) error {
 	return err
 }
 
-func (c *Client) SendLogs(operationID string, lines []string) error {
-	_, err := c.doJSON("POST", "/api/agent/operations/"+operationID+"/logs", &LogBatch{Lines: lines})
+func (c *Client) SendLogs(operationID string, lines []string, progress *int) error {
+	_, err := c.doJSON("POST", "/api/agent/operations/"+operationID+"/logs", &LogBatch{Lines: lines, Progress: progress})
 	return err
 }
 

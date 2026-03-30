@@ -20,6 +20,7 @@ type Streamer struct {
 	operationID string
 	mu          sync.Mutex
 	buffer      []string
+	progress    *int
 }
 
 func NewStreamer(c *client.Client, operationID string) *Streamer {
@@ -27,6 +28,21 @@ func NewStreamer(c *client.Client, operationID string) *Streamer {
 		client:      c,
 		operationID: operationID,
 	}
+}
+
+// SetProgress sets the current deploy progress percentage (0-100).
+func (s *Streamer) SetProgress(p int) {
+	s.mu.Lock()
+	s.progress = &p
+	s.mu.Unlock()
+}
+
+// AddLine injects a synthetic log line (e.g. phase markers) into the buffer.
+func (s *Streamer) AddLine(msg string) {
+	line := "[" + time.Now().UTC().Format("15:04:05") + "] " + msg
+	s.mu.Lock()
+	s.buffer = append(s.buffer, line)
+	s.mu.Unlock()
 }
 
 // Stream reads lines from r, batching and sending them to the server.
@@ -72,14 +88,17 @@ func (s *Streamer) Flush() {
 
 func (s *Streamer) flush() {
 	s.mu.Lock()
-	if len(s.buffer) == 0 {
+	if len(s.buffer) == 0 && s.progress == nil {
 		s.mu.Unlock()
 		return
 	}
 	lines := s.buffer
 	s.buffer = nil
+	progress := s.progress
+	// Clear progress after capturing so we don't re-send the same value
+	s.progress = nil
 	s.mu.Unlock()
 
 	// Best-effort send — don't block on failure
-	_ = s.client.SendLogs(s.operationID, lines)
+	_ = s.client.SendLogs(s.operationID, lines, progress)
 }

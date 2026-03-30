@@ -96,6 +96,31 @@ func (e *Executor) runCommand(operationID, dir, name string, args ...string) err
 	return nil
 }
 
+// runCommandWithStreamer executes a command using an existing streamer,
+// so all commands in a deploy share the same log stream and progress state.
+func (e *Executor) runCommandWithStreamer(streamer *logs.Streamer, dir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	cmd.Stderr = cmd.Stdout
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start %s: %w", name, err)
+	}
+
+	streamer.Stream(stdout)
+	streamer.Flush()
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("%s exited with error: %w", name, err)
+	}
+	return nil
+}
+
 // runCommandSilent executes a command and returns its combined output.
 func runCommandSilent(dir, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)

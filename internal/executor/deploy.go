@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/logs"
 )
 
 func (e *Executor) Deploy(op client.Operation) error {
@@ -25,11 +26,22 @@ func (e *Executor) Deploy(op client.Operation) error {
 		return fmt.Errorf("create service dir: %w", err)
 	}
 
-	// Request fresh credentials from the server (short-lived token, env vars)
+	// Create a single streamer for the entire deploy lifecycle
+	streamer := logs.NewStreamer(e.Client, op.ID)
+
+	// Phase: Fetching credentials (0%)
+	streamer.SetProgress(0)
+	streamer.AddLine("==> Fetching credentials...")
+	streamer.Flush()
+
 	creds, err := e.Client.GetCredentials(serviceID)
 	if err != nil {
 		return fmt.Errorf("get credentials: %w", err)
 	}
+
+	streamer.SetProgress(2)
+	streamer.AddLine("==> Credentials received")
+	streamer.Flush()
 
 	// Authenticate with GHCR if a registry token was provided
 	if creds.RegistryToken != "" {
@@ -63,13 +75,17 @@ func (e *Executor) Deploy(op client.Operation) error {
 	if dockerImage != "" {
 		// Docker image mode: pull the pre-built image
 		imageName = dockerImage
+		streamer.SetProgress(2)
+		streamer.AddLine("==> Pulling Docker image " + imageName + "...")
+		streamer.Flush()
+
 		log.Printf("Pulling Docker image %s for %s", imageName, serviceID)
-		if err := e.runCommand(op.ID, dir, "docker", "pull", imageName); err != nil {
+		if err := e.runCommandWithStreamer(streamer, dir, "docker", "pull", imageName); err != nil {
 			return fmt.Errorf("docker pull %s: %w", imageName, err)
 		}
 	} else {
 		// VPS build mode: clone repo + build with Nixpacks
-		imageName, err = e.buildFromSource(op, serviceID, dir, creds)
+		imageName, err = e.buildFromSource(op, serviceID, dir, creds, streamer)
 		if err != nil {
 			return err
 		}
@@ -82,18 +98,27 @@ func (e *Executor) Deploy(op client.Operation) error {
 		return fmt.Errorf("write docker-compose.yml: %w", err)
 	}
 
-	// Start container
+	// Phase: Docker compose up (85%)
+	streamer.SetProgress(85)
+	streamer.AddLine("==> Starting container...")
+	streamer.Flush()
+
 	log.Printf("Starting container for %s", serviceID)
-	if err := e.runCommand(op.ID, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
 		return fmt.Errorf("docker compose up: %w", err)
 	}
+
+	// Phase: Complete (100%)
+	streamer.SetProgress(100)
+	streamer.AddLine("==> Deploy complete")
+	streamer.Flush()
 
 	log.Printf("Deploy complete for %s", serviceID)
 	return nil
 }
 
 // buildFromSource clones the repo and builds an image with Nixpacks.
-func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, creds *client.Credentials) (string, error) {
+func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, creds *client.Credentials, streamer *logs.Streamer) (string, error) {
 	gitBranch := getStringPayload(op.Payload, "gitBranch")
 	commitSha := getStringPayload(op.Payload, "commitSha")
 	buildCommand := getStringPayload(op.Payload, "buildCommand")
@@ -113,31 +138,40 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 		}
 	}
 
+	// Phase: Git clone/pull (2%)
+	streamer.SetProgress(2)
+	streamer.AddLine("==> Cloning repository...")
+	streamer.Flush()
+
 	// Clone or pull
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(err) {
 		log.Printf("Cloning into %s", repoDir)
-		if err := e.runCommand(op.ID, dir, "git", "clone", "--branch", gitBranch, "--single-branch", gitRepo, "repo"); err != nil {
+		if err := e.runCommandWithStreamer(streamer, dir, "git", "clone", "--branch", gitBranch, "--single-branch", gitRepo, "repo"); err != nil {
 			return "", fmt.Errorf("git clone: %w", err)
 		}
 	} else {
 		log.Printf("Pulling latest for %s", serviceID)
 		_, _ = runCommandSilent(repoDir, "git", "remote", "set-url", "origin", gitRepo)
-		if err := e.runCommand(op.ID, repoDir, "git", "fetch", "origin"); err != nil {
+		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "fetch", "origin"); err != nil {
 			return "", fmt.Errorf("git fetch: %w", err)
 		}
-		if err := e.runCommand(op.ID, repoDir, "git", "reset", "--hard", "origin/"+gitBranch); err != nil {
+		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "reset", "--hard", "origin/"+gitBranch); err != nil {
 			return "", fmt.Errorf("git reset: %w", err)
 		}
 	}
 
 	// Checkout specific commit if requested
 	if commitSha != "" {
-		if err := e.runCommand(op.ID, repoDir, "git", "checkout", commitSha); err != nil {
+		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "checkout", commitSha); err != nil {
 			return "", fmt.Errorf("git checkout %s: %w", commitSha, err)
 		}
 	}
 
-	// Build image with Nixpacks
+	// Phase: Nixpacks build (15%)
+	streamer.SetProgress(15)
+	streamer.AddLine("==> Building with Nixpacks...")
+	streamer.Flush()
+
 	imageName := "stacked-" + serviceID
 	log.Printf("Building image with Nixpacks for %s", serviceID)
 
@@ -152,7 +186,7 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 		nixpacksArgs = append(nixpacksArgs, "--env", k+"="+v)
 	}
 
-	if err := e.runCommand(op.ID, dir, "nixpacks", nixpacksArgs...); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "nixpacks", nixpacksArgs...); err != nil {
 		return "", fmt.Errorf("nixpacks build: %w", err)
 	}
 
