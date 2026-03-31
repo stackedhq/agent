@@ -60,6 +60,14 @@ func (e *Executor) Deploy(op client.Operation) error {
 		}
 	}
 
+	// Inject HOST=0.0.0.0 so apps bind to all interfaces (reachable by Caddy on Docker network)
+	if _, hasHost := creds.EnvVars["HOST"]; !hasHost {
+		if creds.EnvVars == nil {
+			creds.EnvVars = make(map[string]string)
+		}
+		creds.EnvVars["HOST"] = "0.0.0.0"
+	}
+
 	// Write .env file from server-managed env vars
 	if len(creds.EnvVars) > 0 {
 		envContent := buildEnvFile(creds.EnvVars)
