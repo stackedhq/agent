@@ -54,10 +54,16 @@ func generateCaddyfile(domains []interface{}) string {
 			continue
 		}
 
+		// Read port from payload, default to 3000 for backward compat
+		port := 3000
+		if p, ok := dm["port"].(float64); ok && p > 0 {
+			port = int(p)
+		}
+
 		// Container name matches the service name in docker-compose.yml,
-		// which is the serviceID. Default port is 3000.
+		// which is the serviceID.
 		fmt.Fprintf(&b, "%s {\n", domain)
-		fmt.Fprintf(&b, "    reverse_proxy %s:3000\n", serviceID)
+		fmt.Fprintf(&b, "    reverse_proxy %s:%d\n", serviceID, port)
 		fmt.Fprintf(&b, "}\n\n")
 	}
 
