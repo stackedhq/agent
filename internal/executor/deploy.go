@@ -110,6 +110,9 @@ func (e *Executor) Deploy(op client.Operation) error {
 	streamer.AddLine("Starting container...")
 	streamer.Flush()
 
+	// Ensure the stacked network exists (idempotent, same as setup.go)
+	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+
 	log.Printf("Starting container for %s", serviceID)
 	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
 		return fail(fmt.Errorf("docker compose up: %w", err))
