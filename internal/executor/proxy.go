@@ -29,12 +29,14 @@ func (e *Executor) ProxyConfig(op client.Operation) error {
 
 	log.Printf("Updated Caddyfile with %d domain(s)", len(domains))
 
-	// Reload Caddy
-	if out, err := runCommandSilent(proxyDir, "docker", "compose", "exec", "caddy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"); err != nil {
-		return fmt.Errorf("caddy reload: %s: %w", out, err)
+	// Restart Caddy so it picks up the new Caddyfile.
+	// We use restart instead of exec+reload because reload fails when Caddy
+	// has no prior running config (e.g. started with an empty Caddyfile).
+	if out, err := runCommandSilent(proxyDir, "docker", "compose", "restart", "caddy"); err != nil {
+		return fmt.Errorf("caddy restart: %s: %w", out, err)
 	}
 
-	log.Println("Caddy reloaded")
+	log.Println("Caddy restarted")
 	return nil
 }
 
