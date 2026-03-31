@@ -3,11 +3,37 @@ package executor
 import (
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 )
+
+// ensureProxy ensures the Caddy proxy infrastructure is running.
+// Idempotent — safe to call on every proxy_config.
+func ensureProxy() error {
+	if err := ensureDir(proxyDir); err != nil {
+		return fmt.Errorf("create proxy dir: %w", err)
+	}
+
+	// Ensure the stacked network exists
+	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+
+	composePath := filepath.Join(proxyDir, "docker-compose.yml")
+	if _, err := os.Stat(composePath); os.IsNotExist(err) {
+		if err := writeFile(composePath, proxyCompose()); err != nil {
+			return fmt.Errorf("write proxy compose: %w", err)
+		}
+	}
+
+	// Start Caddy (no-op if already running)
+	if out, err := runCommandSilent(proxyDir, "docker", "compose", "up", "-d"); err != nil {
+		return fmt.Errorf("start caddy: %s: %w", out, err)
+	}
+
+	return nil
+}
 
 func (e *Executor) ProxyConfig(op client.Operation) error {
 	domainsRaw, ok := op.Payload["domains"]
@@ -18,6 +44,11 @@ func (e *Executor) ProxyConfig(op client.Operation) error {
 	domains, ok := domainsRaw.([]interface{})
 	if !ok {
 		return fmt.Errorf("proxy_config domains must be an array")
+	}
+
+	// Ensure Caddy is running before writing the Caddyfile
+	if err := ensureProxy(); err != nil {
+		return fmt.Errorf("ensure proxy: %w", err)
 	}
 
 	caddyfile := generateCaddyfile(domains)

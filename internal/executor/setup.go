@@ -17,21 +17,6 @@ func (e *Executor) Setup(op client.Operation) error {
 		return fmt.Errorf("docker not available: %s: %w", out, err)
 	}
 
-	// Create the stacked Docker network if it doesn't exist
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
-
-	// Ensure proxy directory and compose file exist
-	if err := ensureDir(proxyDir); err != nil {
-		return fmt.Errorf("create proxy dir: %w", err)
-	}
-
-	composePath := filepath.Join(proxyDir, "docker-compose.yml")
-	if _, err := os.Stat(composePath); os.IsNotExist(err) {
-		if err := writeFile(composePath, proxyCompose()); err != nil {
-			return fmt.Errorf("write proxy compose: %w", err)
-		}
-	}
-
 	// Write empty Caddyfile if it doesn't exist
 	caddyfilePath := filepath.Join(proxyDir, "Caddyfile")
 	if _, err := os.Stat(caddyfilePath); os.IsNotExist(err) {
@@ -40,10 +25,9 @@ func (e *Executor) Setup(op client.Operation) error {
 		}
 	}
 
-	// Start Caddy
-	log.Println("Starting Caddy proxy...")
-	if out, err := runCommandSilent(proxyDir, "docker", "compose", "up", "-d"); err != nil {
-		return fmt.Errorf("start caddy: %s: %w", out, err)
+	// Ensure Caddy proxy is running
+	if err := ensureProxy(); err != nil {
+		return err
 	}
 
 	log.Println("Setup complete")
