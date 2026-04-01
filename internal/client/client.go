@@ -29,9 +29,9 @@ func New(server, token string) *Client {
 
 type HeartbeatRequest struct {
 	AgentVersion string            `json:"agentVersion"`
-	CPUUsage     float64           `json:"cpuUsage,omitempty"`
-	MemoryUsage  float64           `json:"memoryUsage,omitempty"`
-	DiskUsage    float64           `json:"diskUsage,omitempty"`
+	CPUUsage     float64           `json:"cpuUsage"`
+	MemoryUsage  float64           `json:"memoryUsage"`
+	DiskUsage    float64           `json:"diskUsage"`
 	CPUCores     int               `json:"cpuCores,omitempty"`
 	MemoryMb     int               `json:"memoryMb,omitempty"`
 	DiskGb       int               `json:"diskGb,omitempty"`
