@@ -50,8 +50,10 @@ func collectContainers() []client.ContainerStatus {
 			Status:    r.state,
 		}
 		if s, ok := statsByID[r.id]; ok {
-			c.CPUPercent = s.cpuPercent
-			c.MemoryPercent = s.memPercent
+			// Clamp percent fields to [0, 100] so a malformed `docker stats`
+			// row can't poison the heartbeat payload.
+			c.CPUPercent = clampPercent(s.cpuPercent)
+			c.MemoryPercent = clampPercent(s.memPercent)
 			c.MemoryBytes = s.memBytes
 			c.MemoryLimitBytes = s.memLimitBytes
 			// Treat "limit within 5% of host memory" as unlimited. The 5%

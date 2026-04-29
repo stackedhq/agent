@@ -10,6 +10,11 @@ import (
 	"github.com/stackedapp/stacked/agent/internal/client"
 )
 
+// caddyfileHeader is the placeholder content written when the Caddyfile is
+// missing or has to be self-healed from a non-regular file. ProxyConfig
+// will overwrite this with real content on the next op.
+const caddyfileHeader = "# Managed by Stacked\n"
+
 // ensureProxy ensures the Caddy proxy infrastructure is running.
 // Idempotent — safe to call on every proxy_config.
 func ensureProxy() error {
@@ -25,6 +30,15 @@ func ensureProxy() error {
 		if err := writeFile(composePath, proxyCompose()); err != nil {
 			return fmt.Errorf("write proxy compose: %w", err)
 		}
+	}
+
+	// Self-heal the Caddyfile bind-mount source. If a prior `compose up`
+	// ran before the file existed, docker would have auto-created it as a
+	// directory and every subsequent `compose up` would fail with
+	// "not a directory". Recover before docker compose up.
+	caddyfilePath := filepath.Join(proxyDir, "Caddyfile")
+	if err := ensureRegularFile(caddyfilePath, caddyfileHeader); err != nil {
+		return fmt.Errorf("ensure Caddyfile: %w", err)
 	}
 
 	// Start Caddy (no-op if already running)

@@ -131,12 +131,18 @@ func cpuUsage() float64 {
 	time.Sleep(500 * time.Millisecond)
 	idle2, total2 := readCPUStat()
 
+	// Guard against unsigned underflow. /proc/stat counters are normally
+	// monotonic, but a CPU going offline / hotplug / kernel quirk could
+	// theoretically reset them between samples. Cheap to defend against.
+	if idle2 < idle1 || total2 < total1 {
+		return 0
+	}
 	idleDelta := float64(idle2 - idle1)
 	totalDelta := float64(total2 - total1)
 	if totalDelta == 0 {
 		return 0
 	}
-	return (1.0 - idleDelta/totalDelta) * 100.0
+	return clampPercent((1.0 - idleDelta/totalDelta) * 100.0)
 }
 
 func readCPUStat() (idle, total uint64) {
@@ -193,8 +199,17 @@ func memoryUsage() float64 {
 	if memTotal == 0 {
 		return 0
 	}
+	// Guard against unsigned underflow. MemAvailable is a kernel estimate
+	// that can rarely exceed MemTotal under memory-pressure / accounting
+	// quirks (observed on Oracle Linux 9.6 / arm64). Without this check the
+	// uint64 subtraction wraps to ~2^64, producing percentages on the order
+	// of 1e13 which overflowed the server's numeric(5,2) column and 500'd
+	// every heartbeat.
+	if memAvailable >= memTotal {
+		return 0
+	}
 	used := memTotal - memAvailable
-	return float64(used) / float64(memTotal) * 100.0
+	return clampPercent(float64(used) / float64(memTotal) * 100.0)
 }
 
 func parseMemInfoValue(line string) uint64 {
@@ -217,6 +232,11 @@ func diskUsage() float64 {
 	if total == 0 {
 		return 0
 	}
+	// Guard against unsigned underflow. Bfree should never exceed Blocks on
+	// a real filesystem; defend symmetrically with the other percent fns.
+	if free >= total {
+		return 0
+	}
 	used := total - free
-	return float64(used) / float64(total) * 100.0
+	return clampPercent(float64(used) / float64(total) * 100.0)
 }

@@ -3,7 +3,6 @@ package executor
 import (
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -17,12 +16,12 @@ func (e *Executor) Setup(op client.Operation) error {
 		return fmt.Errorf("docker not available: %s: %w", out, err)
 	}
 
-	// Write empty Caddyfile if it doesn't exist
+	// Ensure the Caddyfile exists as a regular file. ensureRegularFile
+	// also self-heals if a previous failed `compose up` left a directory
+	// here (docker auto-mkdir on missing bind-mount source).
 	caddyfilePath := filepath.Join(proxyDir, "Caddyfile")
-	if _, err := os.Stat(caddyfilePath); os.IsNotExist(err) {
-		if err := writeFile(caddyfilePath, "# Managed by Stacked\n"); err != nil {
-			return fmt.Errorf("write Caddyfile: %w", err)
-		}
+	if err := ensureRegularFile(caddyfilePath, "# Managed by Stacked\n"); err != nil {
+		return fmt.Errorf("ensure Caddyfile: %w", err)
 	}
 
 	// Ensure Caddy proxy is running

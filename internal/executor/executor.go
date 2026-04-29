@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -146,6 +147,35 @@ func writeFile(path, content string) error {
 		return err
 	}
 	return os.WriteFile(path, []byte(content), 0644)
+}
+
+// ensureRegularFile guarantees `path` exists as a regular file. If it's
+// missing, it's created with `fallbackContent`. If it exists but is not a
+// regular file (most commonly: a directory auto-created by docker when a
+// bind-mount source was missing at `compose up` time), it's removed and
+// recreated. Idempotent.
+//
+// Without this, a single failed `docker compose up` can permanently poison
+// a host path: docker auto-mkdirs the missing source, then every subsequent
+// `compose up` fails with "not a directory" because the bind-mount
+// destination is a file inside the image. Manual `rm -rf` was the only
+// recovery before this helper.
+func ensureRegularFile(path, fallbackContent string) error {
+	info, err := os.Stat(path)
+	switch {
+	case err == nil && info.Mode().IsRegular():
+		return nil
+	case err == nil:
+		log.Printf("%s exists but is not a regular file (mode=%s); recreating", path, info.Mode())
+		if rmErr := os.RemoveAll(path); rmErr != nil {
+			return fmt.Errorf("remove non-regular %s: %w", path, rmErr)
+		}
+		return writeFile(path, fallbackContent)
+	case errors.Is(err, os.ErrNotExist):
+		return writeFile(path, fallbackContent)
+	default:
+		return err
+	}
 }
 
 // getStringPayload extracts a string from the operation payload.
