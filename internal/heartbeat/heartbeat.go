@@ -66,6 +66,7 @@ func send(c *client.Client) {
 		OS:           sysInfo.OS,
 		Arch:         sysInfo.Arch,
 		Hostname:     sysInfo.Hostname,
+		Containers:   collectContainers(),
 	}
 
 	if err := c.Heartbeat(req); err != nil {

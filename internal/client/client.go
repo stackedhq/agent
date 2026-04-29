@@ -42,9 +42,13 @@ type HeartbeatRequest struct {
 }
 
 type ContainerStatus struct {
-	ServiceID string  `json:"serviceId"`
-	Status    string  `json:"status"`
-	Uptime    float64 `json:"uptime,omitempty"`
+	ServiceID        string  `json:"serviceId"`
+	Status           string  `json:"status"`
+	Uptime           float64 `json:"uptime,omitempty"`
+	CPUPercent       float64 `json:"cpuPercent,omitempty"`
+	MemoryPercent    float64 `json:"memoryPercent,omitempty"`
+	MemoryBytes      uint64  `json:"memoryBytes,omitempty"`
+	MemoryLimitBytes uint64  `json:"memoryLimitBytes,omitempty"`
 }
 
 type StatusUpdate struct {
