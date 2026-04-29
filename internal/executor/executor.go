@@ -35,6 +35,7 @@ func (e *Executor) Execute(op client.Operation) {
 	}
 
 	var err error
+	var result map[string]interface{}
 	switch op.Type {
 	case "deploy":
 		err = e.Deploy(op)
@@ -46,6 +47,8 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.Setup(op)
 	case "proxy_config":
 		err = e.ProxyConfig(op)
+	case "ssl_check":
+		result, err = e.SslCheck(op)
 	case "self_update":
 		err = e.SelfUpdate(op)
 	default:
@@ -61,7 +64,10 @@ func (e *Executor) Execute(op client.Operation) {
 		return
 	}
 
-	_ = e.Client.UpdateStatus(op.ID, &client.StatusUpdate{Status: "success"})
+	_ = e.Client.UpdateStatus(op.ID, &client.StatusUpdate{
+		Status: "success",
+		Result: result,
+	})
 }
 
 // serviceDir returns the working directory for a service.
