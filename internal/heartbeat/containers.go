@@ -77,10 +77,17 @@ type containerRow struct {
 func listStackedContainers() []containerRow {
 	// Tab-separated to avoid issues with image names containing spaces.
 	// We only want containers that belong to a Stacked-managed compose project.
+	//
+	// Database containers are excluded via the `com.stacked.kind` label so
+	// their stats don't get reported as service metrics (the server lookup
+	// would silently drop them anyway, but emitting the rows is wasted
+	// bandwidth and noisy in heartbeat payloads). Containers without the
+	// label are treated as services for back-compat with already-deployed
+	// services that pre-date the label.
 	cmd := exec.Command(
 		"docker", "ps", "-a",
 		"--filter", "label=com.docker.compose.project",
-		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}`,
+		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}	{{.Label "com.stacked.kind"}}`,
 	)
 	out, err := cmd.Output()
 	if err != nil {
@@ -95,6 +102,13 @@ func listStackedContainers() []containerRow {
 		}
 		parts := strings.Split(line, "\t")
 		if len(parts) < 3 {
+			continue
+		}
+		kind := ""
+		if len(parts) >= 4 {
+			kind = parts[3]
+		}
+		if kind == "database" {
 			continue
 		}
 		rows = append(rows, containerRow{

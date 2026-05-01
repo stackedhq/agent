@@ -145,6 +145,22 @@ func (c *Client) SendServiceLogs(serviceID string, lines []string) error {
 	return err
 }
 
+// SendDatabaseLogs is the database equivalent of SendServiceLogs. Used by
+// the databaselogs forwarder to push `docker logs -f` output up to the
+// dashboard's Console tab. Endpoint is distinct so the server's Redis
+// ring buffer / SSE channel separation is preserved.
+func (c *Client) SendDatabaseLogs(databaseID string, lines []string) error {
+	if len(lines) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(&ServiceLogBatch{Lines: lines})
+	if err != nil {
+		return fmt.Errorf("failed to marshal database log batch: %w", err)
+	}
+	_, err = c.doRequest("POST", "/api/agent/logs/db/"+databaseID, bytes.NewReader(data))
+	return err
+}
+
 // --- Log archive request/response ---
 
 type LogArchiveURL struct {

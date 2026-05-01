@@ -114,11 +114,19 @@ type containerRow struct {
 // listStackedContainers enumerates Stacked-managed containers, identified by
 // the `com.docker.compose.project` label which the deploy executor sets to
 // the serviceID via the per-service working directory name.
+//
+// Database containers are explicitly skipped via the `com.stacked.kind`
+// label introduced when the agent gained db_* support — forwarders for
+// databases live in the databaselogs package and post to a different API
+// endpoint. Containers with no `com.stacked.kind` label are treated as
+// services for back-compat with already-deployed services that pre-date
+// the label (they keep streaming until their next deploy picks up the
+// updated compose template).
 func listStackedContainers() []containerRow {
 	cmd := exec.Command(
 		"docker", "ps", "-a",
 		"--filter", "label=com.docker.compose.project",
-		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}`,
+		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}	{{.Label "com.stacked.kind"}}`,
 	)
 	out, err := cmd.Output()
 	if err != nil {
@@ -133,6 +141,13 @@ func listStackedContainers() []containerRow {
 		}
 		parts := strings.Split(line, "\t")
 		if len(parts) < 3 {
+			continue
+		}
+		kind := ""
+		if len(parts) >= 4 {
+			kind = parts[3]
+		}
+		if kind == "database" {
 			continue
 		}
 		rows = append(rows, containerRow{

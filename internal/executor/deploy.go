@@ -256,6 +256,11 @@ func buildEnvFile(vars map[string]string) string {
 }
 
 func generateCompose(serviceID, imageName string) string {
+	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
+	// managers correctly partition `docker ps` output. The runtimelogs
+	// manager treats label-less containers as services for back-compat
+	// with already-deployed services that pre-date this label — they keep
+	// streaming until their next deploy picks up the new template.
 	return fmt.Sprintf(`services:
   %s:
     image: %s
@@ -264,6 +269,8 @@ func generateCompose(serviceID, imageName string) string {
       - .env
     networks:
       - stacked
+    labels:
+      com.stacked.kind: service
 
 networks:
   stacked:
