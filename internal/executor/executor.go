@@ -52,6 +52,14 @@ func (e *Executor) Execute(op client.Operation) {
 		result, err = e.SslCheck(op)
 	case "self_update":
 		err = e.SelfUpdate(op)
+	case "db_provision":
+		result, err = e.Provision(op)
+	case "db_start":
+		err = e.StartDB(op)
+	case "db_stop":
+		err = e.StopDB(op)
+	case "db_destroy":
+		err = e.DestroyDB(op)
 	default:
 		err = fmt.Errorf("unknown operation type: %s", op.Type)
 	}
