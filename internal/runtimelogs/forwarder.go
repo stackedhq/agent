@@ -52,6 +52,11 @@ type Forwarder struct {
 	// Last RFC3339Nano timestamp seen on a log line. Persisted on shutdown
 	// so a restarted agent picks up where it left off (with `--since`).
 	lastTimestamp string
+
+	// Side pipeline: same lines also get fed to the archiver, which
+	// uploads gzipped NDJSON chunks to R2 every ~60s. Best-effort and
+	// completely independent of the live SSE forward path.
+	archiver *Archiver
 }
 
 // NewForwarder creates a Forwarder. Start it with Run() in a goroutine.
@@ -64,6 +69,7 @@ func NewForwarder(c *client.Client, serviceID, containerID string) *Forwarder {
 		ctx:         ctx,
 		cancel:      cancel,
 		done:        make(chan struct{}),
+		archiver:    NewArchiver(c, serviceID),
 	}
 }
 
@@ -102,6 +108,10 @@ func (f *Forwarder) Run() {
 		return
 	}
 
+	// Archiver runs alongside the live forward path. Stopped after the
+	// scanners drain so its final flush captures every line we saw.
+	go f.archiver.Run()
+
 	// Periodic flush in background.
 	flushDone := make(chan struct{})
 	go func() {
@@ -126,6 +136,10 @@ func (f *Forwarder) Run() {
 
 	close(flushDone)
 	f.flush()
+
+	// Drain the archiver before returning so any in-flight buffer gets
+	// uploaded. Stop() blocks until the final flush completes.
+	f.archiver.Stop()
 
 	// Don't care about exit code — the container ending or being removed
 	// will cause `docker logs` to exit non-zero, which is normal.
@@ -161,6 +175,10 @@ func (f *Forwarder) scan(r io.Reader) {
 		f.buffer = append(f.buffer, line)
 		shouldFlush := len(f.buffer) >= maxBatchSize
 		f.mu.Unlock()
+
+		// Tee into the archiver. Independent of the live flush schedule;
+		// archiver has its own 60s/1MiB cadence.
+		f.archiver.Add(ts, line)
 
 		if shouldFlush {
 			f.flush()

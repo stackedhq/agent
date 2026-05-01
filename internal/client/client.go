@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -141,6 +142,67 @@ func (c *Client) SendServiceLogs(serviceID string, lines []string) error {
 		return fmt.Errorf("failed to marshal service log batch: %w", err)
 	}
 	_, err = c.doRequest("POST", "/api/agent/logs/"+serviceID, bytes.NewReader(data))
+	return err
+}
+
+// --- Log archive request/response ---
+
+type LogArchiveURL struct {
+	URL       string `json:"url"`
+	Key       string `json:"key"`
+	ExpiresAt string `json:"expiresAt"`
+}
+
+type logArchiveURLResponse struct {
+	Data LogArchiveURL `json:"data"`
+}
+
+type LogArchiveConfirm struct {
+	Key       string `json:"key"`
+	SizeBytes int    `json:"sizeBytes"`
+	LineCount int    `json:"lineCount"`
+	FromTs    string `json:"fromTs,omitempty"`
+	ToTs      string `json:"toTs,omitempty"`
+}
+
+// ErrArchivalDisabled signals that the server has the log-archival
+// feature flag turned off (R2_LOGS_BUCKET unset). The archiver uses this
+// to permanently disable itself for the rest of the process lifetime
+// rather than spamming requests every minute.
+var ErrArchivalDisabled = fmt.Errorf("log archival disabled on server")
+
+// RequestLogArchiveURL asks the server for a presigned PUT URL the agent
+// can use to upload a gzipped NDJSON chunk directly to R2.
+func (c *Client) RequestLogArchiveURL(serviceID string) (*LogArchiveURL, error) {
+	body, err := c.doRequest("POST", "/api/agent/logs/"+serviceID+"/archive-url", nil)
+	if err != nil {
+		// Surface ARCHIVAL_DISABLED as a typed error. The body of a 503
+		// response is folded into err.Error() by doRequest — a string
+		// match is enough since this is an internal API contract.
+		if strings.Contains(err.Error(), "ARCHIVAL_DISABLED") {
+			return nil, ErrArchivalDisabled
+		}
+		return nil, err
+	}
+	var resp logArchiveURLResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode archive URL: %w", err)
+	}
+	return &resp.Data, nil
+}
+
+// ConfirmLogArchive records a successful R2 upload in the server's
+// manifest. Idempotent on the server side; safe to retry on transient
+// network errors.
+func (c *Client) ConfirmLogArchive(serviceID string, confirm *LogArchiveConfirm) error {
+	data, err := json.Marshal(confirm)
+	if err != nil {
+		return fmt.Errorf("marshal archive confirm: %w", err)
+	}
+	_, err = c.doRequest("POST", "/api/agent/logs/"+serviceID+"/archive-confirm", bytes.NewReader(data))
+	if err != nil && strings.Contains(err.Error(), "ARCHIVAL_DISABLED") {
+		return ErrArchivalDisabled
+	}
 	return err
 }
 
