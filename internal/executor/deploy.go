@@ -13,17 +13,17 @@ import (
 	"github.com/stackedapp/stacked/agent/internal/logs"
 )
 
-func (e *Executor) Deploy(op client.Operation) error {
+func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	serviceID := getStringPayload(op.Payload, "serviceId")
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
 
 	if serviceID == "" {
-		return fmt.Errorf("deploy requires serviceId in payload")
+		return nil, fmt.Errorf("deploy requires serviceId in payload")
 	}
 
 	dir := serviceDir(serviceID)
 	if err := ensureDir(dir); err != nil {
-		return fmt.Errorf("create service dir: %w", err)
+		return nil, fmt.Errorf("create service dir: %w", err)
 	}
 
 	// Create a single streamer for the entire deploy lifecycle
@@ -36,6 +36,11 @@ func (e *Executor) Deploy(op client.Operation) error {
 		return err
 	}
 
+	// Default port mirrors the server-side schema default. Older servers
+	// that don't yet include `port` in the credentials response still get
+	// a sensible probe target.
+	probePort := 3000
+
 	// Phase: Fetching credentials (0%)
 	streamer.SetProgress(0)
 	streamer.AddLine("Fetching credentials...")
@@ -43,7 +48,10 @@ func (e *Executor) Deploy(op client.Operation) error {
 
 	creds, err := e.Client.GetCredentials(serviceID)
 	if err != nil {
-		return fail(fmt.Errorf("get credentials: %w", err))
+		return nil, fail(fmt.Errorf("get credentials: %w", err))
+	}
+	if creds.Port > 0 {
+		probePort = creds.Port
 	}
 
 	streamer.SetProgress(2)
@@ -73,14 +81,14 @@ func (e *Executor) Deploy(op client.Operation) error {
 		envContent := buildEnvFile(creds.EnvVars)
 		envPath := filepath.Join(dir, ".env")
 		if err := writeFile(envPath, envContent); err != nil {
-			return fail(fmt.Errorf("write .env: %w", err))
+			return nil, fail(fmt.Errorf("write .env: %w", err))
 		}
 	} else {
 		// Ensure .env exists (docker compose requires it with env_file directive)
 		envPath := filepath.Join(dir, ".env")
 		if _, err := os.Stat(envPath); os.IsNotExist(err) {
 			if err := writeFile(envPath, ""); err != nil {
-				return fail(fmt.Errorf("write .env: %w", err))
+				return nil, fail(fmt.Errorf("write .env: %w", err))
 			}
 		}
 	}
@@ -96,13 +104,13 @@ func (e *Executor) Deploy(op client.Operation) error {
 
 		log.Printf("Pulling Docker image %s for %s", imageName, serviceID)
 		if err := e.runCommandWithStreamer(streamer, dir, "docker", "pull", imageName); err != nil {
-			return fail(fmt.Errorf("docker pull %s: %w", imageName, err))
+			return nil, fail(fmt.Errorf("docker pull %s: %w", imageName, err))
 		}
 	} else {
 		// VPS build mode: clone repo + build with Nixpacks
 		imageName, err = e.buildFromSource(op, serviceID, dir, creds, streamer)
 		if err != nil {
-			return fail(err)
+			return nil, fail(err)
 		}
 	}
 
@@ -110,7 +118,7 @@ func (e *Executor) Deploy(op client.Operation) error {
 	compose := generateCompose(serviceID, imageName)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
-		return fail(fmt.Errorf("write docker-compose.yml: %w", err))
+		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
 
 	// Phase: Docker compose up (85%)
@@ -123,8 +131,12 @@ func (e *Executor) Deploy(op client.Operation) error {
 
 	log.Printf("Starting container for %s", serviceID)
 	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
-		return fail(fmt.Errorf("docker compose up: %w", err))
+		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
+
+	// Phase: Health probe (95%)
+	streamer.SetProgress(95)
+	probeRes := e.HealthProbe(streamer, serviceID, probePort)
 
 	// Phase: Complete (100%)
 	streamer.SetProgress(100)
@@ -132,7 +144,15 @@ func (e *Executor) Deploy(op client.Operation) error {
 	streamer.Flush()
 
 	log.Printf("Deploy complete for %s", serviceID)
-	return nil
+
+	result := map[string]interface{}{
+		"probeOk":      probeRes.Ok,
+		"exposedPorts": probeRes.ExposedPorts,
+	}
+	if probeRes.Error != "" {
+		result["probeError"] = probeRes.Error
+	}
+	return result, nil
 }
 
 // buildFromSource clones the repo and builds an image with Nixpacks.

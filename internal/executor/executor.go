@@ -39,7 +39,7 @@ func (e *Executor) Execute(op client.Operation) {
 	var result map[string]interface{}
 	switch op.Type {
 	case "deploy":
-		err = e.Deploy(op)
+		result, err = e.Deploy(op)
 	case "stop":
 		err = e.Stop(op)
 	case "restart":

@@ -86,6 +86,9 @@ type Credentials struct {
 	GitCloneUrl   string            `json:"gitCloneUrl"`
 	RegistryToken string            `json:"registryToken"`
 	EnvVars       map[string]string `json:"envVars"`
+	// Port is the user-configured upstream port that Caddy forwards to
+	// (services.port, default 3000). The deploy health probe targets it.
+	Port int `json:"port,omitempty"`
 }
 
 type CredentialsResponse struct {
