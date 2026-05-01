@@ -7,6 +7,11 @@ on:
     tags:
       - 'v*'
   pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to regenerate release notes for (e.g. v0.6.18)'
+        required: true
 
 jobs:
   build:
@@ -34,7 +39,7 @@ jobs:
   release:
     name: Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -44,34 +49,88 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
-      - name: Build binaries
-        run: make build VERSION=${GITHUB_REF_NAME#v}
+      - name: Determine tag range
+        id: tags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CURRENT="${{ github.event.inputs.tag }}"
+          else
+            CURRENT="${GITHUB_REF_NAME}"
+          fi
+          PREV=$(git tag --sort=-v:refname | grep -E '^v' | grep -v "^${CURRENT}$" | head -1)
+          if [ -z "$PREV" ]; then
+            PREV=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "previous=${PREV}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate release notes
+      - name: Build binaries
+        run: make build VERSION=${TAG#v}
+        env:
+          TAG: ${{ steps.tags.outputs.current }}
+
+      - name: Generate AI release notes
+        id: ai_notes
+        continue-on-error: true
+        uses: github/copilot-release-notes@main
+        with:
+          base-ref: ${{ steps.tags.outputs.previous }}
+          head-ref: ${{ steps.tags.outputs.current }}
+          model: gpt-4.1
+          instructions: .github/release-notes-instructions.md
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+
+      - name: Build release notes (with fallback)
         id: notes
         run: |
-          # Get previous tag
-          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1)
-          if [ -z "$PREV_TAG" ]; then
-            COMMITS=$(git log --pretty=format:"- %s" HEAD)
+          AI_NOTES=$(cat <<'AINOTES_EOF'
+          ${{ steps.ai_notes.outputs.release-notes }}
+          AINOTES_EOF
+          )
+
+          # Detect REQUIRES-REINSTALL anywhere in the commit range so it survives
+          # even if the AI step failed or omitted it.
+          PREV="${{ steps.tags.outputs.previous }}"
+          CURRENT="${{ steps.tags.outputs.current }}"
+          if git log --format=%B "${PREV}..${CURRENT}" 2>/dev/null | grep -q "REQUIRES-REINSTALL"; then
+            REINSTALL=1
           else
-            COMMITS=$(git log --pretty=format:"- %s" "${PREV_TAG}..HEAD")
+            REINSTALL=0
           fi
-          # Write to file to preserve newlines
-          echo "$COMMITS" > /tmp/release-notes.md
+
+          if [ -n "$(echo "$AI_NOTES" | tr -d '[:space:]')" ] && [ "${{ steps.ai_notes.outcome }}" = "success" ]; then
+            echo "Using AI-generated notes"
+            printf '%s\n' "$AI_NOTES" > /tmp/release-notes.md
+          else
+            echo "AI notes unavailable, falling back to commit list"
+            if [ -z "$PREV" ]; then
+              git log --pretty=format:"- %s" HEAD > /tmp/release-notes.md
+            else
+              git log --pretty=format:"- %s" "${PREV}..${CURRENT}" > /tmp/release-notes.md
+            fi
+          fi
+
+          # Ensure REQUIRES-REINSTALL token is present if any commit in range had it.
+          if [ "$REINSTALL" = "1" ] && ! grep -q "REQUIRES-REINSTALL" /tmp/release-notes.md; then
+            printf '\n\nREQUIRES-REINSTALL\n' >> /tmp/release-notes.md
+          fi
+
           echo "" >> /tmp/release-notes.md
-          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ github.ref_name }}" >> /tmp/release-notes.md
+          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV}...${CURRENT}" >> /tmp/release-notes.md
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.tags.outputs.current }}
+          name: ${{ steps.tags.outputs.current }}
           body_path: /tmp/release-notes.md
           files: |
             dist/stacked-agent-linux-amd64
