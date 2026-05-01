@@ -71,6 +71,15 @@ jobs:
           echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
           echo "previous=${PREV}" >> "$GITHUB_OUTPUT"
 
+      - name: Sync release-notes instructions from main
+        # When dispatched against an old tag, that tag's tree may not contain
+        # the instructions file. Always pull the latest version from main so
+        # the AI step has the up-to-date style guide regardless of which tag
+        # we're regenerating.
+        run: |
+          git fetch origin main --depth=1
+          git checkout origin/main -- .github/release-notes-instructions.md || true
+
       - name: Build binaries
         run: make build VERSION=${TAG#v}
         env:
