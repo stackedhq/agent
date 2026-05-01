@@ -61,6 +61,10 @@ type LogBatch struct {
 	Progress *int     `json:"progress,omitempty"`
 }
 
+type ServiceLogBatch struct {
+	Lines []string `json:"lines"`
+}
+
 // --- Response types ---
 
 type Operation struct {
@@ -119,6 +123,21 @@ func (c *Client) SendLogs(operationID string, lines []string, progress *int) err
 		return fmt.Errorf("failed to marshal log batch: %w", err)
 	}
 	_, err = c.doRequest("POST", "/api/agent/operations/"+operationID+"/logs", bytes.NewReader(data))
+	return err
+}
+
+// SendServiceLogs forwards a batch of runtime container log lines for a
+// service. Used by the runtimelogs forwarder, distinct from SendLogs which
+// targets per-operation deploy logs.
+func (c *Client) SendServiceLogs(serviceID string, lines []string) error {
+	if len(lines) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(&ServiceLogBatch{Lines: lines})
+	if err != nil {
+		return fmt.Errorf("failed to marshal service log batch: %w", err)
+	}
+	_, err = c.doRequest("POST", "/api/agent/logs/"+serviceID, bytes.NewReader(data))
 	return err
 }
 
