@@ -13,11 +13,13 @@ import (
 	"github.com/stackedapp/stacked/agent/internal/executor"
 	"github.com/stackedapp/stacked/agent/internal/heartbeat"
 	"github.com/stackedapp/stacked/agent/internal/poller"
+	"github.com/stackedapp/stacked/agent/internal/runtimelogs"
 )
 
 const (
-	pollInterval      = 5 * time.Second
-	heartbeatInterval = 10 * time.Second
+	pollInterval         = 5 * time.Second
+	heartbeatInterval    = 10 * time.Second
+	logReconcileInterval = 10 * time.Second
 )
 
 func main() {
@@ -38,11 +40,13 @@ func main() {
 
 	c := client.New(cfg.Agent.Server, cfg.Agent.Token)
 	exec := executor.New(c)
+	logMgr := runtimelogs.NewManager(c)
 
 	stop := make(chan struct{})
 
 	go heartbeat.Loop(c, heartbeatInterval, stop)
 	go poller.Loop(c, exec, pollInterval, stop)
+	go runtimeLogReconcileLoop(logMgr, logReconcileInterval, stop)
 
 	log.Println("Agent running. Press Ctrl+C to stop.")
 
@@ -54,7 +58,30 @@ func main() {
 	log.Println("Shutting down...")
 	close(stop)
 
+	// Stop all log forwarders cleanly so cursors get persisted before we
+	// exit. Bounded by the forwarder's own context cancellation, so this
+	// won't hang the process.
+	logMgr.StopAll()
+
 	// Give goroutines a moment to finish
 	time.Sleep(1 * time.Second)
 	log.Println("Agent stopped.")
 }
+
+// runtimeLogReconcileLoop periodically syncs the runtime log forwarder set
+// against currently-running Stacked containers. Runs immediately on startup
+// to pick up containers from a prior agent process.
+func runtimeLogReconcileLoop(m *runtimelogs.Manager, interval time.Duration, stop <-chan struct{}) {
+	m.Reconcile()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.Reconcile()
+		case <-stop:
+			return
+		}
+	}
+}
+
