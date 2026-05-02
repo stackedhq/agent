@@ -262,8 +262,17 @@ func generateCompose(serviceID, imageName string) string {
 	// manager treats label-less containers as services for back-compat
 	// with already-deployed services that pre-date this label — they keep
 	// streaming until their next deploy picks up the new template.
+	// `container_name` pins the container's name to the serviceID so probe.go
+	// (and any other agent code path keyed by serviceID) can resolve it via
+	// `docker inspect <serviceID>`. Without this, compose would name the
+	// container `<project>-<service>-1` (project = workdir basename =
+	// serviceID, service = serviceID), which `docker inspect <serviceID>`
+	// cannot match — making every post-deploy health probe fail with
+	// `docker inspect: exit status 1`. Databases (database.go) already do
+	// this; services were missing it.
 	return fmt.Sprintf(`services:
   %s:
+    container_name: %s
     image: %s
     restart: unless-stopped
     env_file:
@@ -277,5 +286,5 @@ networks:
   stacked:
     name: stacked
     external: true
-`, serviceID, imageName)
+`, serviceID, serviceID, imageName)
 }
