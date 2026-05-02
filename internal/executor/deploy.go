@@ -146,8 +146,9 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	log.Printf("Deploy complete for %s", serviceID)
 
 	result := map[string]interface{}{
-		"probeOk":      probeRes.Ok,
-		"exposedPorts": probeRes.ExposedPorts,
+		"probeOk":             probeRes.Ok,
+		"exposedPorts":        probeRes.ExposedPorts,
+		"exposedPortsUnknown": probeRes.ExposedPortsUnknown,
 	}
 	if probeRes.Error != "" {
 		result["probeError"] = probeRes.Error

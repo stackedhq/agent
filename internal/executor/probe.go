@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,10 @@ type ProbeResult struct {
 	Ok           bool   `json:"probeOk"`
 	Error        string `json:"probeError,omitempty"`
 	ExposedPorts []int  `json:"exposedPorts"`
+	// ExposedPortsUnknown is true when `docker inspect` itself failed and we
+	// could not determine the image's declared ports. Distinct from "image
+	// legitimately exposes none", which keeps this false with an empty slice.
+	ExposedPortsUnknown bool `json:"exposedPortsUnknown"`
 }
 
 // probeTimeoutBudget defines the 3-retry, 1s-spacing TCP probe schedule.
@@ -30,7 +35,34 @@ const (
 	probeAttempts    = 3
 	probeDialTimeout = 1500 * time.Millisecond
 	probeRetryDelay  = 1 * time.Second
+
+	// inspectAttempts covers the brief race between `docker compose up -d`
+	// returning and the container fully attaching to the `stacked` network.
+	inspectAttempts   = 3
+	inspectRetryDelay = 500 * time.Millisecond
 )
+
+// runDockerInspect runs `docker inspect` capturing both stdout and stderr.
+// `Output()` would discard stderr, leaving callers with an opaque
+// `exit status 1` and no way to surface docker's actual reason. We trim
+// stderr (newlines, the boilerplate "Error response from daemon: " prefix)
+// and fold it into the returned error so the dashboard banner can show it.
+func runDockerInspect(args ...string) (string, error) {
+	cmd := exec.Command("docker", append([]string{"inspect"}, args...)...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		msg = strings.TrimPrefix(msg, "Error response from daemon: ")
+		msg = strings.TrimPrefix(msg, "Error: ")
+		if msg != "" {
+			return "", fmt.Errorf("docker inspect: %s (%w)", msg, err)
+		}
+		return "", fmt.Errorf("docker inspect: %w", err)
+	}
+	return stdout.String(), nil
+}
 
 // dialTCP attempts a single TCP connect with a bounded timeout.
 func dialTCP(addr string) error {
@@ -67,25 +99,34 @@ func probeTCP(addr string) error {
 // resolution of the service name (which only works inside the network).
 func containerIPOnNetwork(serviceID, network string) (string, error) {
 	format := fmt.Sprintf(`{{(index .NetworkSettings.Networks %q).IPAddress}}`, network)
-	out, err := exec.Command("docker", "inspect", "--format", format, serviceID).Output()
-	if err != nil {
-		return "", fmt.Errorf("docker inspect: %w", err)
+	var lastErr error
+	for i := 0; i < inspectAttempts; i++ {
+		if i > 0 {
+			time.Sleep(inspectRetryDelay)
+		}
+		out, err := runDockerInspect("--format", format, serviceID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ip := strings.TrimSpace(out)
+		if ip == "" {
+			lastErr = fmt.Errorf("no IP on network %q", network)
+			continue
+		}
+		return ip, nil
 	}
-	ip := strings.TrimSpace(string(out))
-	if ip == "" {
-		return "", fmt.Errorf("no IP on network %q", network)
-	}
-	return ip, nil
+	return "", lastErr
 }
 
 // inspectExposedPorts reads `Config.ExposedPorts` from the container.
 // Returns an empty slice (never nil) when the image declares none.
 func inspectExposedPorts(serviceID string) ([]int, error) {
-	out, err := exec.Command("docker", "inspect", "--format", "{{json .Config.ExposedPorts}}", serviceID).Output()
+	out, err := runDockerInspect("--format", "{{json .Config.ExposedPorts}}", serviceID)
 	if err != nil {
-		return nil, fmt.Errorf("docker inspect: %w", err)
+		return nil, err
 	}
-	raw := strings.TrimSpace(string(out))
+	raw := strings.TrimSpace(out)
 	if raw == "" || raw == "null" {
 		return []int{}, nil
 	}
@@ -119,7 +160,11 @@ func (e *Executor) HealthProbe(streamer *logs.Streamer, serviceID string, port i
 	res := ProbeResult{ExposedPorts: []int{}}
 
 	// 1. Read declared ExposedPorts (best-effort).
+	// On error we mark ExposedPortsUnknown so the dashboard can distinguish
+	// "image declares none" from "we couldn't tell" — those have very
+	// different remediation paths.
 	if ports, err := inspectExposedPorts(serviceID); err != nil {
+		res.ExposedPortsUnknown = true
 		streamer.AddLine(fmt.Sprintf("Health: could not read exposed ports: %v", err))
 	} else {
 		res.ExposedPorts = ports
