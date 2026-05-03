@@ -60,6 +60,10 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.StopDB(op)
 	case "db_destroy":
 		err = e.DestroyDB(op)
+	case "db_extension_enable":
+		err = e.EnableExtension(op)
+	case "db_extension_disable":
+		err = e.DisableExtension(op)
 	default:
 		err = fmt.Errorf("unknown operation type: %s", op.Type)
 	}
