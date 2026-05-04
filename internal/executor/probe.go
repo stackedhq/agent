@@ -98,7 +98,11 @@ func probeTCP(addr string) error {
 // bridge IPs directly, so we dial that instead of relying on DNS
 // resolution of the service name (which only works inside the network).
 func containerIPOnNetwork(serviceID, network string) (string, error) {
-	format := fmt.Sprintf(`{{(index .NetworkSettings.Networks %q).IPAddress}}`, network)
+	// `with index` (vs bare `index`) makes a missing network key produce
+	// empty output instead of a `nil pointer evaluating *EndpointSettings.IPAddress`
+	// template error — letting the empty-string retry path below recover
+	// when the container attaches to the network a moment later.
+	format := fmt.Sprintf(`{{with index .NetworkSettings.Networks %q}}{{.IPAddress}}{{end}}`, network)
 	var lastErr error
 	for i := 0; i < inspectAttempts; i++ {
 		if i > 0 {
@@ -112,6 +116,16 @@ func containerIPOnNetwork(serviceID, network string) (string, error) {
 		ip := strings.TrimSpace(out)
 		if ip == "" {
 			lastErr = fmt.Errorf("no IP on network %q", network)
+			continue
+		}
+		// Defensive: docker has been observed returning non-empty,
+		// non-parseable strings (e.g. the literal "invalid IP") for
+		// `.IPAddress` in edge cases where the endpoint exists on the
+		// network but no IPv4 has been allocated. Dialing such a value
+		// would produce a confusing `dial tcp: lookup <garbage>: no such host`
+		// DNS error; surface a clear message instead.
+		if net.ParseIP(ip) == nil {
+			lastErr = fmt.Errorf("no valid IP on network %q (got %q)", network, ip)
 			continue
 		}
 		return ip, nil
@@ -146,6 +160,16 @@ func inspectExposedPorts(serviceID string) ([]int, error) {
 	}
 	sort.Ints(ports)
 	return ports, nil
+}
+
+// containsInt reports whether n is present in xs.
+func containsInt(xs []int, n int) bool {
+	for _, x := range xs {
+		if x == n {
+			return true
+		}
+	}
+	return false
 }
 
 // HealthProbe performs the post-deploy health check: it inspects the
@@ -197,7 +221,12 @@ func (e *Executor) HealthProbe(streamer *logs.Streamer, serviceID string, port i
 		res.Ok = false
 		res.Error = err.Error()
 		streamer.AddLine(fmt.Sprintf("Health: probe FAILED on port %d — %v", port, err))
-		if len(res.ExposedPorts) > 0 {
+		// Only surface the port-mismatch hint when the configured port is
+		// genuinely absent from the image's declared ports. Firing it when
+		// they match (e.g. exposes [3000], configured 3000) misleads users
+		// into chasing a port-config problem when the real cause is
+		// networking or the app failing to bind.
+		if len(res.ExposedPorts) > 0 && !containsInt(res.ExposedPorts, port) {
 			streamer.AddLine(fmt.Sprintf("Health: hint — image exposes %v but service is configured for %d.", res.ExposedPorts, port))
 		}
 	} else {
