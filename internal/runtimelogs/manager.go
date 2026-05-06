@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/slots"
 )
 
 // Manager owns the set of active Forwarders, one per running Stacked-managed
@@ -109,6 +110,10 @@ type containerRow struct {
 	id        string
 	serviceID string
 	state     string
+	// slot is the value of the `com.stacked.slot` label, or "" when the
+	// container has no slot label (the historical recreate-mode shape
+	// where a service has exactly one container named <serviceID>).
+	slot string
 }
 
 // listStackedContainers enumerates Stacked-managed containers, identified by
@@ -122,11 +127,19 @@ type containerRow struct {
 // services for back-compat with already-deployed services that pre-date
 // the label (they keep streaming until their next deploy picks up the
 // updated compose template).
+//
+// During a rolling (blue/green) deploy, both <serviceID>-blue and
+// <serviceID>-green can be running simultaneously — they share the
+// same compose-project label. We disambiguate via `com.stacked.slot`:
+// the executor writes that label on rolling-mode containers, and we
+// keep only the row matching the active slot recorded in the slots
+// state file. Recreate-mode containers have no slot label and are
+// always kept.
 func listStackedContainers() []containerRow {
 	cmd := exec.Command(
 		"docker", "ps", "-a",
 		"--filter", "label=com.docker.compose.project",
-		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}	{{.Label "com.stacked.kind"}}`,
+		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}	{{.Label "com.stacked.kind"}}	{{.Label "com.stacked.slot"}}`,
 	)
 	out, err := cmd.Output()
 	if err != nil {
@@ -150,11 +163,53 @@ func listStackedContainers() []containerRow {
 		if kind == "database" {
 			continue
 		}
+		slot := ""
+		if len(parts) >= 5 {
+			slot = parts[4]
+		}
 		rows = append(rows, containerRow{
 			id:        parts[0],
 			serviceID: parts[1],
 			state:     parts[2],
+			slot:      slot,
 		})
 	}
-	return rows
+	return filterActiveSlot(rows)
+}
+
+// filterActiveSlot drops rows that don't correspond to the active slot
+// for their service. For services with no slot state recorded (the
+// recreate-mode default), all rows pass through unchanged. For
+// rolling-mode services, only the row whose `slot` label matches the
+// recorded active slot is kept; all other slot-bearing rows for the
+// same service are dropped, and unlabeled (legacy) rows are kept only
+// when the recorded active slot is exactly `legacy`.
+func filterActiveSlot(rows []containerRow) []containerRow {
+	if len(rows) == 0 {
+		return rows
+	}
+	state := slots.All()
+	if len(state) == 0 {
+		return rows
+	}
+	out := rows[:0:0]
+	for _, r := range rows {
+		active, ok := state[r.serviceID]
+		if !ok {
+			// No state for this service — keep everything as before.
+			out = append(out, r)
+			continue
+		}
+		if r.slot == "" {
+			// Legacy unlabeled container. Keep only when state says so.
+			if string(active) == "legacy" {
+				out = append(out, r)
+			}
+			continue
+		}
+		if r.slot == string(active) {
+			out = append(out, r)
+		}
+	}
+	return out
 }

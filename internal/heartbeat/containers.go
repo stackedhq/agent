@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/slots"
 )
 
 // collectContainers enumerates Stacked-managed Docker containers (those with a
@@ -72,6 +73,7 @@ type containerRow struct {
 	id        string
 	serviceID string
 	state     string
+	slot      string
 }
 
 func listStackedContainers() []containerRow {
@@ -87,7 +89,7 @@ func listStackedContainers() []containerRow {
 	cmd := exec.Command(
 		"docker", "ps", "-a",
 		"--filter", "label=com.docker.compose.project",
-		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}	{{.Label "com.stacked.kind"}}`,
+		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}	{{.Label "com.stacked.kind"}}	{{.Label "com.stacked.slot"}}`,
 	)
 	out, err := cmd.Output()
 	if err != nil {
@@ -111,13 +113,51 @@ func listStackedContainers() []containerRow {
 		if kind == "database" {
 			continue
 		}
+		slot := ""
+		if len(parts) >= 5 {
+			slot = parts[4]
+		}
 		rows = append(rows, containerRow{
 			id:        parts[0],
 			serviceID: parts[1],
 			state:     parts[2],
+			slot:      slot,
 		})
 	}
-	return rows
+	return filterActiveSlot(rows)
+}
+
+// filterActiveSlot mirrors the same-named helper in runtimelogs/manager.go.
+// Kept package-local to avoid pulling a shared dependency just for this
+// 20-line filter; the duplication is small and the rule is unlikely to
+// drift since both consumers must agree on which slot's metrics / logs
+// to surface.
+func filterActiveSlot(rows []containerRow) []containerRow {
+	if len(rows) == 0 {
+		return rows
+	}
+	state := slots.All()
+	if len(state) == 0 {
+		return rows
+	}
+	out := rows[:0:0]
+	for _, r := range rows {
+		active, ok := state[r.serviceID]
+		if !ok {
+			out = append(out, r)
+			continue
+		}
+		if r.slot == "" {
+			if string(active) == "legacy" {
+				out = append(out, r)
+			}
+			continue
+		}
+		if r.slot == string(active) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func containerIDs(rows []containerRow) []string {

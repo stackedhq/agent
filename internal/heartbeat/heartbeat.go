@@ -174,6 +174,30 @@ func readCPUStat() (idle, total uint64) {
 	return
 }
 
+// AvailableMemoryMB reads MemAvailable from /proc/meminfo and returns it
+// in megabytes. Returns 0 if the file is unreadable or the field is
+// missing (non-Linux hosts, exotic kernels). Used by the rolling-deploy
+// executor for the pre-flight memory-headroom check: starting a second
+// container alongside the live one needs roughly 2× the service's
+// memory limit to fit, and a 1 GB VPS should fail the deploy fast
+// rather than OOM-killing the host.
+func AvailableMemoryMB() uint64 {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "MemAvailable:") {
+			// parseMemInfoValue returns kB; convert to MB.
+			return parseMemInfoValue(line) / 1024
+		}
+	}
+	return 0
+}
+
 // memoryUsage reads /proc/meminfo and returns used memory as a percentage.
 func memoryUsage() float64 {
 	f, err := os.Open("/proc/meminfo")

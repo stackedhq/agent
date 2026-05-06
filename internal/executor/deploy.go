@@ -29,6 +29,15 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// Create a single streamer for the entire deploy lifecycle
 	streamer := logs.NewStreamer(e.Client, op.ID)
 
+	// Branch on deploy strategy. `recreate` (default, blank, or older
+	// agents that don't read the field) follows the historical
+	// in-place container replacement path defined in the rest of this
+	// function. `rolling` hands off to deployRolling, which owns the
+	// blue/green and fast-restart paths.
+	if strategy := getStringPayload(op.Payload, "deployStrategy"); strategy == "rolling" {
+		return e.deployRolling(op, streamer)
+	}
+
 	// Write deploy errors to the log stream so they appear in the UI
 	fail := func(err error) error {
 		streamer.AddLine("ERROR: " + err.Error())

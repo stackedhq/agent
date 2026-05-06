@@ -63,6 +63,14 @@ If the release requires changes to `install.sh` (new system deps, config changes
 - **Self-update**: Downloads new binary → replaces in-place → `os.Exit(0)` → systemd restarts with new binary
 - **All operations are sequential**: Poller claims pending ops and executes them one at a time
 
+## State Files
+
+The agent persists a small amount of state on disk under `/opt/stacked/`:
+
+- `active-slots.json` — owned by `internal/slots`. Maps `serviceID → "blue"|"green"|"legacy"` for services in rolling deploy mode. Read by the deploy executor (slot picking), proxy executor (Caddyfile upstream resolution), runtimelogs and heartbeat (filtering containers to the active slot during a rolling overlap). Recreate-mode services have no entry; `slots.Active(id)` returning `""` is the back-compat signal. File is flock-protected and atomically rewritten on every `slots.SetActive` / `slots.Clear`.
+- `proxy/domains.json` — owned by `internal/executor/proxy.go`. Cached snapshot of the most recent `proxy_config` payload from the server, so `RegenerateCaddyfile()` (called after a rolling-deploy slot flip) can rewrite the Caddyfile without round-tripping to the server.
+- `proxy/Caddyfile` and `proxy/Caddyfile.candidate` — the live Caddy config and the validate-before-swap candidate. Always validated inside the running Caddy container before being swapped into place; reload failure restores the previous bytes.
+
 ## Server Repo
 
 The Stacked server (Next.js) lives at `../stacked`. Agent changes often require corresponding server changes (API schema, UI).

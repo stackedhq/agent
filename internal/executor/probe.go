@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -75,6 +76,88 @@ func dialTCP(addr string) error {
 	}
 	_ = conn.Close()
 	return nil
+}
+
+// httpProbe issues a single GET against http://addr<path> with a short
+// timeout. Returns nil iff the response status is in [200, 400). 4xx and
+// 5xx are treated as failures — a healthy app should respond 2xx (or
+// occasionally a 3xx redirect on `/`) on its health endpoint. We deliberately
+// don't follow redirects: if /healthz redirects to /login the app is not
+// ready, regardless of the eventual final status.
+func httpProbe(addr, path string) error {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	client := &http.Client{
+		Timeout: probeDialTimeout * 2, // small budget per attempt; outer loop bounds total wait
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	url := "http://" + addr + path
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
+	}
+	return nil
+}
+
+// HealthGate runs a blocking probe loop against the container's bridge IP
+// on the configured port, retrying until either the probe passes or the
+// caller's timeout budget is exhausted. Used by rolling deploys to gate
+// the Caddy traffic flip on "new container is actually serving requests."
+//
+// `path` is optional. When empty, gates on TCP connect alone (matching
+// the post-deploy probe semantics). When set, also requires a 2xx/3xx
+// response from `GET path`. The gate emits human-readable progress to
+// the deploy log streamer so the user can see why a long gate is taking
+// time — "connection refused" vs. "503 from /healthz" are very different
+// debugging stories.
+//
+// Returns nil iff the gate passed within the budget.
+func HealthGate(streamer *logs.Streamer, serviceID, network string, port int, path string, totalTimeout time.Duration) error {
+	ip, err := containerIPOnNetwork(serviceID, network)
+	if err != nil {
+		return fmt.Errorf("resolve container IP: %w", err)
+	}
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
+
+	deadline := time.Now().Add(totalTimeout)
+	attempt := 0
+	var lastErr error
+	for {
+		attempt++
+		if err := dialTCP(addr); err != nil {
+			lastErr = err
+		} else if path != "" {
+			if err := httpProbe(addr, path); err != nil {
+				lastErr = err
+			} else {
+				streamer.AddLine(fmt.Sprintf("Health: gate passed on attempt %d (%s%s 2xx).", attempt, addr, path))
+				streamer.Flush()
+				return nil
+			}
+		} else {
+			streamer.AddLine(fmt.Sprintf("Health: gate passed on attempt %d (TCP %s).", attempt, addr))
+			streamer.Flush()
+			return nil
+		}
+
+		// Surface progress every few attempts so a long wait isn't silent.
+		if attempt%5 == 1 {
+			streamer.AddLine(fmt.Sprintf("Health: still waiting (attempt %d): %v", attempt, lastErr))
+			streamer.Flush()
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("health gate timed out after %s: %w", totalTimeout, lastErr)
+		}
+		time.Sleep(probeRetryDelay)
+	}
 }
 
 // probeTCP retries a TCP dial against addr up to probeAttempts times.

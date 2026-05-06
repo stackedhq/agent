@@ -40,6 +40,8 @@ func (e *Executor) Execute(op client.Operation) {
 	switch op.Type {
 	case "deploy":
 		result, err = e.Deploy(op)
+	case "release_command":
+		err = e.ReleaseCommand(op)
 	case "stop":
 		err = e.Stop(op)
 	case "restart":
