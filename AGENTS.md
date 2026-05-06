@@ -40,11 +40,19 @@ make build
 **Releasing:** Tag with `vX.Y.Z` and push — GitHub Actions builds binaries and creates a release.
 
 ```bash
-git tag v0.6.2
-git push origin main v0.6.2
+git tag v0.7.0
+git push origin v0.7.0
 ```
 
-Use **patch** version bumps (v0.6.x) unless there's a breaking change.
+### Versioning (SemVer, pre-1.0)
+
+Pick the bump from what *the user sees*, not from whether the change is technically backward compatible. Almost everything we ship is backward compatible (recreate keeps working, old payload fields stay honored), so "no breaking change" alone is not the patch test.
+
+- **Patch** (`v0.X.Y → v0.X.Y+1`) — bug fixes, log/UX tweaks, refactors, perf, dependency bumps. No new operation type, no new on-disk state, no new behavior the user has to learn or opt into.
+- **Minor** (`v0.X.Y → v0.X+1.0`) — new user-visible capability even when fully backward compatible. Triggers: a new `operation_type`, a new deploy strategy, a new state file under `/opt/stacked/`, a new label contract on managed containers, a new public package, anything that pairs with a server-repo schema change. Past examples: `db_*` ops landing, log archival rollout, rolling deploy strategy.
+- **Major** — N/A pre-1.0. If we ever ship a backward-incompatible payload change, coordinate the rollout with the server repo and still bump minor for now.
+
+When in doubt, bump minor. It's cheaper to over-version than to bury a meaningful release in a patch and confuse the dashboard's update banner copy.
 
 If the release requires changes to `install.sh` (new system deps, config changes, etc.), include `REQUIRES-REINSTALL` in the GitHub release notes body. The dashboard checks for this keyword and shows a manual reinstall banner instead of the auto-update button.
 
