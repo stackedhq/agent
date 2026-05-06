@@ -128,10 +128,13 @@ func (f *Forwarder) Run() {
 	}()
 
 	// Scan stdout and stderr concurrently; both feed the same buffer.
+	// The level tag ("info" / "error") preserves which stream a line came
+	// from so the dashboard can color stderr distinctly. This is the only
+	// authoritative severity signal available from `docker logs`.
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); f.scan(stdout) }()
-	go func() { defer wg.Done(); f.scan(stderr) }()
+	go func() { defer wg.Done(); f.scan(stdout, "info") }()
+	go func() { defer wg.Done(); f.scan(stderr, "error") }()
 	wg.Wait()
 
 	close(flushDone)
@@ -155,7 +158,15 @@ func (f *Forwarder) Stop() {
 }
 
 // scan reads lines from r, splitting timestamp from payload and buffering.
-func (f *Forwarder) scan(r io.Reader) {
+// `level` is the source-stream tag ("info" for stdout, "error" for stderr).
+// Wire format pushed to the server is `<rfc3339-ts>\t<level>\t<msg>` so the
+// dashboard can render a timestamp column and stderr coloring without a
+// JSON envelope. Tab is safe: `docker logs --timestamps` emits a single
+// space between ts and payload and never injects raw tabs of its own; any
+// tabs inside the payload survive as-is on the right side of the second
+// split. The archiver still gets the unframed (ts, line) tuple — its
+// NDJSON format is independent of the live wire framing.
+func (f *Forwarder) scan(r io.Reader, level string) {
 	scanner := bufio.NewScanner(r)
 	// Default buffer is 64KB; bump to 1MB so a single fat JSON log line
 	// doesn't kill the scanner.
@@ -168,17 +179,23 @@ func (f *Forwarder) scan(r io.Reader) {
 			line = line[:maxLineBytes] + " …[truncated]"
 		}
 
+		// Build the framed wire line. If we somehow lost the timestamp
+		// (defensive — splitTimestamp returns "" for malformed input),
+		// still emit the level marker so the dashboard can color it; the
+		// timestamp column will just be blank for that row.
+		framed := ts + "\t" + level + "\t" + line
+
 		f.mu.Lock()
 		if ts != "" {
 			f.lastTimestamp = ts
 		}
-		f.buffer = append(f.buffer, line)
+		f.buffer = append(f.buffer, framed)
 		shouldFlush := len(f.buffer) >= maxBatchSize
 		f.mu.Unlock()
 
 		// Tee into the archiver. Independent of the live flush schedule;
 		// archiver has its own 60s/1MiB cadence.
-		f.archiver.Add(ts, line)
+		f.archiver.Add(ts, level, line)
 
 		if shouldFlush {
 			f.flush()

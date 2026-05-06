@@ -49,8 +49,11 @@ type Archiver struct {
 // archiveRecord is the on-the-wire NDJSON shape per log line. Kept
 // intentionally minimal — adding fields later is forward-compat as long
 // as the reader skips unknown keys (the dashboard's `JSON.parse` does).
+// `Lvl` is "info" (stdout) or "error" (stderr); omitted for legacy chunks
+// that pre-date severity tagging.
 type archiveRecord struct {
 	Ts  string `json:"ts,omitempty"`
+	Lvl string `json:"lvl,omitempty"`
 	Msg string `json:"msg"`
 }
 
@@ -101,11 +104,11 @@ func (a *Archiver) Stop() {
 // Add buffers one log line. Called from Forwarder.scan() in addition to
 // the live forward path. The Forwarder owns the line-truncation policy,
 // so this is a pure append.
-func (a *Archiver) Add(ts, line string) {
+func (a *Archiver) Add(ts, lvl, line string) {
 	if a.disabled.Load() {
 		return
 	}
-	rec := archiveRecord{Ts: ts, Msg: line}
+	rec := archiveRecord{Ts: ts, Lvl: lvl, Msg: line}
 	data, err := json.Marshal(&rec)
 	if err != nil {
 		return
