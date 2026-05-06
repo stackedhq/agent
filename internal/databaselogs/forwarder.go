@@ -104,10 +104,13 @@ func (f *Forwarder) Run() {
 		}
 	}()
 
+	// Tag stdout as "info" and stderr as "error" so the dashboard can
+	// color stderr distinctly. See `runtimelogs/forwarder.go` for the
+	// rationale on the `<ts>\t<lvl>\t<msg>` wire format.
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); f.scan(stdout) }()
-	go func() { defer wg.Done(); f.scan(stderr) }()
+	go func() { defer wg.Done(); f.scan(stdout, "info") }()
+	go func() { defer wg.Done(); f.scan(stderr, "error") }()
 	wg.Wait()
 
 	close(flushDone)
@@ -123,7 +126,7 @@ func (f *Forwarder) Stop() {
 	<-f.done
 }
 
-func (f *Forwarder) scan(r io.Reader) {
+func (f *Forwarder) scan(r io.Reader, level string) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -134,11 +137,13 @@ func (f *Forwarder) scan(r io.Reader) {
 			line = line[:maxLineBytes] + " …[truncated]"
 		}
 
+		framed := ts + "\t" + level + "\t" + line
+
 		f.mu.Lock()
 		if ts != "" {
 			f.lastTimestamp = ts
 		}
-		f.buffer = append(f.buffer, line)
+		f.buffer = append(f.buffer, framed)
 		shouldFlush := len(f.buffer) >= maxBatchSize
 		f.mu.Unlock()
 
