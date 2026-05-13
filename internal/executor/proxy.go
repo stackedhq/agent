@@ -377,20 +377,39 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 	state := slots.All()
 	content := generateCaddyfile(parsed, state)
 
-	// Validate by writing the candidate to a sibling path and asking
-	// Caddy to validate it inside the container. We can't use
-	// `--config -` over stdin reliably across all Caddy versions, so
-	// the side-file approach is portable.
-	tmpPath := caddyfilePath + ".candidate"
-	if err := writeFile(tmpPath, content); err != nil {
-		return fmt.Errorf("write candidate Caddyfile: %w", err)
+	// Validate the candidate config inside the Caddy container before
+	// touching the live file. The container's `/etc/caddy/Caddyfile` is
+	// a single-file bind mount (see setup.go::proxyCompose), so a
+	// sibling `Caddyfile.candidate` written to the host directory is
+	// NOT visible inside the container. We instead pipe the candidate
+	// to a container-only scratch path via `docker exec` stdin and
+	// validate that path. `--config -` over stdin would be simpler but
+	// isn't portable across all Caddy versions.
+	composeFile := filepath.Join(proxyDir, "docker-compose.yml")
+	const candidateInContainer = "/tmp/Caddyfile.candidate"
+	writeCmd := exec.Command(
+		"docker", "compose", "-f", composeFile,
+		"exec", "-T", "caddy",
+		"sh", "-c", "cat > "+candidateInContainer,
+	)
+	writeCmd.Stdin = strings.NewReader(content)
+	if out, err := writeCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("write candidate Caddyfile into container: %s: %w", strings.TrimSpace(string(out)), err)
 	}
-	defer os.Remove(tmpPath)
+	// Best-effort cleanup; `/tmp` doesn't survive container restart
+	// anyway, but a tidy `rm` keeps `docker exec ls /tmp` boring.
+	defer func() {
+		_ = exec.Command(
+			"docker", "compose", "-f", composeFile,
+			"exec", "-T", "caddy",
+			"rm", "-f", candidateInContainer,
+		).Run()
+	}()
 
 	if err := exec.Command(
-		"docker", "compose", "-f", filepath.Join(proxyDir, "docker-compose.yml"),
+		"docker", "compose", "-f", composeFile,
 		"exec", "-T", "caddy",
-		"caddy", "validate", "--config", "/etc/caddy/Caddyfile.candidate",
+		"caddy", "validate", "--config", candidateInContainer,
 	).Run(); err != nil {
 		// Validation failed. Don't write the live file. Surface the
 		// validation error so the caller can decide what to do (rolling
@@ -403,7 +422,7 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 	}
 
 	if err := exec.Command(
-		"docker", "compose", "-f", filepath.Join(proxyDir, "docker-compose.yml"),
+		"docker", "compose", "-f", composeFile,
 		"exec", "-T", "caddy",
 		"caddy", "reload", "--config", "/etc/caddy/Caddyfile",
 	).Run(); err != nil {
