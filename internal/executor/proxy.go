@@ -95,6 +95,37 @@ func (d cachedDomain) isPortBound() bool {
 	return d.ServiceID == "" && d.Host != "" && d.Port > 0
 }
 
+// ReconcileProxy brings the on-disk proxy compose file and Caddy
+// container in line with the current agent version's expectations.
+// Intended to be called once at agent startup so that embedded-template
+// changes (e.g. a new extra_hosts entry in proxyCompose) land on existing
+// installs immediately after self-update, without waiting for the next
+// proxy_config op or requiring a manual reinstall.
+//
+// Skipped on machines that have never run Setup: presence of
+// `<proxyDir>/docker-compose.yml` is the signal that Caddy has been
+// provisioned here at least once. On a brand-new machine we let the
+// server-dispatched Setup op be the single source of truth for first
+// provisioning, to avoid racing with it.
+//
+// Errors are returned for the caller to log. They must not stop the
+// agent from booting — Docker may be slow to come up, the proxy may
+// be in a transient bad state, etc. The poller will recover via the
+// next proxy_config or Setup op.
+func ReconcileProxy() error {
+	composePath := filepath.Join(proxyDir, "docker-compose.yml")
+	if _, err := os.Stat(composePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil // never set up here; nothing to reconcile
+		}
+		return fmt.Errorf("stat proxy compose: %w", err)
+	}
+	if _, err := runCommandSilent("", "docker", "info"); err != nil {
+		return fmt.Errorf("docker not available")
+	}
+	return ensureProxy()
+}
+
 // ensureProxy ensures the Caddy proxy infrastructure is running.
 // Idempotent — safe to call on every proxy_config.
 //

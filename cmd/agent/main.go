@@ -45,6 +45,18 @@ func main() {
 	logMgr := runtimelogs.NewManager(c)
 	dbLogMgr := databaselogs.NewManager(c)
 
+	// Reconcile the proxy compose file and Caddy container against the
+	// current agent version. This lets embedded-template changes (e.g.
+	// extra_hosts in proxyCompose) land on existing installs as soon as
+	// systemd restarts us with the new binary after self-update, without
+	// needing a manual reinstall or waiting for the next proxy_config op.
+	// A no-op on machines that haven't run Setup yet. Errors are logged
+	// and swallowed — the agent must always come up so the poller can
+	// recover via subsequent ops.
+	if err := executor.ReconcileProxy(); err != nil {
+		log.Printf("Startup proxy reconcile skipped: %v", err)
+	}
+
 	stop := make(chan struct{})
 
 	go heartbeat.Loop(c, heartbeatInterval, stop)
