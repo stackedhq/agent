@@ -77,18 +77,22 @@ type containerRow struct {
 }
 
 func listStackedContainers() []containerRow {
-	// Tab-separated to avoid issues with image names containing spaces.
-	// We only want containers that belong to a Stacked-managed compose project.
+	// We only want Stacked-managed service containers, identified by
+	// the `com.stacked.kind=service` label that the deploy executor
+	// writes on every container it creates (both recreate-mode
+	// compose templates and rolling-mode `docker run`). The
+	// historical "no kind label = treat as service" back-compat path
+	// was removed because it swept up unrelated docker-compose
+	// projects the user runs on the same host (e.g. their own side
+	// projects) and the Caddy proxy itself, polluting heartbeat
+	// payloads with bogus serviceIds.
 	//
-	// Database containers are excluded via the `com.stacked.kind` label so
-	// their stats don't get reported as service metrics (the server lookup
-	// would silently drop them anyway, but emitting the rows is wasted
-	// bandwidth and noisy in heartbeat payloads). Containers without the
-	// label are treated as services for back-compat with already-deployed
-	// services that pre-date the label.
+	// Tab-separated to avoid issues with image names containing
+	// spaces. The docker-side label filter shortcuts the common case;
+	// the parser-side check below is defence in depth.
 	cmd := exec.Command(
 		"docker", "ps", "-a",
-		"--filter", "label=com.docker.compose.project",
+		"--filter", "label=com.stacked.kind=service",
 		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}	{{.Label "com.stacked.kind"}}	{{.Label "com.stacked.slot"}}`,
 	)
 	out, err := cmd.Output()
@@ -103,14 +107,13 @@ func listStackedContainers() []containerRow {
 			continue
 		}
 		parts := strings.Split(line, "\t")
-		if len(parts) < 3 {
+		if len(parts) < 4 {
 			continue
 		}
-		kind := ""
-		if len(parts) >= 4 {
-			kind = parts[3]
-		}
-		if kind == "database" {
+		if parts[3] != "service" {
+			// Should be redundant given the docker-side filter,
+			// but cheap to verify and avoids reporting bogus rows
+			// if docker ever loosens label-filter semantics.
 			continue
 		}
 		slot := ""

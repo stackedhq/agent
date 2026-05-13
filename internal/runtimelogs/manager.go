@@ -116,17 +116,28 @@ type containerRow struct {
 	slot string
 }
 
-// listStackedContainers enumerates Stacked-managed containers, identified by
-// the `com.docker.compose.project` label which the deploy executor sets to
-// the serviceID via the per-service working directory name.
+// listStackedContainers enumerates Stacked-managed service containers,
+// identified by the `com.stacked.kind=service` label that the deploy
+// executor writes on every container it creates (both recreate-mode
+// compose templates and rolling-mode `docker run` invocations).
 //
-// Database containers are explicitly skipped via the `com.stacked.kind`
-// label introduced when the agent gained db_* support — forwarders for
-// databases live in the databaselogs package and post to a different API
-// endpoint. Containers with no `com.stacked.kind` label are treated as
-// services for back-compat with already-deployed services that pre-date
-// the label (they keep streaming until their next deploy picks up the
-// updated compose template).
+// We intentionally do NOT fall back to "any container with a compose
+// project label" — that historical back-compat clause was meant to
+// catch services deployed by ancient agents that pre-dated the kind
+// label, but in practice it also swept up:
+//
+//   - the Caddy proxy container (compose project = literal "proxy")
+//   - unrelated docker-compose projects the user runs on the same
+//     host (e.g. their own side projects)
+//
+// Both produced bogus POSTs to /api/agent/logs/<non-uuid> which the
+// dashboard rejected as 500s and which spammed the agent log. Every
+// active code path that creates a Stacked service now sets the kind
+// label, so a positive allowlist is safe.
+//
+// Database containers (`com.stacked.kind=database`) are handled by a
+// separate forwarder in the databaselogs package and are excluded by
+// the same label-equality filter.
 //
 // During a rolling (blue/green) deploy, both <serviceID>-blue and
 // <serviceID>-green can be running simultaneously — they share the
@@ -138,7 +149,10 @@ type containerRow struct {
 func listStackedContainers() []containerRow {
 	cmd := exec.Command(
 		"docker", "ps", "-a",
-		"--filter", "label=com.docker.compose.project",
+		// Docker-side filter shortcuts the common case where the
+		// user runs other compose projects on the box. The
+		// parser-side check below is defence in depth.
+		"--filter", "label=com.stacked.kind=service",
 		"--format", `{{.ID}}	{{.Label "com.docker.compose.project"}}	{{.State}}	{{.Label "com.stacked.kind"}}	{{.Label "com.stacked.slot"}}`,
 	)
 	out, err := cmd.Output()
@@ -153,14 +167,21 @@ func listStackedContainers() []containerRow {
 			continue
 		}
 		parts := strings.Split(line, "\t")
-		if len(parts) < 3 {
+		if len(parts) < 4 {
 			continue
 		}
-		kind := ""
-		if len(parts) >= 4 {
-			kind = parts[3]
+		if parts[3] != "service" {
+			// Belt-and-braces: the docker-side filter should
+			// have excluded these already.
+			continue
 		}
-		if kind == "database" {
+		serviceID := parts[1]
+		if !isUUID(serviceID) {
+			// A Stacked service container with a non-UUID
+			// project label shouldn't exist (executor always
+			// uses the UUID). Warn once per project and skip
+			// so we don't POST garbage to the server.
+			warnNonUUIDOnce(serviceID)
 			continue
 		}
 		slot := ""
@@ -169,12 +190,53 @@ func listStackedContainers() []containerRow {
 		}
 		rows = append(rows, containerRow{
 			id:        parts[0],
-			serviceID: parts[1],
+			serviceID: serviceID,
 			state:     parts[2],
 			slot:      slot,
 		})
 	}
 	return filterActiveSlot(rows)
+}
+
+// isUUID is a cheap shape check for the 8-4-4-4-12 hex form. We only
+// need to reject things like "proxy" or compose-project slugs that
+// would 500 the server's UUID-typed query — not validate version /
+// variant bits.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// warnedNonUUID tracks projects we've already warned about so a
+// long-lived stray container doesn't fill the agent log on every
+// Reconcile tick.
+var (
+	warnedNonUUIDMu sync.Mutex
+	warnedNonUUID   = map[string]struct{}{}
+)
+
+func warnNonUUIDOnce(project string) {
+	warnedNonUUIDMu.Lock()
+	defer warnedNonUUIDMu.Unlock()
+	if _, seen := warnedNonUUID[project]; seen {
+		return
+	}
+	warnedNonUUID[project] = struct{}{}
+	log.Printf("runtimelogs: skipping container with com.stacked.kind=service but non-UUID project %q", project)
 }
 
 // filterActiveSlot drops rows that don't correspond to the active slot
