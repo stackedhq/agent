@@ -54,7 +54,30 @@ Pick the bump from what *the user sees*, not from whether the change is technica
 
 When in doubt, bump minor. It's cheaper to over-version than to bury a meaningful release in a patch and confuse the dashboard's update banner copy.
 
-If the release requires changes to `install.sh` (new system deps, config changes, etc.), include `REQUIRES-REINSTALL` in the GitHub release notes body. The dashboard checks for this keyword and shows a manual reinstall banner instead of the auto-update button.
+### REQUIRES-REINSTALL
+
+Include `REQUIRES-REINSTALL` in the GitHub release notes body **only** when the release contains a change the self-update path cannot apply. The dashboard checks for this keyword and shows a manual reinstall banner instead of the auto-update button.
+
+Self-update can do: swap the agent binary, restart itself via systemd, and — on the next op or startup hook — rewrite any file the `stacked` user owns under `/opt/stacked/` (compose files, Caddyfiles, state JSON) and recreate containers it manages.
+
+Self-update cannot do: anything requiring root, anything that has to happen before the agent process exists, or anything outside `/opt/stacked/`.
+
+**Use `REQUIRES-REINSTALL` for:**
+- `install.sh` changes (new system deps, new install steps)
+- New systemd unit fields or a renamed service
+- New sudoers entries (the existing rule only permits `systemctl restart|stop|status stacked-agent`)
+- File-layout migrations under `/opt/stacked/` that need root to perform
+- Anything that must run before the agent process starts
+
+**Do NOT use `REQUIRES-REINSTALL` for:**
+- Pure Go logic changes
+- Changes to embedded templates (Caddyfile, `docker-compose.yml` for the proxy, etc.) — these are rewritten by the agent and picked up by `docker compose up -d` on the next reconcile
+- New `operation_type` handlers
+- New state files the agent writes itself
+
+If a release changes an embedded template and you want it to land on existing installs without waiting for an unrelated op to trigger reconcile, ensure the relevant `ensure*` function (e.g. `ensureProxy`) is invoked from agent startup, not only from op handlers. That makes the change land on the systemd restart that follows self-update. Reaching for `REQUIRES-REINSTALL` to paper over a missing startup hook is the wrong fix — it pushes manual work onto every user for something the agent can do itself.
+
+**Historical note:** v0.8.0 was tagged `REQUIRES-REINSTALL` because the new `extra_hosts` entry in `proxyCompose()` only reconciles inside `ensureProxy()`, which isn't called at startup. Self-update swapped the binary but left the existing Caddy container on the old compose file until the next `proxy_config` op. The correct fix is a startup reconcile, not a reinstall.
 
 ## Development Guidelines
 
