@@ -34,6 +34,18 @@ func (e *Executor) Setup(op client.Operation) error {
 }
 
 func proxyCompose() string {
+	// `host.docker.internal:host-gateway` makes the host reachable from
+	// inside the Caddy container under a stable hostname. Required for
+	// port-bound domains where the user types host=127.0.0.1 expecting
+	// "this VPS" — inside a bridged container, 127.0.0.1 resolves to
+	// the container itself, not the host. The agent's Caddyfile
+	// renderer transparently rewrites 127.0.0.1/localhost to this
+	// hostname so the user-facing form stays simple.
+	//
+	// `host-gateway` is a synthetic value Docker resolves to the host's
+	// gateway IP at container start time. Supported on Docker 20.10+
+	// (Q4 2020) on Linux; older daemons will silently fail to add the
+	// host entry but Caddy still starts. We accept that fallback.
 	return `services:
   caddy:
     image: caddy:2-alpine
@@ -41,6 +53,8 @@ func proxyCompose() string {
     ports:
       - "80:80"
       - "443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data

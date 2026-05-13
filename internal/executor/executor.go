@@ -72,9 +72,20 @@ func (e *Executor) Execute(op client.Operation) {
 
 	if err != nil {
 		log.Printf("Operation %s (%s) failed: %v", op.ID, op.Type, err)
+		// If the handler returned a typed error carrying a
+		// structured result (currently only ProxyConfigError), use
+		// that instead of the bare {error: "..."} envelope so the
+		// server can render an actionable banner. Falls back to the
+		// historical shape for plain errors, preserving back-compat
+		// with the existing server-side parser.
+		failResult := map[string]interface{}{"error": err.Error()}
+		var pe *ProxyConfigError
+		if errors.As(err, &pe) {
+			failResult = pe.Result()
+		}
 		_ = e.Client.UpdateStatus(op.ID, &client.StatusUpdate{
 			Status: "failed",
-			Result: map[string]interface{}{"error": err.Error()},
+			Result: failResult,
 		})
 		return
 	}

@@ -58,6 +58,194 @@ func TestGenerateCaddyfileMixedRecreateAndRolling(t *testing.T) {
 	}
 }
 
+func TestGenerateCaddyfilePortBoundHTTP(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "plex.example.com", Host: "127.0.0.1", Port: 32400, Scheme: "http"},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	// 127.0.0.1 must be rewritten to host.docker.internal because
+	// Caddy runs inside a bridged container — see
+	// renderUpstreamHostPort. The user typed "this VPS"; we deliver
+	// "this VPS" rather than the container's own loopback.
+	if !strings.Contains(out, "reverse_proxy host.docker.internal:32400") {
+		t.Fatalf("expected loopback rewrite to host.docker.internal, got:\n%s", out)
+	}
+	if strings.Contains(out, "127.0.0.1") {
+		t.Fatalf("127.0.0.1 should have been rewritten, got:\n%s", out)
+	}
+	if strings.Contains(out, "https://") {
+		t.Fatalf("http upstream should not emit https scheme, got:\n%s", out)
+	}
+}
+
+func TestRenderUpstreamHostPortRewritesLoopback(t *testing.T) {
+	cases := map[string]string{
+		"127.0.0.1": "host.docker.internal:80",
+		"localhost": "host.docker.internal:80",
+		"LocalHost": "host.docker.internal:80",
+		"::1":       "host.docker.internal:80",
+	}
+	for input, want := range cases {
+		if got := renderUpstreamHostPort(input, 80); got != want {
+			t.Errorf("%s -> %s, want %s", input, got, want)
+		}
+	}
+}
+
+func TestRenderUpstreamHostPortLeavesOtherHostsAlone(t *testing.T) {
+	cases := map[string]string{
+		"10.0.0.5":              "10.0.0.5:443",
+		"host.docker.internal":  "host.docker.internal:443",
+		"plex":                  "plex:443",
+		"upstream.lan":          "upstream.lan:443",
+	}
+	for input, want := range cases {
+		if got := renderUpstreamHostPort(input, 443); got != want {
+			t.Errorf("%s -> %s, want %s", input, got, want)
+		}
+	}
+}
+
+func TestRenderUpstreamHostPortBracketsIPv6(t *testing.T) {
+	cases := map[string]string{
+		"2001:db8::1":  "[2001:db8::1]:8080",
+		"fe80::1234":   "[fe80::1234]:8080",
+		"[2001:db8::1]": "[2001:db8::1]:8080", // already-bracketed passes through
+	}
+	for input, want := range cases {
+		if got := renderUpstreamHostPort(input, 8080); got != want {
+			t.Errorf("%s -> %s, want %s", input, got, want)
+		}
+	}
+}
+
+func TestGenerateCaddyfilePortBoundHTTPS(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "upstream.example.com", Host: "10.0.0.5", Port: 8443, Scheme: "https"},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	if !strings.Contains(out, "reverse_proxy https://10.0.0.5:8443") {
+		t.Fatalf("expected port-bound https upstream, got:\n%s", out)
+	}
+}
+
+func TestGenerateCaddyfilePortBoundIPv6HTTPS(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "v6.example.com", Host: "2001:db8::5", Port: 8443, Scheme: "https"},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	if !strings.Contains(out, "reverse_proxy https://[2001:db8::5]:8443") {
+		t.Fatalf("IPv6 upstream must be bracketed, got:\n%s", out)
+	}
+}
+
+func TestGenerateCaddyfileMixedServiceAndPortBound(t *testing.T) {
+	// Slot state for the rolling service must not leak into the
+	// port-bound row's upstream.
+	parsed := []cachedDomain{
+		{Domain: "app.example.com", ServiceID: "svc-1", Port: 3000},
+		{Domain: "plex.example.com", Host: "127.0.0.1", Port: 32400, Scheme: "http"},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{"svc-1": slots.Blue})
+	if !strings.Contains(out, "reverse_proxy svc-1-blue:3000") {
+		t.Fatalf("service-backed row should use slot upstream, got:\n%s", out)
+	}
+	if !strings.Contains(out, "reverse_proxy host.docker.internal:32400") {
+		t.Fatalf("port-bound row should use host.docker.internal upstream, got:\n%s", out)
+	}
+}
+
+func TestParseDomainsAcceptsBothShapes(t *testing.T) {
+	raw := []interface{}{
+		map[string]interface{}{
+			"domain":    "a.example.com",
+			"serviceId": "svc-1",
+			"port":      float64(3000),
+		},
+		map[string]interface{}{
+			"domain": "b.example.com",
+			"host":   "127.0.0.1",
+			"port":   float64(32400),
+			"scheme": "http",
+		},
+		// Neither shape — should be dropped.
+		map[string]interface{}{
+			"domain": "c.example.com",
+		},
+	}
+	parsed := parseDomains(raw)
+	if len(parsed) != 2 {
+		t.Fatalf("expected 2 valid domains, got %d: %+v", len(parsed), parsed)
+	}
+	if parsed[0].ServiceID != "svc-1" || parsed[0].Port != 3000 {
+		t.Errorf("service-backed parse wrong: %+v", parsed[0])
+	}
+	if !parsed[1].isPortBound() {
+		t.Errorf("second row should be detected as port-bound: %+v", parsed[1])
+	}
+	if parsed[1].Host != "127.0.0.1" || parsed[1].Port != 32400 || parsed[1].Scheme != "http" {
+		t.Errorf("port-bound parse wrong: %+v", parsed[1])
+	}
+}
+
+func TestParseDomainsDefaultsSchemeToHTTP(t *testing.T) {
+	raw := []interface{}{
+		map[string]interface{}{
+			"domain": "a.example.com",
+			"host":   "127.0.0.1",
+			"port":   float64(8080),
+			// scheme omitted
+		},
+	}
+	parsed := parseDomains(raw)
+	if len(parsed) != 1 || parsed[0].Scheme != "http" {
+		t.Fatalf("missing scheme should default to http, got: %+v", parsed)
+	}
+}
+
+func TestProxyConfigErrorResult(t *testing.T) {
+	err := &ProxyConfigError{
+		Code:    "port_in_use",
+		Port:    80,
+		Holder:  "dokploy-traefik",
+		Message: "port 80 is held by container 'dokploy-traefik'",
+	}
+	res := err.Result()
+	if res["error_code"] != "port_in_use" {
+		t.Errorf("missing error_code: %+v", res)
+	}
+	if res["port"] != 80 {
+		t.Errorf("missing port: %+v", res)
+	}
+	if res["holder"] != "dokploy-traefik" {
+		t.Errorf("missing holder: %+v", res)
+	}
+	if res["error"] == nil {
+		t.Errorf("missing legacy error field: %+v", res)
+	}
+}
+
+func TestParsePortInUseFromDocker(t *testing.T) {
+	out := `Container proxy-caddy-1  Starting
+Error response from daemon: driver failed programming external connectivity on endpoint proxy-caddy-1 (abc): Bind for 0.0.0.0:80 failed: port is already allocated
+`
+	port, _ := parsePortInUseFromDocker(out)
+	if port != 80 {
+		t.Errorf("expected port 80, got %d", port)
+	}
+	// Holder lookup runs docker ps which won't be available in tests;
+	// we tolerate empty holder. Production path is exercised by
+	// integration.
+}
+
+func TestParsePortInUseFromDockerNoMatch(t *testing.T) {
+	out := "some unrelated docker error"
+	port, holder := parsePortInUseFromDocker(out)
+	if port != 0 || holder != "" {
+		t.Errorf("expected zero values, got port=%d holder=%q", port, holder)
+	}
+}
+
 func TestGetIntPayloadOrFallback(t *testing.T) {
 	cases := []struct {
 		name     string
