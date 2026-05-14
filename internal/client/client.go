@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -237,6 +238,21 @@ func (c *Client) GetCredentials(serviceID string) (*Credentials, error) {
 
 // --- HTTP helpers ---
 
+// HTTPError is returned by doRequest when the server responds with a 4xx
+// or 5xx status. Exposing the status code lets doJSON decide whether the
+// request is retry-safe: 5xx and transport errors are retried, 4xx are
+// not (the server is intentionally rejecting us — retrying just amplifies
+// the failure, e.g. 429s where each retry refills the rate-limit window).
+type HTTPError struct {
+	Status     int
+	Body       string
+	RetryAfter time.Duration // parsed from Retry-After header; 0 if absent/invalid
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
+}
+
 func (c *Client) doJSON(method, path string, payload interface{}) ([]byte, error) {
 	var bodyReader io.Reader
 	if payload != nil {
@@ -258,6 +274,16 @@ func (c *Client) doJSON(method, path string, payload interface{}) ([]byte, error
 			return body, nil
 		}
 		lastErr = err
+
+		// Don't retry 4xx — the server is rejecting us on purpose, and
+		// retrying 429s in particular makes the rate-limit problem worse
+		// (each retry adds another timestamp to the server's sliding
+		// window). 5xx and transport errors fall through to the normal
+		// retry path.
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) && httpErr.Status >= 400 && httpErr.Status < 500 {
+			return nil, err
+		}
 
 		// Re-create reader for retry if we had a body
 		if payload != nil {
@@ -289,8 +315,28 @@ func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, error) 
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, &HTTPError{
+			Status:     resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	return respBody, nil
+}
+
+// parseRetryAfter parses an HTTP Retry-After header value as a duration.
+// Only the delta-seconds form is supported (the HTTP-date form is
+// uncommon for our server and not worth the dependency). Returns 0 on
+// any parse failure so callers can treat it as "no hint".
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	secs, err := time.ParseDuration(v + "s")
+	if err != nil || secs < 0 {
+		return 0
+	}
+	return secs
 }
