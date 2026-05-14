@@ -155,6 +155,45 @@ func TestGenerateCaddyfileMixedServiceAndPortBound(t *testing.T) {
 	}
 }
 
+func TestGenerateCaddyfileEmitsServerHeader(t *testing.T) {
+	// `Server: Stacked` should be emitted exactly once per site block,
+	// for both service-backed and port-bound domains, regardless of
+	// slot state. This is the Vercel-parity brand header.
+	parsed := []cachedDomain{
+		{Domain: "app.example.com", ServiceID: "svc-1", Port: 3000},
+		{Domain: "plex.example.com", Host: "127.0.0.1", Port: 32400, Scheme: "http"},
+		{Domain: "upstream.example.com", Host: "10.0.0.5", Port: 8443, Scheme: "https"},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{"svc-1": slots.Blue})
+	if n := strings.Count(out, "header Server Stacked"); n != len(parsed) {
+		t.Fatalf("expected %d `header Server Stacked` lines (one per site), got %d in:\n%s", len(parsed), n, out)
+	}
+	// Header must be inside the site block, after `reverse_proxy`,
+	// before the closing brace. Check that ordering holds for each
+	// site by walking the rendered output.
+	for _, d := range parsed {
+		idxOpen := strings.Index(out, d.Domain+" {")
+		if idxOpen < 0 {
+			t.Fatalf("site block for %s missing in:\n%s", d.Domain, out)
+		}
+		rest := out[idxOpen:]
+		idxClose := strings.Index(rest, "}")
+		if idxClose < 0 {
+			t.Fatalf("site block for %s not closed in:\n%s", d.Domain, out)
+		}
+		block := rest[:idxClose]
+		if !strings.Contains(block, "reverse_proxy ") {
+			t.Fatalf("site block for %s missing reverse_proxy:\n%s", d.Domain, block)
+		}
+		if !strings.Contains(block, "header Server Stacked") {
+			t.Fatalf("site block for %s missing brand header:\n%s", d.Domain, block)
+		}
+		if strings.Index(block, "reverse_proxy ") > strings.Index(block, "header Server Stacked") {
+			t.Fatalf("brand header should follow reverse_proxy in site %s:\n%s", d.Domain, block)
+		}
+	}
+}
+
 func TestParseDomainsAcceptsBothShapes(t *testing.T) {
 	raw := []interface{}{
 		map[string]interface{}{
