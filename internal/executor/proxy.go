@@ -562,6 +562,12 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 			}
 			fmt.Fprintf(&b, "    reverse_proxy %s:%d\n", host, d.Port)
 		}
+		// Brand the proxy in responses, à la Vercel's `Server: Vercel`.
+		// `header` with no prefix is set-semantics: it overrides whatever
+		// the upstream (or Caddy's own default) emitted for `Server`.
+		// Applied uniformly to service-backed and port-bound domains —
+		// the proxy is ours in both cases.
+		b.WriteString("    header Server Stacked\n")
 		fmt.Fprintf(&b, "}\n\n")
 	}
 	return b.String()
