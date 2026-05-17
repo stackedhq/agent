@@ -66,6 +66,10 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.EnableExtension(op)
 	case "db_extension_disable":
 		err = e.DisableExtension(op)
+	case "db_migrate":
+		err = e.DBMigrate(op)
+	case "volume_migrate":
+		err = e.VolumeMigrate(op)
 	default:
 		err = fmt.Errorf("unknown operation type: %s", op.Type)
 	}

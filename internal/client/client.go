@@ -222,6 +222,43 @@ func (c *Client) ConfirmLogArchive(serviceID string, confirm *LogArchiveConfirm)
 	return err
 }
 
+// --- Migration credentials ---
+
+// MigrationDBCreds holds the source + target credentials and container
+// names for a `db_migrate` op. Populated server-side from the
+// dokploy_migration_targets row + the encrypted source creds blob.
+type MigrationDBCreds struct {
+	ContainerName string            `json:"containerName"`
+	Creds         map[string]string `json:"creds"`
+}
+
+type MigrationCredentials struct {
+	Kind   string            `json:"kind"` // "database" | "volume"
+	Engine string            `json:"engine,omitempty"`
+	Source *MigrationDBCreds `json:"source,omitempty"`
+	Target *MigrationDBCreds `json:"target,omitempty"`
+	SourcePath string         `json:"sourcePath,omitempty"`
+	TargetPath string         `json:"targetPath,omitempty"`
+}
+
+type migrationCredentialsResponse struct {
+	Data MigrationCredentials `json:"data"`
+}
+
+// GetMigrationCredentials fetches decrypted source + target creds for a
+// dokploy_migration_targets row. Mirrors `GetCredentials` for services.
+func (c *Client) GetMigrationCredentials(targetID string) (*MigrationCredentials, error) {
+	body, err := c.doJSON("GET", "/api/agent/migration-credentials/"+targetID, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp migrationCredentialsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to decode migration credentials: %w", err)
+	}
+	return &resp.Data, nil
+}
+
 func (c *Client) GetCredentials(serviceID string) (*Credentials, error) {
 	body, err := c.doJSON("GET", "/api/agent/credentials/"+serviceID, nil)
 	if err != nil {
