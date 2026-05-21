@@ -4,12 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/slots"
@@ -129,17 +127,17 @@ func ReconcileProxy() error {
 // ensureProxy ensures the Caddy proxy infrastructure is running.
 // Idempotent — safe to call on every proxy_config.
 //
-// Before invoking `docker compose up` we run a port preflight on
-// the host's :80 and :443 listeners. A successful `compose up` is
-// idempotent when ports are already bound by *our* Caddy (the
-// existing process owns them), but fails fatally when *another*
-// process owns them — the docker daemon returns a raw
-// "Bind for 0.0.0.0:80 failed: port is already allocated" string.
-//
-// We catch that case up-front and return a typed *ProxyConfigError
-// so the server can render an actionable banner ("port 80 in use by
-// '<container>'") instead of leaving every domain stuck on
-// "Origin cert: issuing".
+// Port conflicts on :80/:443 are detected post-hoc by parsing the
+// docker daemon's error from `docker compose up -d` (see
+// parsePortInUseFromDocker). Docker is the only authoritative source
+// for whether the bind succeeds — it runs as root, it uses the same
+// IPv4/v6 semantics as the Caddy container's actual binds, and it
+// owns the port from the moment it succeeds. Any independent
+// preflight (e.g. an in-process net.Listen probe) is either wrong
+// for unprivileged agents (EACCES on ports <1024 looks identical to
+// EADDRINUSE), wrong on dual-stack hosts (Go binds v4+v6 by default,
+// docker binds v4 only), or racy (port can change owner between
+// probe and compose up). So we don't run one.
 func ensureProxy() error {
 	if err := ensureDir(proxyDir); err != nil {
 		return fmt.Errorf("create proxy dir: %w", err)
@@ -172,43 +170,14 @@ func ensureProxy() error {
 		return fmt.Errorf("ensure Caddyfile: %w", err)
 	}
 
-	// Port preflight — see doc comment above. Skip if our Caddy
-	// container is already running, since *we* are the legitimate
-	// owner of those binds in that case and `compose up` will be a
-	// no-op.
-	if !caddyContainerRunning() {
-		if perr := checkPortConflict(); perr != nil {
-			return perr
-		}
-	}
-
-	// Start Caddy (no-op if already running)
+	// Start Caddy (no-op if already running). docker compose up -d is
+	// idempotent against a running container, and the docker daemon is
+	// the authoritative arbiter of port conflicts — if :80 or :443 is
+	// held by something else, the daemon returns a recognizable error
+	// string that parsePortInUseFromDocker turns into a typed
+	// ProxyConfigError for the server to surface.
 	if out, err := runCommandSilent(proxyDir, "docker", "compose", "up", "-d"); err != nil {
-		// Last-line check: in case the preflight missed something
-		// (race window, IPv6-only bind, etc.), surface a typed
-		// port_in_use error if the daemon's message looks like one.
 		if port, holder := parsePortInUseFromDocker(out); port != 0 {
-			return &ProxyConfigError{
-				Code:    "port_in_use",
-				Port:    port,
-				Holder:  holder,
-				Message: fmt.Sprintf("start caddy: port %d already in use", port),
-			}
-		}
-		return fmt.Errorf("start caddy: %s: %w", out, err)
-	}
-
-	return nil
-}
-
-// checkPortConflict tries to bind 80 and 443 briefly. A successful
-// bind proves no one else is on the port. A bind error is the signal
-// to identify the docker container holding it (best-effort) and
-// return a typed ProxyConfigError.
-func checkPortConflict() *ProxyConfigError {
-	for _, port := range []int{80, 443} {
-		if err := probePort(port); err != nil {
-			holder := lookupPortHolderContainer(port)
 			msg := fmt.Sprintf("port %d is already in use on this machine", port)
 			if holder != "" {
 				msg = fmt.Sprintf("port %d is held by container '%s'", port, holder)
@@ -220,36 +189,10 @@ func checkPortConflict() *ProxyConfigError {
 				Message: msg,
 			}
 		}
+		return fmt.Errorf("start caddy: %s: %w", out, err)
 	}
-	return nil
-}
 
-// probePort attempts a transient listen on the given port (IPv4 +
-// IPv6) and immediately closes. Any error means something owns it.
-func probePort(port int) error {
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return err
-	}
-	_ = l.Close()
-	// Tiny pause to ensure the socket is fully released before we
-	// hand the port back to docker compose up.
-	time.Sleep(20 * time.Millisecond)
 	return nil
-}
-
-// caddyContainerRunning checks whether our Caddy container is
-// currently up. A `compose up -d` on an already-running container
-// re-uses the existing binds without conflict, so we can skip the
-// preflight in that case.
-func caddyContainerRunning() bool {
-	out, err := exec.Command("docker", "compose", "-f",
-		filepath.Join(proxyDir, "docker-compose.yml"),
-		"ps", "--status=running", "--quiet").Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) != ""
 }
 
 // lookupPortHolderContainer asks docker which container publishes the
@@ -267,8 +210,9 @@ func lookupPortHolderContainer(port int) string {
 	if len(names) == 0 {
 		return ""
 	}
-	// Filter out our own Caddy if it shows up (it shouldn't given the
-	// caddyContainerRunning guard, but belt-and-braces).
+	// Skip our own Caddy if it shows up — we wouldn't be in this code
+	// path if docker were happy with the bind, so a proxy-caddy entry
+	// here is leftover bookkeeping, not the real holder.
 	for _, n := range names {
 		if !strings.Contains(n, "proxy-caddy") {
 			return n
