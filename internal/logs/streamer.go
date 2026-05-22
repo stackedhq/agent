@@ -3,6 +3,7 @@ package logs
 import (
 	"bufio"
 	"io"
+	"regexp"
 	"sync"
 	"time"
 
@@ -13,6 +14,25 @@ const (
 	flushInterval = 1 * time.Second
 	maxBatchSize  = 50
 )
+
+// tokenURLPattern matches the `x-access-token:<token>@github.com` shape
+// we embed installation tokens into for `git clone`. When git or any
+// downstream tool echoes the clone URL on failure, this regex strips
+// the token so it doesn't end up in the deploy log streamed to the
+// dashboard (or, worse, archived to R2).
+//
+// The token character class is length-agnostic on purpose: GitHub's new
+// stateless `ghs_…` JWT format (rolling out per the May 2026 changelog)
+// can be ~520 chars and contains dots and underscores. We match
+// anything that isn't `@` or whitespace.
+var tokenURLPattern = regexp.MustCompile(`x-access-token:[^@\s]+@`)
+
+// redactLine strips embedded installation tokens from a log line. Safe
+// to apply unconditionally — lines without the pattern are returned
+// unchanged.
+func redactLine(s string) string {
+	return tokenURLPattern.ReplaceAllString(s, "x-access-token:***@")
+}
 
 // Streamer reads lines from an io.Reader and batches them to the Stacked API.
 type Streamer struct {
@@ -39,7 +59,7 @@ func (s *Streamer) SetProgress(p int) {
 
 // AddLine injects a synthetic log line into the buffer.
 func (s *Streamer) AddLine(msg string) {
-	line := "[" + time.Now().UTC().Format("15:04:05") + "] " + msg
+	line := "[" + time.Now().UTC().Format("15:04:05") + "] " + redactLine(msg)
 	s.mu.Lock()
 	s.buffer = append(s.buffer, line)
 	s.mu.Unlock()
@@ -67,7 +87,7 @@ func (s *Streamer) Stream(r io.Reader) {
 	}()
 
 	for scanner.Scan() {
-		line := "[" + time.Now().UTC().Format("15:04:05") + "] " + scanner.Text()
+		line := "[" + time.Now().UTC().Format("15:04:05") + "] " + redactLine(scanner.Text())
 		s.mu.Lock()
 		s.buffer = append(s.buffer, line)
 		shouldFlush := len(s.buffer) >= maxBatchSize

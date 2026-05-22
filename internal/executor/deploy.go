@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -57,6 +58,14 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 
 	creds, err := e.Client.GetCredentials(serviceID)
 	if err != nil {
+		// Typed credentials error from the server (e.g. GitHub App not
+		// installed for the repo's owner). Surface the server's human
+		// message verbatim instead of wrapping in `get credentials:` —
+		// the message is already actionable for the end user.
+		var credErr *client.CredentialsError
+		if errors.As(err, &credErr) {
+			return nil, fail(fmt.Errorf("%s", credErr.Message))
+		}
 		return nil, fail(fmt.Errorf("get credentials: %w", err))
 	}
 	if creds.Port > 0 {

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os/exec"
@@ -59,6 +60,10 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 
 	creds, err := e.Client.GetCredentials(serviceID)
 	if err != nil {
+		var credErr *client.CredentialsError
+		if errors.As(err, &credErr) {
+			return fail(fmt.Errorf("%s", credErr.Message))
+		}
 		return fail(fmt.Errorf("get credentials: %w", err))
 	}
 

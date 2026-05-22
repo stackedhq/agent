@@ -40,6 +40,27 @@ type HeartbeatRequest struct {
 	Arch         string            `json:"arch,omitempty"`
 	Hostname     string            `json:"hostname,omitempty"`
 	Containers   []ContainerStatus `json:"containers,omitempty"`
+	// Optional tailnet snapshot. Omitted entirely when Tailscale is
+	// not installed on this VPS — the server then knows to leave the
+	// machine's tailscale_* columns untouched. See heartbeat/tailscale.go.
+	Tailscale *TailscaleStatus `json:"tailscale,omitempty"`
+}
+
+// TailscaleStatus is the subset of `tailscale status --json` the agent
+// reports on each heartbeat. Status values are mapped agent-side from
+// Tailscale's BackendState enum into a small set the dashboard switch
+// on directly — see internal/heartbeat/tailscale.go.
+type TailscaleStatus struct {
+	// One of: "connected", "expired" (reserved — currently agents
+	// only emit "needs_login" for expired keys), "needs_login",
+	// "stopped", "starting".
+	Status       string `json:"status"`
+	IPv4         string `json:"ipv4,omitempty"`
+	IPv6         string `json:"ipv6,omitempty"`
+	MagicDNSName string `json:"magicDnsName,omitempty"`
+	NodeID       string `json:"nodeId,omitempty"`
+	LoginName    string `json:"loginName,omitempty"`
+	TailnetName  string `json:"tailnetName,omitempty"`
 }
 
 type ContainerStatus struct {
@@ -92,8 +113,34 @@ type Credentials struct {
 	Port int `json:"port,omitempty"`
 }
 
+// CredentialsErrorBody is the server-side error envelope returned
+// alongside `Data` when the credentials endpoint cannot mint a usable
+// token (e.g. GitHub App not installed for the repo's owner, or token
+// mint failed). The agent surfaces `Message` verbatim to the user via
+// the deploy log so they get an actionable next step instead of a
+// generic `git clone` failure.
+type CredentialsErrorBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
 type CredentialsResponse struct {
-	Data Credentials `json:"data"`
+	Data  Credentials           `json:"data"`
+	Error *CredentialsErrorBody `json:"error,omitempty"`
+}
+
+// CredentialsError is returned by GetCredentials when the server
+// responded with a typed error envelope. Distinct from transport
+// errors so callers can format it differently in the deploy log
+// (we don't want "get credentials: <stack trace>" — we want the
+// server's human message rendered as-is).
+type CredentialsError struct {
+	Code    string
+	Message string
+}
+
+func (e *CredentialsError) Error() string {
+	return e.Message
 }
 
 // --- API methods ---
@@ -268,6 +315,12 @@ func (c *Client) GetCredentials(serviceID string) (*Credentials, error) {
 	var resp CredentialsResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to decode credentials: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, &CredentialsError{
+			Code:    resp.Error.Code,
+			Message: resp.Error.Message,
+		}
 	}
 	return &resp.Data, nil
 }
