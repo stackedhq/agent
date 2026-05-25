@@ -67,6 +67,12 @@ func send(c *client.Client) {
 		Arch:         sysInfo.Arch,
 		Hostname:     sysInfo.Hostname,
 		Containers:   collectContainers(),
+		// Optional. Returns nil if the tailscale binary isn't
+		// installed or the daemon errored — the field is then
+		// omitted from the JSON wire payload (omitempty) so the
+		// server treats this machine as "no tailscale activity to
+		// report" and leaves its tailscale_* columns alone.
+		Tailscale: collectTailscaleStatus(),
 	}
 
 	if err := c.Heartbeat(req); err != nil {

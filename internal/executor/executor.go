@@ -70,8 +70,22 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.DBMigrate(op)
 	case "volume_migrate":
 		err = e.VolumeMigrate(op)
+	case "tailscale_setup":
+		err = e.TailscaleSetup(op)
+	case "tailscale_disable":
+		err = e.TailscaleDisable(op)
 	default:
 		err = fmt.Errorf("unknown operation type: %s", op.Type)
+	}
+
+	// Open-ended ops (today: tailscale_setup) take responsibility for
+	// their own terminal status updates — the handler has already
+	// reported `running` with an interim result, and the final
+	// transition will come from a different path (heartbeat-driven in
+	// the tailscale case). Return early so we don't clobber that state
+	// with a synthetic `success`.
+	if errors.Is(err, errOpenEnded) {
+		return
 	}
 
 	if err != nil {
