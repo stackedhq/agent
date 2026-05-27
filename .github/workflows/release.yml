@@ -105,11 +105,16 @@ jobs:
           AINOTES_EOF
           )
 
-          # Detect REQUIRES-REINSTALL anywhere in the commit range so it survives
-          # even if the AI step failed or omitted it.
+          # Detect REQUIRES-REINSTALL across the commit range so it survives
+          # even if the AI step failed or omitted it. The token only counts
+          # when it sits on its own line in a commit body — same rule the
+          # dashboard uses (see stacked/src/lib/agent-version.ts). A bare
+          # substring match catches negated mentions like
+          # `No REQUIRES-REINSTALL: install.sh unchanged` and produces false
+          # positives, so anchor to line boundaries here too.
           PREV="${{ steps.tags.outputs.previous }}"
           CURRENT="${{ steps.tags.outputs.current }}"
-          if git log --format=%B "${PREV}..${CURRENT}" 2>/dev/null | grep -q "REQUIRES-REINSTALL"; then
+          if git log --format=%B "${PREV}..${CURRENT}" 2>/dev/null | grep -qE '^[[:space:]]*REQUIRES-REINSTALL[[:space:]]*$'; then
             REINSTALL=1
           else
             REINSTALL=0
