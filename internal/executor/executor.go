@@ -74,6 +74,12 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.TailscaleSetup(op)
 	case "tailscale_disable":
 		err = e.TailscaleDisable(op)
+	case "dokploy_takeover_probe":
+		result, err = e.DokployTakeoverProbe(op)
+	case "dokploy_traefik_stop":
+		err = e.DokployTraefikStop(op)
+	case "dokploy_traefik_start":
+		err = e.DokployTraefikStart(op)
 	default:
 		err = fmt.Errorf("unknown operation type: %s", op.Type)
 	}
