@@ -132,8 +132,15 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 		}
 	}
 
-	// Generate docker-compose.yml using the image
-	compose := generateCompose(serviceID, imageName)
+	// Generate docker-compose.yml using the image. Volumes are pulled
+	// from the op payload — absent / empty / malformed payloads yield
+	// an empty mounts list and the template renders identically to the
+	// pre-host-volumes version.
+	mounts := parseVolumes(op.Payload)
+	if err := ensureVolumeHostDirs(mounts); err != nil {
+		return nil, fail(err)
+	}
+	compose := generateCompose(serviceID, imageName, mounts)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
@@ -274,7 +281,7 @@ func buildEnvFile(vars map[string]string) string {
 	return b.String()
 }
 
-func generateCompose(serviceID, imageName string) string {
+func generateCompose(serviceID, imageName string, mounts []volumeMount) string {
 	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
 	// managers correctly partition `docker ps` output. The runtimelogs
 	// manager treats label-less containers as services for back-compat
@@ -288,6 +295,15 @@ func generateCompose(serviceID, imageName string) string {
 	// cannot match — making every post-deploy health probe fail with
 	// `docker inspect: exit status 1`. Databases (database.go) already do
 	// this; services were missing it.
+	//
+	// The `volumes:` block is spliced in only when there are mounts —
+	// omitting the key entirely is intentional (some compose versions
+	// read an empty `volumes:` as "remove previously configured
+	// volumes", which would conflict with the historical no-volumes
+	// template). Callers (deploy.go, deploy_rolling.go) are responsible
+	// for `ensureVolumeHostDirs` before invoking `docker compose up` so
+	// the bind sources exist with predictable mode/ownership.
+	volumesBlock := renderComposeVolumes(mounts)
 	return fmt.Sprintf(`services:
   %s:
     container_name: %s
@@ -295,7 +311,7 @@ func generateCompose(serviceID, imageName string) string {
     restart: unless-stopped
     env_file:
       - .env
-    networks:
+%s    networks:
       - stacked
     labels:
       com.stacked.kind: service
@@ -304,5 +320,5 @@ networks:
   stacked:
     name: stacked
     external: true
-`, serviceID, serviceID, imageName)
+`, serviceID, serviceID, imageName, volumesBlock)
 }

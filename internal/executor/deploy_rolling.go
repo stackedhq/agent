@@ -39,15 +39,13 @@ func (e *Executor) deployRolling(op client.Operation, streamer *logs.Streamer) (
 		return nil, fmt.Errorf("rolling deploy requires serviceId in payload")
 	}
 
-	// `volumes` arrives as []interface{} from the JSON payload — we just
-	// need its length to pick the sub-strategy. The actual volume
-	// mounting inside the container is owned by generateCompose /
-	// runRollingContainer below; this branch is purely about whether
-	// blue and green can coexist safely.
-	hasVolumes := false
-	if v, ok := op.Payload["volumes"].([]interface{}); ok && len(v) > 0 {
-		hasVolumes = true
-	}
+	// Parse once — the slice length picks the sub-strategy, and the
+	// parsed entries are reused by deployBlueGreen / deployFastRestart
+	// (via generateCompose) so we don't re-walk the payload further
+	// down. This branch is purely about whether blue and green can
+	// coexist safely; the actual mounting is owned by generateCompose.
+	mounts := parseVolumes(op.Payload)
+	hasVolumes := len(mounts) > 0
 
 	if hasVolumes {
 		streamer.AddLine("Rolling mode: fast restart (volumes attached, can't run two slots concurrently).")
@@ -274,7 +272,11 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// `<serviceID>` so volumes mount exclusively (only one writer at
 	// a time). Reuses the existing compose template — the recreate
 	// path's container shape — so logs/metrics keying is unchanged.
-	compose := generateCompose(serviceID, imageName)
+	mounts := parseVolumes(op.Payload)
+	if err := ensureVolumeHostDirs(mounts); err != nil {
+		return nil, fail(err)
+	}
+	compose := generateCompose(serviceID, imageName, mounts)
 	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}

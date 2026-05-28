@@ -96,12 +96,209 @@ func (e *Executor) DokployTakeoverProbe(op client.Operation) (map[string]interfa
 		containerNames = append(containerNames, name)
 	}
 
+	swarmInfo := probeSwarm()
 	result := map[string]interface{}{
 		"traefik":    probeTraefik(),
 		"ports":      probePortHolders(),
+		"swarm":      swarmInfo,
 		"containers": probeContainerBindings(containerNames),
 	}
 	return result, nil
+}
+
+// probeSwarm reports whether this docker daemon is a swarm node and,
+// if so, which network the Dokploy stack uses. The dashboard branches
+// the takeover wizard on `active`: in swarm mode there are no
+// host-published ports for app containers (Traefik dials over the
+// overlay), so the soft-migration flow attaches Stacked Caddy to the
+// same overlay network instead of expecting loopback host ports.
+//
+// `network` is best-effort: we read it off the `dokploy-traefik`
+// container's `NetworkSettings.Networks` map and pick the first
+// non-default entry. Returns null if Traefik isn't present (then the
+// dashboard has no install to migrate from anyway).
+func probeSwarm() map[string]interface{} {
+	active := false
+	if out, err := runCommandSilent("", "docker", "info", "--format", "{{.Swarm.LocalNodeState}}"); err == nil {
+		if strings.TrimSpace(out) == "active" {
+			active = true
+		}
+	}
+	var network interface{} = nil
+	if name := detectDokployNetwork(); name != "" {
+		network = name
+	}
+	return map[string]interface{}{
+		"active":  active,
+		"network": network,
+	}
+}
+
+// detectDokployNetwork reads `dokploy-traefik`'s attached networks
+// and returns the first non-default one. Default docker bridges
+// (bridge/host/none/ingress/docker_gwbridge) are skipped so we don't
+// mistake them for the app overlay. Empty string if Traefik isn't
+// present or has no usable network.
+func detectDokployNetwork() string {
+	raw, err := runDockerInspect("--format", "{{json .NetworkSettings.Networks}}", dokployTraefikContainer)
+	if err != nil {
+		return ""
+	}
+	var networks map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &networks); err != nil {
+		return ""
+	}
+	defaults := map[string]bool{
+		"bridge":          true,
+		"host":            true,
+		"none":            true,
+		"ingress":         true,
+		"docker_gwbridge": true,
+	}
+	// Sort for determinism — docker's JSON output isn't ordered.
+	names := make([]string, 0, len(networks))
+	for n := range networks {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	// Prefer anything containing "dokploy" first, then fall back to
+	// any non-default network. Some self-hosted setups rename the
+	// network; the dokploy substring catches the canonical case
+	// without hardcoding `dokploy-network`.
+	for _, n := range names {
+		if defaults[n] {
+			continue
+		}
+		if strings.Contains(n, "dokploy") {
+			return n
+		}
+	}
+	for _, n := range names {
+		if defaults[n] {
+			continue
+		}
+		return n
+	}
+	return ""
+}
+
+// DokployCaddyAttachNetwork connects the Stacked Caddy container to
+// the Dokploy overlay network so it can dial app services by name
+// (`<service>:<port>`) over docker's embedded DNS — the same path
+// Dokploy's own Traefik uses. Idempotent: re-running after a
+// successful attach is a no-op.
+//
+// Payload:
+//
+//	{ "network": "<network-name>" }
+//
+// The dashboard sources `network` from a prior probe result so we
+// don't have to redetect here. If the payload omits it we fall back
+// to detection for safety.
+func (e *Executor) DokployCaddyAttachNetwork(op client.Operation) error {
+	network, _ := op.Payload["network"].(string)
+	network = strings.TrimSpace(network)
+	if network == "" {
+		network = detectDokployNetwork()
+	}
+	if network == "" {
+		return fmt.Errorf("no dokploy overlay network detected on this host")
+	}
+	if !isSafeNetworkName(network) {
+		return fmt.Errorf("unsafe network name: %q", network)
+	}
+	container, err := stackedCaddyContainerID()
+	if err != nil {
+		return err
+	}
+	out, err := runDockerSilent("network", "connect", network, container)
+	if err != nil {
+		// docker errors with "already exists in network" when the
+		// container is already attached. That's the desired end
+		// state — treat as success.
+		if strings.Contains(out, "already exists in network") || strings.Contains(out, "is already attached") {
+			log.Printf("dokploy_caddy_attach_network: caddy already attached to %s", network)
+			return nil
+		}
+		return fmt.Errorf("network connect %s: %s: %w", network, strings.TrimSpace(out), err)
+	}
+	log.Printf("dokploy_caddy_attach_network: attached caddy to %s", network)
+	return nil
+}
+
+// DokployCaddyDetachNetwork is the inverse, used on rollback. Also
+// idempotent — disconnecting a container that isn't on the network
+// returns success.
+func (e *Executor) DokployCaddyDetachNetwork(op client.Operation) error {
+	network, _ := op.Payload["network"].(string)
+	network = strings.TrimSpace(network)
+	if network == "" {
+		network = detectDokployNetwork()
+	}
+	if network == "" {
+		return nil // nothing to detach from
+	}
+	if !isSafeNetworkName(network) {
+		return fmt.Errorf("unsafe network name: %q", network)
+	}
+	container, err := stackedCaddyContainerID()
+	if err != nil {
+		return err
+	}
+	out, err := runDockerSilent("network", "disconnect", network, container)
+	if err != nil {
+		if strings.Contains(out, "is not connected to network") || strings.Contains(out, "not connected") {
+			return nil
+		}
+		return fmt.Errorf("network disconnect %s: %s: %w", network, strings.TrimSpace(out), err)
+	}
+	log.Printf("dokploy_caddy_detach_network: detached caddy from %s", network)
+	return nil
+}
+
+// stackedCaddyContainerID resolves the Stacked Caddy container ID via
+// `docker compose ps -q` in the proxy compose project. Returns an
+// error if Caddy isn't running — the takeover path requires Caddy
+// up so it can hold 80/443 the instant Dokploy Traefik releases them.
+func stackedCaddyContainerID() (string, error) {
+	out, err := runCommandSilent(proxyDir, "docker", "compose", "ps", "-q", "caddy")
+	if err != nil {
+		return "", fmt.Errorf("locate stacked caddy container: %s: %w", strings.TrimSpace(out), err)
+	}
+	id := strings.TrimSpace(out)
+	if id == "" {
+		return "", fmt.Errorf("stacked caddy is not running on this host")
+	}
+	// `docker compose ps -q` can emit multiple lines if the service
+	// has >1 replica. Caddy is single-replica; take the first.
+	if nl := strings.IndexByte(id, '\n'); nl >= 0 {
+		id = id[:nl]
+	}
+	return id, nil
+}
+
+// isSafeNetworkName mirrors isSafeContainerName but accepts the
+// slightly broader docker network naming rules (same charset in
+// practice). Defense-in-depth even though we pass via exec.Command,
+// not a shell.
+func isSafeNetworkName(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_' || r == '.' || r == '-':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // DokployTraefikStop stops the dokploy-traefik container and clears
@@ -249,6 +446,48 @@ func probeContainerBindings(names []string) map[string]interface{} {
 	return out
 }
 
+// inspectSwarmService falls back to `docker service inspect` when
+// `docker inspect` (which only matches containers) misses. Dokploy in
+// swarm mode names each app as a service whose actual task containers
+// are `<name>.<replica>.<taskid>` — `docker inspect <name>` returns
+// the "No such object" error and the wizard would otherwise report
+// the app as missing.
+//
+// On hit we return `swarm: true` and the service's first declared
+// target port (best-effort, sourced from `Endpoint.Spec.Ports` if
+// published, otherwise from `ContainerSpec` exposed ports). The
+// dashboard already knows the canonical app port from Dokploy's DB
+// (`services[].port`), so `targetPort` here is informational — what
+// matters is that `found: true, swarm: true` lets the wizard pick
+// the overlay-network upstream path instead of the loopback one.
+func inspectSwarmService(name string) (map[string]interface{}, bool) {
+	raw, err := runDockerSilent("service", "inspect", "--format", "{{json .Endpoint.Spec.Ports}}", name)
+	if err != nil {
+		return nil, false
+	}
+	targetPort := 0
+	var ports []struct {
+		TargetPort    int    `json:"TargetPort"`
+		PublishedPort int    `json:"PublishedPort"`
+		Protocol      string `json:"Protocol"`
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed != "" && trimmed != "null" {
+		if err := json.Unmarshal([]byte(trimmed), &ports); err == nil && len(ports) > 0 {
+			targetPort = ports[0].TargetPort
+		}
+	}
+	result := map[string]interface{}{
+		"found":    true,
+		"swarm":    true,
+		"bindings": []dockerPortBinding{},
+	}
+	if targetPort > 0 {
+		result["targetPort"] = targetPort
+	}
+	return result, true
+}
+
 func inspectOneContainer(name string) map[string]interface{} {
 	// `docker inspect --format '{{json .NetworkSettings.Ports}}'`
 	// gives us the binding table verbatim. Format is:
@@ -260,8 +499,12 @@ func inspectOneContainer(name string) map[string]interface{} {
 	raw, err := runDockerInspect("--format", "{{json .NetworkSettings.Ports}}", name)
 	if err != nil {
 		// `docker inspect` returns non-zero when the container is
-		// absent. That's not an agent-side failure — surface it as
-		// found:false so the wizard's per-row message is precise.
+		// absent. Before reporting missing, check whether the name
+		// matches a swarm service — Dokploy in swarm mode names apps
+		// as services, not containers.
+		if svc, ok := inspectSwarmService(name); ok {
+			return svc
+		}
 		return map[string]interface{}{
 			"found":    false,
 			"bindings": []dockerPortBinding{},

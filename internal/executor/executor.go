@@ -80,6 +80,10 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.DokployTraefikStop(op)
 	case "dokploy_traefik_start":
 		err = e.DokployTraefikStart(op)
+	case "dokploy_caddy_attach_network":
+		err = e.DokployCaddyAttachNetwork(op)
+	case "dokploy_caddy_detach_network":
+		err = e.DokployCaddyDetachNetwork(op)
 	default:
 		err = fmt.Errorf("unknown operation type: %s", op.Type)
 	}
