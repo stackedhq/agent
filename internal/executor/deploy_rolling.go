@@ -150,19 +150,30 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// the configured port. Failures here abort BEFORE the Caddy flip,
 	// so the live slot keeps serving — this is the whole point of
 	// blue/green.
+	// Honor an explicit port (incl. 0 for workers). Fall back to 3000
+	// only when the server omits the field (older server).
 	probePort := 3000
-	if creds.Port > 0 {
-		probePort = creds.Port
+	if creds.Port != nil {
+		probePort = *creds.Port
 	}
 	healthPath := getStringPayload(op.Payload, "healthCheckPath")
 	timeoutSec := getIntPayloadOr(op.Payload, "healthCheckTimeoutSec", 60)
-	streamer.SetProgress(85)
-	streamer.AddLine(fmt.Sprintf("Health gate: probing %s:%d (timeout=%ds)...", newContainer, probePort, timeoutSec))
-	streamer.Flush()
-	if err := HealthGate(streamer, newContainer, "stacked", probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
-		// Tear down the failed slot so the next deploy starts clean.
-		_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
-		return nil, fail(fmt.Errorf("health gate: %w", err))
+	// Worker services (port <= 0) expose no port — there's nothing to
+	// gate on. Skip straight to the Caddy flip (which is a no-op for a
+	// service with no domains) rather than abort on an impossible probe.
+	if probePort <= 0 {
+		streamer.SetProgress(85)
+		streamer.AddLine("Health gate: worker service — no port to probe, skipping.")
+		streamer.Flush()
+	} else {
+		streamer.SetProgress(85)
+		streamer.AddLine(fmt.Sprintf("Health gate: probing %s:%d (timeout=%ds)...", newContainer, probePort, timeoutSec))
+		streamer.Flush()
+		if err := HealthGate(streamer, newContainer, "stacked", probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
+			// Tear down the failed slot so the next deploy starts clean.
+			_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+			return nil, fail(fmt.Errorf("health gate: %w", err))
+		}
 	}
 
 	// Phase 6: flip Caddy. We persist the new slot in state FIRST,
@@ -300,17 +311,25 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
 
+	// Honor an explicit port (incl. 0 for workers); 3000 only when absent.
 	probePort := 3000
-	if creds.Port > 0 {
-		probePort = creds.Port
+	if creds.Port != nil {
+		probePort = *creds.Port
 	}
 	healthPath := getStringPayload(op.Payload, "healthCheckPath")
 	timeoutSec := getIntPayloadOr(op.Payload, "healthCheckTimeoutSec", 60)
-	streamer.SetProgress(90)
-	streamer.AddLine(fmt.Sprintf("Health gate: probing %s:%d (timeout=%ds)...", serviceID, probePort, timeoutSec))
-	streamer.Flush()
-	if err := HealthGate(streamer, serviceID, "stacked", probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
-		return nil, fail(fmt.Errorf("health gate: %w", err))
+	// Workers expose no port — nothing to gate on.
+	if probePort <= 0 {
+		streamer.SetProgress(90)
+		streamer.AddLine("Health gate: worker service — no port to probe, skipping.")
+		streamer.Flush()
+	} else {
+		streamer.SetProgress(90)
+		streamer.AddLine(fmt.Sprintf("Health gate: probing %s:%d (timeout=%ds)...", serviceID, probePort, timeoutSec))
+		streamer.Flush()
+		if err := HealthGate(streamer, serviceID, "stacked", probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
+			return nil, fail(fmt.Errorf("health gate: %w", err))
+		}
 	}
 
 	// Fast-restart never uses slot state — clear any stale entry from

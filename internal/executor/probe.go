@@ -286,6 +286,16 @@ func (e *Executor) HealthProbe(streamer *logs.Streamer, serviceID string, port i
 		}
 	}
 
+	// Worker services (port <= 0) expose no port. There's nothing to
+	// TCP-probe, so report healthy after the best-effort EXPOSE read.
+	// The server sends port=0 for these in the credentials response.
+	if port <= 0 {
+		res.Ok = true
+		streamer.AddLine("Health: worker service — no port to probe.")
+		streamer.Flush()
+		return res
+	}
+
 	// 2. TCP-probe the configured port via the container's bridge IP.
 	streamer.AddLine(fmt.Sprintf("Health: probing %s:%d on the stacked network...", serviceID, port))
 	streamer.Flush()

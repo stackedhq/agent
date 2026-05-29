@@ -110,7 +110,10 @@ type Credentials struct {
 	EnvVars       map[string]string `json:"envVars"`
 	// Port is the user-configured upstream port that Caddy forwards to
 	// (services.port, default 3000). The deploy health probe targets it.
-	Port int `json:"port,omitempty"`
+	// Pointer so we can tell "absent" (older server — fall back to 3000)
+	// from an explicit 0, which the server sends for worker services
+	// (no exposed port) to signal "skip the TCP probe entirely".
+	Port *int `json:"port,omitempty"`
 }
 
 // CredentialsErrorBody is the server-side error envelope returned

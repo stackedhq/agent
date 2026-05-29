@@ -68,8 +68,11 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 		}
 		return nil, fail(fmt.Errorf("get credentials: %w", err))
 	}
-	if creds.Port > 0 {
-		probePort = creds.Port
+	// Honor an explicit port from the server, including 0 (worker service
+	// — HealthProbe skips the TCP probe for non-positive ports). Only fall
+	// back to the 3000 default when the field is absent (older server).
+	if creds.Port != nil {
+		probePort = *creds.Port
 	}
 
 	streamer.SetProgress(2)
