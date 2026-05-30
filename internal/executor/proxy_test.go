@@ -308,3 +308,179 @@ func TestGetIntPayloadOrFallback(t *testing.T) {
 		})
 	}
 }
+
+// boolPtr is a test helper so cases can express
+// `StripPrefix: boolPtr(false)` without ceremony.
+func boolPtr(b bool) *bool { return &b }
+
+// TestGenerateCaddyfileSinglePathRootIsBackCompat verifies the fast
+// path: a single row with path="/" (or empty, simulating a v1
+// payload) renders the historical bare `reverse_proxy` shape with
+// no `handle` wrapper. Diffing rendered Caddyfiles across this
+// upgrade for any unchanged domain must produce an empty diff.
+func TestGenerateCaddyfileSinglePathRootIsBackCompat(t *testing.T) {
+	cases := []struct {
+		name string
+		row  cachedDomain
+	}{
+		{"v1 payload (no Path)", cachedDomain{Domain: "a.example.com", ServiceID: "svc", Port: 3000}},
+		{"v2 payload explicit /", cachedDomain{Domain: "a.example.com", ServiceID: "svc", Port: 3000, Path: "/", StripPrefix: boolPtr(true)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := generateCaddyfile([]cachedDomain{c.row}, map[string]slots.Slot{})
+			if strings.Contains(out, "handle") {
+				t.Fatalf("expected no handle wrapper for single-root row, got:\n%s", out)
+			}
+			if !strings.Contains(out, "    reverse_proxy svc:3000") {
+				t.Fatalf("expected bare reverse_proxy, got:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestGenerateCaddyfileMultiPathRootAndApi verifies the canonical
+// two-row scenario from the feature spec: `/` → service A, `/api`
+// → service B on the same host. Output must be one site block,
+// /api emitted first (longest-prefix-first), `handle_path /api*`
+// for the stripping route, and `handle {}` for the root fallback.
+func TestGenerateCaddyfileMultiPathRootAndApi(t *testing.T) {
+	parsed := []cachedDomain{
+		// Intentionally insert root first so the sort is exercised.
+		{Domain: "r.example.com", Host: "127.0.0.1", Port: 3002, Scheme: "http", Path: "/", StripPrefix: boolPtr(true)},
+		{Domain: "r.example.com", Host: "127.0.0.1", Port: 3001, Scheme: "http", Path: "/api", StripPrefix: boolPtr(true)},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+
+	// One outer site block per host (count opening braces with the host token).
+	if got := strings.Count(out, "r.example.com {"); got != 1 {
+		t.Fatalf("expected exactly one site block for r.example.com, got %d:\n%s", got, out)
+	}
+	// handle_path for the prefix-strip route.
+	if !strings.Contains(out, "handle_path /api* {") {
+		t.Fatalf("expected handle_path /api* block, got:\n%s", out)
+	}
+	// Bare `handle {` for the root fallback (no prefix matcher).
+	if !strings.Contains(out, "handle {") {
+		t.Fatalf("expected root handle {} block, got:\n%s", out)
+	}
+	// Longest-prefix-first ordering: /api before /.
+	apiIdx := strings.Index(out, "handle_path /api*")
+	rootIdx := strings.Index(out, "handle {")
+	if apiIdx < 0 || rootIdx < 0 || apiIdx > rootIdx {
+		t.Fatalf("expected /api block before root block, got:\n%s", out)
+	}
+	// Both upstreams present, loopback rewritten to host.docker.internal.
+	if !strings.Contains(out, "reverse_proxy host.docker.internal:3001") {
+		t.Fatalf("missing /api upstream, got:\n%s", out)
+	}
+	if !strings.Contains(out, "reverse_proxy host.docker.internal:3002") {
+		t.Fatalf("missing root upstream, got:\n%s", out)
+	}
+	// Branding stays once per site block, outside any handle.
+	if got := strings.Count(out, "header Server Stacked"); got != 1 {
+		t.Fatalf("expected one header directive per host, got %d:\n%s", got, out)
+	}
+}
+
+// TestGenerateCaddyfileNestedPathsLongestFirst verifies that a
+// nested pair like /api + /api/v1 sort longest-first so the
+// human-readable output mirrors Caddy's matcher precedence.
+func TestGenerateCaddyfileNestedPathsLongestFirst(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "h.example.com", Host: "127.0.0.1", Port: 3001, Scheme: "http", Path: "/api", StripPrefix: boolPtr(true)},
+		{Domain: "h.example.com", Host: "127.0.0.1", Port: 3002, Scheme: "http", Path: "/api/v1", StripPrefix: boolPtr(true)},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	v1Idx := strings.Index(out, "handle_path /api/v1*")
+	apiIdx := strings.Index(out, "handle_path /api*")
+	if v1Idx < 0 || apiIdx < 0 || v1Idx > apiIdx {
+		t.Fatalf("expected /api/v1 before /api in output, got:\n%s", out)
+	}
+}
+
+// TestGenerateCaddyfileStripPrefixFalseUsesHandle verifies the
+// opt-out: stripPrefix=false on a non-root path emits bare `handle`
+// (matcher only, no rewrite) instead of `handle_path` (matcher +
+// strip). The upstream still resolves the same way.
+func TestGenerateCaddyfileStripPrefixFalseUsesHandle(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "k.example.com", Host: "127.0.0.1", Port: 4000, Scheme: "http", Path: "/keep", StripPrefix: boolPtr(false)},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	if !strings.Contains(out, "handle /keep* {") {
+		t.Fatalf("expected bare handle /keep*, got:\n%s", out)
+	}
+	if strings.Contains(out, "handle_path") {
+		t.Fatalf("did not expect handle_path when stripPrefix=false, got:\n%s", out)
+	}
+}
+
+// TestGenerateCaddyfileMixedServiceAndPortBoundSameHost verifies
+// that a single host can mix a service-backed root with a
+// port-bound /api row. Both end up in the same site block.
+func TestGenerateCaddyfileMixedServiceAndPortBoundSameHost(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "m.example.com", ServiceID: "svc-1", Port: 3000, Path: "/", StripPrefix: boolPtr(true)},
+		{Domain: "m.example.com", Host: "127.0.0.1", Port: 5000, Scheme: "http", Path: "/api", StripPrefix: boolPtr(true)},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{"svc-1": slots.Blue})
+	if got := strings.Count(out, "m.example.com {"); got != 1 {
+		t.Fatalf("expected one site block, got %d:\n%s", got, out)
+	}
+	if !strings.Contains(out, "reverse_proxy svc-1-blue:3000") {
+		t.Fatalf("expected blue-slot service upstream, got:\n%s", out)
+	}
+	if !strings.Contains(out, "reverse_proxy host.docker.internal:5000") {
+		t.Fatalf("expected port-bound upstream, got:\n%s", out)
+	}
+}
+
+// TestParseDomainsAcceptsV2Fields ensures parseDomains carries
+// path + stripPrefix through from the wire payload. Absence
+// collapses to defaults via effective*().
+func TestParseDomainsAcceptsV2Fields(t *testing.T) {
+	raw := []interface{}{
+		map[string]interface{}{
+			"domain":      "x.example.com",
+			"host":        "127.0.0.1",
+			"port":        float64(3001),
+			"scheme":      "http",
+			"path":        "/api",
+			"stripPrefix": false,
+		},
+	}
+	parsed := parseDomains(raw)
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed row, got %d", len(parsed))
+	}
+	if parsed[0].effectivePath() != "/api" {
+		t.Fatalf("expected path /api, got %q", parsed[0].effectivePath())
+	}
+	if parsed[0].effectiveStripPrefix() {
+		t.Fatalf("expected stripPrefix=false to propagate, got true")
+	}
+}
+
+// TestParseDomainsLegacyPayloadDefaults ensures a v1 payload (no
+// path / stripPrefix fields) parses cleanly with the defaults the
+// renderer expects.
+func TestParseDomainsLegacyPayloadDefaults(t *testing.T) {
+	raw := []interface{}{
+		map[string]interface{}{
+			"domain":    "y.example.com",
+			"serviceId": "svc-1",
+			"port":      float64(3000),
+		},
+	}
+	parsed := parseDomains(raw)
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed row, got %d", len(parsed))
+	}
+	if parsed[0].effectivePath() != "/" {
+		t.Fatalf("expected default path /, got %q", parsed[0].effectivePath())
+	}
+	if !parsed[0].effectiveStripPrefix() {
+		t.Fatalf("expected default stripPrefix=true, got false")
+	}
+}

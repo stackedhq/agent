@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -85,6 +86,41 @@ type cachedDomain struct {
 	Port      int    `json:"port"`
 	Host      string `json:"host,omitempty"`
 	Scheme    string `json:"scheme,omitempty"`
+
+	// Multi-path routing (server payload_version 2+). Absent on
+	// v1 payloads; parseDomains fills in defaults ('/' + strip=true)
+	// so the rest of the renderer can branch on these fields
+	// unconditionally. Two cachedDomain entries with the same
+	// Domain and different Path produce a single Caddy site block
+	// with one `handle`/`handle_path` per row.
+	Path        string `json:"path,omitempty"`
+	// Pointer so we can tell "absent" (legacy payload) from
+	// "explicitly false". Absent collapses to true in normalisePath
+	// — default-strip matches what most backends-on-/api want.
+	StripPrefix *bool  `json:"stripPrefix,omitempty"`
+}
+
+// effectivePath returns the path this entry routes, defaulting to
+// `/` when absent (legacy v1 payloads). Always non-empty after this
+// call so the renderer can compare straight against "/".
+func (d cachedDomain) effectivePath() string {
+	if d.Path == "" {
+		return "/"
+	}
+	return d.Path
+}
+
+// effectiveStripPrefix returns the strip flag for non-root paths.
+// Forced true at "/" (no prefix to strip) and defaulted true when
+// the field is absent on the payload.
+func (d cachedDomain) effectiveStripPrefix() bool {
+	if d.effectivePath() == "/" {
+		return true
+	}
+	if d.StripPrefix == nil {
+		return true
+	}
+	return *d.StripPrefix
 }
 
 // isPortBound returns true for entries whose upstream is a raw
@@ -410,6 +446,16 @@ func parseDomains(raw []interface{}) []cachedDomain {
 			port = int(p)
 		}
 
+		// Multi-path fields (payload_version 2+). Absence is
+		// indistinguishable from default; we keep the pointer nil so
+		// effectiveStripPrefix can fall back to true.
+		path, _ := dm["path"].(string)
+		var stripPtr *bool
+		if sp, ok := dm["stripPrefix"].(bool); ok {
+			stripCopy := sp
+			stripPtr = &stripCopy
+		}
+
 		switch {
 		case serviceID != "":
 			// Service-backed. Default port matches the historical
@@ -418,9 +464,11 @@ func parseDomains(raw []interface{}) []cachedDomain {
 				port = 3000
 			}
 			out = append(out, cachedDomain{
-				Domain:    domain,
-				ServiceID: serviceID,
-				Port:      port,
+				Domain:      domain,
+				ServiceID:   serviceID,
+				Port:        port,
+				Path:        path,
+				StripPrefix: stripPtr,
 			})
 		case host != "" && port > 0:
 			// Port-bound. Scheme defaults to http; only http and
@@ -430,10 +478,12 @@ func parseDomains(raw []interface{}) []cachedDomain {
 				scheme = "http"
 			}
 			out = append(out, cachedDomain{
-				Domain: domain,
-				Host:   host,
-				Port:   port,
-				Scheme: scheme,
+				Domain:      domain,
+				Host:        host,
+				Port:        port,
+				Scheme:      scheme,
+				Path:        path,
+				StripPrefix: stripPtr,
 			})
 		default:
 			// Neither shape fully populated; skip.
@@ -486,35 +536,105 @@ func loadDomains() ([]cachedDomain, error) {
 func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) string {
 	var b strings.Builder
 	b.WriteString("# Managed by Stacked \u2014 do not edit manually\n\n")
+
+	// Group rows by hostname so we emit exactly one site block per
+	// host, even when multi-path routing splits a host across
+	// several rows. Preserve first-seen order for the outer host
+	// list (deterministic given the server's ORDER BY on domain)
+	// so the rendered Caddyfile is stable across renders.
+	hostOrder := make([]string, 0)
+	byHost := make(map[string][]cachedDomain)
 	for _, d := range parsed {
-		fmt.Fprintf(&b, "%s {\n", d.Domain)
-		if d.isPortBound() {
-			// Port-bound. Resolve the user-typed host to something
-			// reachable from *inside* the Caddy container. Then
-			// format with proper IPv6 bracketing. See
-			// renderUpstreamHostPort for the rules.
-			hp := renderUpstreamHostPort(d.Host, d.Port)
-			if d.Scheme == "https" {
-				fmt.Fprintf(&b, "    reverse_proxy https://%s\n", hp)
-			} else {
-				fmt.Fprintf(&b, "    reverse_proxy %s\n", hp)
-			}
-		} else {
-			host := d.ServiceID
-			if slot, ok := state[d.ServiceID]; ok && slot != slots.Legacy {
-				host = d.ServiceID + "-" + string(slot)
-			}
-			fmt.Fprintf(&b, "    reverse_proxy %s:%d\n", host, d.Port)
+		if _, seen := byHost[d.Domain]; !seen {
+			hostOrder = append(hostOrder, d.Domain)
 		}
-		// Brand the proxy in responses, à la Vercel's `Server: Vercel`.
-		// `header` with no prefix is set-semantics: it overrides whatever
-		// the upstream (or Caddy's own default) emitted for `Server`.
-		// Applied uniformly to service-backed and port-bound domains —
-		// the proxy is ours in both cases.
+		byHost[d.Domain] = append(byHost[d.Domain], d)
+	}
+
+	for _, host := range hostOrder {
+		rows := byHost[host]
+		// Order paths longest-first so a hand-read Caddyfile
+		// matches Caddy's own longest-prefix matcher precedence.
+		// (Caddy 2's `handle` directives auto-sort, but the
+		// human reader shouldn't have to know that.)
+		sortedRows := make([]cachedDomain, len(rows))
+		copy(sortedRows, rows)
+		sort.SliceStable(sortedRows, func(i, j int) bool {
+			pi, pj := sortedRows[i].effectivePath(), sortedRows[j].effectivePath()
+			if pi == pj {
+				return false
+			}
+			if pi == "/" {
+				return false // root last
+			}
+			if pj == "/" {
+				return true
+			}
+			return len(pi) > len(pj)
+		})
+
+		fmt.Fprintf(&b, "%s {\n", host)
+
+		// Fast path: single row at root — emit a bare
+		// `reverse_proxy` (no `handle` wrapper). Keeps the
+		// Caddyfile identical to the pre-multi-path output for
+		// every existing single-route domain, so diffing
+		// generated configs across this upgrade is empty.
+		if len(sortedRows) == 1 && sortedRows[0].effectivePath() == "/" {
+			writeUpstream(&b, sortedRows[0], state, "    ")
+		} else {
+			for _, d := range sortedRows {
+				path := d.effectivePath()
+				if path == "/" {
+					// Default fall-through for everything
+					// that didn't match a more specific path.
+					b.WriteString("    handle {\n")
+				} else if d.effectiveStripPrefix() {
+					// `handle_path` matches the prefix AND
+					// strips it before forwarding — the
+					// default for non-root routes because
+					// most backends expect to see paths
+					// relative to their own root.
+					fmt.Fprintf(&b, "    handle_path %s* {\n", path)
+				} else {
+					// Same matcher, prefix preserved —
+					// for backends that build URLs from
+					// `req.path` and need the full string.
+					fmt.Fprintf(&b, "    handle %s* {\n", path)
+				}
+				writeUpstream(&b, d, state, "        ")
+				b.WriteString("    }\n")
+			}
+		}
+
+		// Brand the proxy once per host, outside the handle
+		// blocks so it applies uniformly to every route.
 		b.WriteString("    header Server Stacked\n")
 		fmt.Fprintf(&b, "}\n\n")
 	}
 	return b.String()
+}
+
+// writeUpstream emits the single `reverse_proxy` line for a row,
+// indented with `indent`. Factored out so the single-row fast path
+// and the multi-row handle path share one code path — keeps the
+// upstream-resolution rules (slots, IPv6 brackets, loopback rewrite)
+// in exactly one place.
+func writeUpstream(b *strings.Builder, d cachedDomain, state map[string]slots.Slot, indent string) {
+	if d.isPortBound() {
+		hp := renderUpstreamHostPort(d.Host, d.Port)
+		if d.Scheme == "https" {
+			fmt.Fprintf(b, "%sreverse_proxy https://%s\n", indent, hp)
+		} else {
+			fmt.Fprintf(b, "%sreverse_proxy %s\n", indent, hp)
+		}
+		return
+	}
+	host := d.ServiceID
+	if slot, ok := state[d.ServiceID]; ok && slot != slots.Legacy {
+		host = d.ServiceID + "-" + string(slot)
+	}
+	fmt.Fprintf(b, "%sreverse_proxy %s:%d\n", indent, host, d.Port)
 }
 
 // renderUpstreamHostPort produces a Caddy-safe "host:port" token for a
