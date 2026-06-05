@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -223,6 +224,118 @@ func dockerStats(ids []string) map[string]containerStats {
 		}
 	}
 	return result
+}
+
+// collectOtherContainers enumerates Docker containers on this host that
+// are *not* managed by Stacked, and returns their current `docker stats`
+// snapshot.
+//
+// "Not managed by Stacked" means: no `com.stacked.kind=service` label.
+// That's the same label `listStackedContainers` filters *in* on, so the
+// two collectors are complementary by construction — every container
+// the host runs is either reported under `containers` (Stacked
+// services) or `otherContainers` (everything else), never both.
+//
+// The list is capped (sorted by CPU desc, truncated to TOP_N) so a box
+// running 200 random containers can't push an arbitrarily large JSONB
+// blob through the heartbeat.
+func collectOtherContainers() []client.OtherContainer {
+	const topN = 10
+	rows := listOtherContainers()
+	if len(rows) == 0 {
+		return nil
+	}
+
+	statsByID := dockerStats(otherContainerIDs(rows))
+	out := make([]client.OtherContainer, 0, len(rows))
+	for _, r := range rows {
+		c := client.OtherContainer{
+			ID:    r.id,
+			Name:  r.name,
+			Image: r.image,
+			State: r.state,
+		}
+		if s, ok := statsByID[r.id]; ok {
+			c.CPUPercent = clampPercent(s.cpuPercent)
+			c.MemoryPercent = clampPercent(s.memPercent)
+			c.MemoryBytes = s.memBytes
+		}
+		out = append(out, c)
+	}
+
+	// Sort by CPU desc so the top-N truncation keeps the most
+	// interesting rows. Memory-heavy idle containers still surface
+	// further down because we cap at 10, which is comfortably above
+	// the active-container count on a typical solo-founder VPS.
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CPUPercent > out[j].CPUPercent
+	})
+	if len(out) > topN {
+		out = out[:topN]
+	}
+	return out
+}
+
+type otherContainerRow struct {
+	id    string
+	name  string
+	image string
+	state string
+}
+
+func listOtherContainers() []otherContainerRow {
+	// Tab-separated to avoid issues with image names containing
+	// spaces. We can't use a docker-side `label!=` filter for an
+	// arbitrary key, so we pull every container and filter
+	// agent-side. Cheap on the typical 10–20 container host.
+	cmd := exec.Command(
+		"docker", "ps", "-a",
+		"--format", `{{.ID}}	{{.Names}}	{{.Image}}	{{.State}}	{{.Label "com.stacked.kind"}}`,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("docker ps (other) failed: %v", err)
+		return nil
+	}
+
+	var rows []otherContainerRow
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 4 {
+			continue
+		}
+		// Skip Stacked-managed service containers — they're already
+		// reported under `containers` and serve as the basis for
+		// per-service metrics in the UI. Anything without the
+		// `com.stacked.kind=service` label is considered "other":
+		// the user's own compose projects, the Caddy proxy
+		// container itself, ad-hoc `docker run` invocations.
+		kind := ""
+		if len(parts) >= 5 {
+			kind = parts[4]
+		}
+		if kind == "service" {
+			continue
+		}
+		rows = append(rows, otherContainerRow{
+			id:    shortID(parts[0]),
+			name:  parts[1],
+			image: parts[2],
+			state: parts[3],
+		})
+	}
+	return rows
+}
+
+func otherContainerIDs(rows []otherContainerRow) []string {
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.id)
+	}
+	return ids
 }
 
 // shortID truncates a container ID to the 12-char form `docker ps` returns.

@@ -7,11 +7,54 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 )
+
+// diskBreakdownInterval is the minimum gap between disk-breakdown
+// collections. `du -sb` on a multi-GB Postgres volume spikes I/O, and
+// `docker system df` walks the full image graph; running both every
+// heartbeat (30s) is wasteful because disk usage changes on the order
+// of minutes, not seconds. We refresh on a 5-minute cadence and reuse
+// the cached snapshot in between — the SSE update on the next true
+// refresh still keeps the UI live, just less frequently.
+const diskBreakdownInterval = 5 * time.Minute
+
+var (
+	diskBreakdownMu       sync.Mutex
+	diskBreakdownLastAtNs atomic.Int64 // unix nanos
+	diskBreakdownCache    *client.DiskBreakdown
+)
+
+// cachedDiskBreakdown returns the last disk breakdown if it's still
+// within the refresh window, otherwise runs a fresh collection. Safe
+// to call from the heartbeat goroutine — the mutex ensures only one
+// collection runs at a time even if heartbeats overlap (they don't
+// today, but future cadence changes shouldn't introduce a data race).
+func cachedDiskBreakdown() *client.DiskBreakdown {
+	now := time.Now().UnixNano()
+	last := diskBreakdownLastAtNs.Load()
+	if last != 0 && now-last < int64(diskBreakdownInterval) {
+		diskBreakdownMu.Lock()
+		defer diskBreakdownMu.Unlock()
+		return diskBreakdownCache
+	}
+	diskBreakdownMu.Lock()
+	defer diskBreakdownMu.Unlock()
+	// Re-check inside the lock: a sibling caller may have refreshed
+	// while we were waiting for the mutex.
+	last = diskBreakdownLastAtNs.Load()
+	if last != 0 && time.Now().UnixNano()-last < int64(diskBreakdownInterval) {
+		return diskBreakdownCache
+	}
+	diskBreakdownCache = collectDiskBreakdown()
+	diskBreakdownLastAtNs.Store(time.Now().UnixNano())
+	return diskBreakdownCache
+}
 
 // Version is set at build time via ldflags. Defaults to "dev" for local builds.
 var Version = "dev"
@@ -73,6 +116,14 @@ func send(c *client.Client) {
 		// server treats this machine as "no tailscale activity to
 		// report" and leaves its tailscale_* columns alone.
 		Tailscale: collectTailscaleStatus(),
+		// "What's eating my box" sections. Each collector returns
+		// nil on any error / missing tool, and `omitempty` then drops
+		// the field from the wire payload — the server preserves
+		// whatever the last good heartbeat wrote for that section.
+		OtherContainers:      collectOtherContainers(),
+		TopProcessesByCPU:    collectTopProcessesByCPU(),
+		TopProcessesByMemory: collectTopProcessesByMemory(),
+		DiskBreakdown:        cachedDiskBreakdown(),
 	}
 
 	if err := c.Heartbeat(req); err != nil {

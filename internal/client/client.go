@@ -44,6 +44,66 @@ type HeartbeatRequest struct {
 	// not installed on this VPS — the server then knows to leave the
 	// machine's tailscale_* columns untouched. See heartbeat/tailscale.go.
 	Tailscale *TailscaleStatus `json:"tailscale,omitempty"`
+
+	// --- Resource investigation ("what's eating my box") ---
+	//
+	// All four sections below are strictly optional. The server treats
+	// missing sections as "this agent doesn't report that yet" and
+	// preserves whatever was last written for the machine — newer
+	// fields can land in any release without breaking older sibling
+	// agents that share a machine row. See agent.ts buildResourceSnapshot.
+	OtherContainers      []OtherContainer  `json:"otherContainers,omitempty"`
+	TopProcessesByCPU    []ProcessStat     `json:"topProcessesByCpu,omitempty"`
+	TopProcessesByMemory []ProcessStat     `json:"topProcessesByMemory,omitempty"`
+	DiskBreakdown        *DiskBreakdown    `json:"diskBreakdown,omitempty"`
+}
+
+// OtherContainer describes a Docker container running on the box that
+// is *not* managed by Stacked (no `com.stacked.kind=service` label).
+// Surfaced so the user can answer "why is my box at 90% CPU" when the
+// culprit is something they're running outside Stacked.
+type OtherContainer struct {
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	Image         string  `json:"image"`
+	State         string  `json:"state"`
+	CPUPercent    float64 `json:"cpuPercent,omitempty"`
+	MemoryPercent float64 `json:"memoryPercent,omitempty"`
+	MemoryBytes   uint64  `json:"memoryBytes,omitempty"`
+}
+
+// ProcessStat is one row of `ps`-derived top-N data. PIDs are
+// deliberately omitted — the UI surfaces process names so the user
+// can investigate, without inviting a "kill this PID" button we
+// don't want to ship as a destructive op.
+type ProcessStat struct {
+	Command       string  `json:"command"`
+	CPUPercent    float64 `json:"cpuPercent"`
+	MemoryPercent float64 `json:"memoryPercent"`
+}
+
+// DiskBreakdown carries two complementary sources of disk-usage
+// attribution: Docker's `system df` totals, and `du`-based sizes for
+// /opt/stacked/{services,volumes}. Both are independent and may be
+// nil if collection failed (du can be slow on large volumes — the
+// collector applies a hard timeout and drops the section rather than
+// blocking the heartbeat).
+type DiskBreakdown struct {
+	Docker  *DockerDiskUsage  `json:"docker,omitempty"`
+	Stacked *StackedDiskUsage `json:"stacked,omitempty"`
+}
+
+type DockerDiskUsage struct {
+	ImagesBytes      uint64 `json:"imagesBytes"`
+	ContainersBytes  uint64 `json:"containersBytes"`
+	VolumesBytes     uint64 `json:"volumesBytes"`
+	BuildCacheBytes  uint64 `json:"buildCacheBytes"`
+	ReclaimableBytes uint64 `json:"reclaimableBytes"`
+}
+
+type StackedDiskUsage struct {
+	ServicesBytes uint64 `json:"servicesBytes"`
+	VolumesBytes  uint64 `json:"volumesBytes"`
 }
 
 // TailscaleStatus is the subset of `tailscale status --json` the agent
