@@ -70,40 +70,58 @@ func reconcileDatabaseFirewall(containerName string, hostPort int, allowedCIDRs 
 		return fmt.Errorf("clear existing rules: %w", err)
 	}
 
-	dport := fmt.Sprintf("%d", hostPort)
-
 	// Insert at the top of DOCKER-USER (position 1). We insert the DROP first
 	// so it ends up *below* the subsequent allow rules: each `-I … 1` pushes
 	// the previous top down. Final top-to-bottom order becomes:
-	//   allow <cidrN> … allow <cidr1>  DROP <port>
+	//   allow <cidrN> … allow <cidr1>  DROP(new)
 	// i.e. listed sources RETURN to normal processing, the rest are dropped.
-	dropRule := []string{
-		"-I", "DOCKER-USER", "1",
-		"-p", "tcp", "--dport", dport,
-		"-m", "comment", "--comment", tag,
-		"-j", "DROP",
-	}
-	if err := runIptables(dropRule); err != nil {
+	if err := runIptables(dropRuleArgs(hostPort, tag)); err != nil {
 		return fmt.Errorf("insert drop rule: %w", err)
 	}
-
 	for _, cidr := range allowedCIDRs {
 		cidr = strings.TrimSpace(cidr)
 		if cidr == "" {
 			continue
 		}
-		allowRule := []string{
-			"-I", "DOCKER-USER", "1",
-			"-p", "tcp", "--dport", dport,
-			"-s", cidr,
-			"-m", "comment", "--comment", tag,
-			"-j", "RETURN",
-		}
-		if err := runIptables(allowRule); err != nil {
+		if err := runIptables(allowRuleArgs(hostPort, cidr, tag)); err != nil {
 			return fmt.Errorf("insert allow rule for %s: %w", cidr, err)
 		}
 	}
 	return nil
+}
+
+// allowRuleArgs / dropRuleArgs build the DOCKER-USER rule argv. They are pure
+// so the exact match semantics — the part that's easy to get wrong — can be
+// unit-tested without invoking iptables.
+//
+// Critical detail: DOCKER-USER is traversed in the FORWARD chain, *after*
+// Docker's nat/PREROUTING DNAT has already rewritten the packet's destination
+// from <hostPort> to the container's native port. Matching on `--dport` would
+// therefore never match (and would also match every container sharing that
+// native port). We instead match `conntrack --ctorigdstport <hostPort>`, which
+// is the original, pre-DNAT destination port — unique to this database's
+// published port. The DROP additionally matches `--ctstate NEW` so only new
+// inbound connections from non-allowlisted sources are blocked; established
+// and return traffic flow normally.
+func allowRuleArgs(hostPort int, cidr, tag string) []string {
+	return []string{
+		"-I", "DOCKER-USER", "1",
+		"-p", "tcp",
+		"-m", "conntrack", "--ctorigdstport", fmt.Sprintf("%d", hostPort),
+		"-s", cidr,
+		"-m", "comment", "--comment", tag,
+		"-j", "RETURN",
+	}
+}
+
+func dropRuleArgs(hostPort int, tag string) []string {
+	return []string{
+		"-I", "DOCKER-USER", "1",
+		"-p", "tcp",
+		"-m", "conntrack", "--ctorigdstport", fmt.Sprintf("%d", hostPort), "--ctstate", "NEW",
+		"-m", "comment", "--comment", tag,
+		"-j", "DROP",
+	}
 }
 
 // deleteTaggedRules removes every DOCKER-USER rule carrying `tag`. It reads
