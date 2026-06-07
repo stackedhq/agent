@@ -386,12 +386,38 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 // each slot needs to be independently start/stop-able, and compose's
 // orphan handling within a single project gets in the way of running
 // blue and green simultaneously.
+//
+// The `--network-alias <serviceID>` is what gives blue/green services a
+// stable internal hostname. The per-slot container is named
+// `<serviceID>-blue` / `<serviceID>-green`, which flips every deploy —
+// useless as a fixed address for sibling services. Aliasing every slot
+// to the bare `<serviceID>` means another container on the `stacked`
+// network can always reach the live service at `<serviceID>:<port>`
+// regardless of which slot is active. During the brief blue/green
+// overlap both slots carry the alias and Docker DNS round-robins between
+// them (standard scaled-service behaviour, both are healthy by then);
+// steady state resolves to the single running slot. recreate /
+// fast-restart already get this for free via `container_name`.
 func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation) error {
-	limits := resourceLimitsFromPayload(op.Payload)
+	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload))
+	cmd := exec.Command("docker", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		streamer.AddLine(strings.TrimSpace(string(out)))
+		return fmt.Errorf("docker run %s: %w", containerName, err)
+	}
+	return nil
+}
+
+// rollingContainerArgs builds the `docker run` argv for a rolling slot
+// container. Pure (no side effects) so the flag contract — notably the
+// stable `--network-alias` — can be unit-tested without invoking docker.
+func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits) []string {
 	args := []string{
 		"run", "-d",
 		"--name", containerName,
 		"--network=stacked",
+		"--network-alias=" + serviceID,
 		"--restart=" + limits.restartPolicy,
 		"--env-file=" + envPath,
 		"--label", "com.docker.compose.project=" + serviceID,
@@ -408,13 +434,7 @@ func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot
 	}
 	// Image must come last — everything after it is the container's argv.
 	args = append(args, imageName)
-	cmd := exec.Command("docker", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		streamer.AddLine(strings.TrimSpace(string(out)))
-		return fmt.Errorf("docker run %s: %w", containerName, err)
-	}
-	return nil
+	return args
 }
 
 // containerNameForSlot returns the container name for a service's slot.
