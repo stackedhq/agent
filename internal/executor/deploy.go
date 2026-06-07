@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -143,7 +144,7 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	if err := ensureVolumeHostDirs(mounts); err != nil {
 		return nil, fail(err)
 	}
-	compose := generateCompose(serviceID, imageName, mounts)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload))
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
@@ -284,7 +285,43 @@ func buildEnvFile(vars map[string]string) string {
 	return b.String()
 }
 
-func generateCompose(serviceID, imageName string, mounts []volumeMount) string {
+// resourceLimits captures the per-container CPU/memory caps and restart
+// policy from a deploy op payload. Zero limit values mean "unset" ->
+// unlimited; an empty restart policy falls back to unless-stopped. Both
+// deploy paths apply these: the recreate path threads them into the
+// compose template (generateCompose), the rolling path into `docker run`
+// flags (runRollingContainer).
+type resourceLimits struct {
+	cpuMillicores int    // 1000 = 1 CPU core; <=0 = unlimited
+	memoryMB      int    // <=0 = unlimited
+	restartPolicy string // docker/compose restart policy
+}
+
+func resourceLimitsFromPayload(payload map[string]interface{}) resourceLimits {
+	rp := getStringPayload(payload, "restartPolicy")
+	if rp == "" {
+		rp = "unless-stopped"
+	}
+	return resourceLimits{
+		cpuMillicores: getIntPayload(payload, "cpuLimit"),
+		memoryMB:      getIntPayload(payload, "memoryLimitMb"),
+		restartPolicy: rp,
+	}
+}
+
+// cpus renders the CPU cap as a docker/compose decimal core count
+// (e.g. 1500 millicores -> "1.5"). Empty string when unset.
+func (l resourceLimits) cpus() string {
+	if l.cpuMillicores <= 0 {
+		return ""
+	}
+	s := strconv.FormatFloat(float64(l.cpuMillicores)/1000.0, 'f', 3, 64)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	return s
+}
+
+func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits) string {
 	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
 	// managers correctly partition `docker ps` output. The runtimelogs
 	// manager treats label-less containers as services for back-compat
@@ -307,12 +344,23 @@ func generateCompose(serviceID, imageName string, mounts []volumeMount) string {
 	// for `ensureVolumeHostDirs` before invoking `docker compose up` so
 	// the bind sources exist with predictable mode/ownership.
 	volumesBlock := renderComposeVolumes(mounts)
+	// Resource block: restart policy is always emitted; mem_limit / cpus
+	// only when the service has a configured cap (otherwise the container
+	// runs unlimited, matching the historical behaviour). `mem_limit` and
+	// `cpus` are both honoured by `docker compose up` in non-swarm mode.
+	var resourceBlock strings.Builder
+	resourceBlock.WriteString("    restart: " + limits.restartPolicy + "\n")
+	if limits.memoryMB > 0 {
+		fmt.Fprintf(&resourceBlock, "    mem_limit: %dm\n", limits.memoryMB)
+	}
+	if c := limits.cpus(); c != "" {
+		resourceBlock.WriteString("    cpus: " + c + "\n")
+	}
 	return fmt.Sprintf(`services:
   %s:
     container_name: %s
     image: %s
-    restart: unless-stopped
-    env_file:
+%s    env_file:
       - .env
 %s    networks:
       - stacked
@@ -323,5 +371,5 @@ networks:
   stacked:
     name: stacked
     external: true
-`, serviceID, serviceID, imageName, volumesBlock)
+`, serviceID, serviceID, imageName, resourceBlock.String(), volumesBlock)
 }

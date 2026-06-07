@@ -287,7 +287,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	if err := ensureVolumeHostDirs(mounts); err != nil {
 		return nil, fail(err)
 	}
-	compose := generateCompose(serviceID, imageName, mounts)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload))
 	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
@@ -387,17 +387,27 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 // orphan handling within a single project gets in the way of running
 // blue and green simultaneously.
 func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation) error {
+	limits := resourceLimitsFromPayload(op.Payload)
 	args := []string{
 		"run", "-d",
 		"--name", containerName,
 		"--network=stacked",
-		"--restart=unless-stopped",
+		"--restart=" + limits.restartPolicy,
 		"--env-file=" + envPath,
 		"--label", "com.docker.compose.project=" + serviceID,
 		"--label", "com.stacked.kind=service",
 		"--label", "com.stacked.slot=" + slot,
-		imageName,
 	}
+	// Resource caps applied only when configured; an unset limit leaves
+	// the container unconstrained (historical behaviour).
+	if limits.memoryMB > 0 {
+		args = append(args, fmt.Sprintf("--memory=%dm", limits.memoryMB))
+	}
+	if c := limits.cpus(); c != "" {
+		args = append(args, "--cpus="+c)
+	}
+	// Image must come last — everything after it is the container's argv.
+	args = append(args, imageName)
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
