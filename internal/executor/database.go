@@ -33,6 +33,15 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	containerName := getStringPayload(op.Payload, "containerName")
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
 	credentials := getMapPayload(op.Payload, "credentials")
+	// External exposure. Absent → "public" to preserve historical behavior
+	// for older servers that don't send the field (the new server always
+	// sends "internal" for freshly-provisioned databases). bindHost carries
+	// the machine's Tailscale IP and is only consulted in tailnet mode.
+	accessMode := getStringPayload(op.Payload, "accessMode")
+	if accessMode == "" {
+		accessMode = "public"
+	}
+	bindHost := getStringPayload(op.Payload, "tailscaleIp")
 
 	if databaseID == "" {
 		return nil, fmt.Errorf("db_provision requires databaseId")
@@ -66,7 +75,7 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	streamer.AddLine(fmt.Sprintf("Provisioning %s database (%s)", dbType, dockerImage))
 	streamer.Flush()
 
-	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials)
+	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost)
 	if err != nil {
 		return nil, fail(err)
 	}
@@ -230,7 +239,52 @@ func (e *Executor) DestroyDB(op client.Operation) error {
 //
 // The volume is named `data` and is compose-managed (not a bind mount) —
 // `compose down -v` cleans it up on destroy, plain stop/start preserves it.
-func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string) (string, error) {
+// databaseNativePort is the port the engine listens on inside its container —
+// the target of the host port mapping and the port siblings reach over the
+// `stacked` network.
+func databaseNativePort(dbType string) int {
+	switch dbType {
+	case "postgres":
+		return 5432
+	case "mysql":
+		return 3306
+	case "mongo":
+		return 27017
+	case "redis":
+		return 6379
+	}
+	return 0
+}
+
+// renderDatabasePorts builds the compose `ports:` block for a database based
+// on its access mode. The returned string is spliced directly into the
+// service definition (already indented, trailing newline) — or empty for
+// internal mode, which publishes no host port at all.
+//
+//   - internal: "" — no host binding. Reachable only over the `stacked`
+//     Docker network; closed to the host and internet by construction.
+//   - tailnet:  bind to the machine's Tailscale IP (bindHost) so the port is
+//     reachable only over the tailnet. If bindHost is empty (Tailscale not
+//     ready) we publish nothing rather than fall back to 0.0.0.0 — failing
+//     closed is the safe choice.
+//   - public:   bind 0.0.0.0. Source-IP restriction is enforced separately as
+//     DOCKER-USER firewall rules (see firewall.go), not here.
+func renderDatabasePorts(accessMode, bindHost string, hostPort, nativePort int) string {
+	switch accessMode {
+	case "tailnet":
+		if bindHost == "" {
+			return ""
+		}
+		return fmt.Sprintf("    ports:\n      - \"%s:%d:%d\"\n", bindHost, hostPort, nativePort)
+	case "public":
+		return fmt.Sprintf("    ports:\n      - \"%d:%d\"\n", hostPort, nativePort)
+	default: // internal (and any unknown value — fail closed)
+		return ""
+	}
+}
+
+func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string, accessMode, bindHost string) (string, error) {
+	portsBlock := renderDatabasePorts(accessMode, bindHost, port, databaseNativePort(dbType))
 	switch dbType {
 	case "postgres":
 		user := creds["user"]
@@ -250,9 +304,7 @@ func generateDatabaseCompose(dbType string, port int, containerName, image strin
       POSTGRES_DB: %s
     volumes:
       - data:/var/lib/postgresql/data
-    ports:
-      - "%d:5432"
-    networks:
+%s    networks:
       - stacked
     labels:
       com.stacked.kind: database
@@ -264,7 +316,7 @@ networks:
   stacked:
     name: stacked
     external: true
-`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), port), nil
+`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), portsBlock), nil
 
 	case "mysql":
 		user := creds["user"]
@@ -286,9 +338,7 @@ networks:
       MYSQL_PASSWORD: %s
     volumes:
       - data:/var/lib/mysql
-    ports:
-      - "%d:3306"
-    networks:
+%s    networks:
       - stacked
     labels:
       com.stacked.kind: database
@@ -300,7 +350,7 @@ networks:
   stacked:
     name: stacked
     external: true
-`, image, containerName, yamlEscape(rootPw), yamlEscape(dbName), yamlEscape(user), yamlEscape(password), port), nil
+`, image, containerName, yamlEscape(rootPw), yamlEscape(dbName), yamlEscape(user), yamlEscape(password), portsBlock), nil
 
 	case "mongo":
 		user := creds["user"]
@@ -320,9 +370,7 @@ networks:
       MONGO_INITDB_DATABASE: %s
     volumes:
       - data:/data/db
-    ports:
-      - "%d:27017"
-    networks:
+%s    networks:
       - stacked
     labels:
       com.stacked.kind: database
@@ -334,7 +382,7 @@ networks:
   stacked:
     name: stacked
     external: true
-`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), port), nil
+`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), portsBlock), nil
 
 	case "redis":
 		password := creds["password"]
@@ -352,9 +400,7 @@ networks:
     command: ["redis-server", "--requirepass", %s]
     volumes:
       - data:/data
-    ports:
-      - "%d:6379"
-    networks:
+%s    networks:
       - stacked
     labels:
       com.stacked.kind: database
@@ -366,7 +412,7 @@ networks:
   stacked:
     name: stacked
     external: true
-`, image, containerName, yamlQuote(password), port), nil
+`, image, containerName, yamlQuote(password), portsBlock), nil
 	}
 	return "", fmt.Errorf("unsupported database type: %s", dbType)
 }
