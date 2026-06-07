@@ -66,7 +66,7 @@ func TestGenerateCompose_AppliesLimits(t *testing.T) {
 		cpuMillicores: 1500,
 		memoryMB:      512,
 		restartPolicy: "always",
-	})
+	}, nil)
 	for _, want := range []string{
 		"restart: always",
 		"mem_limit: 512m",
@@ -78,10 +78,40 @@ func TestGenerateCompose_AppliesLimits(t *testing.T) {
 	}
 }
 
+func TestGenerateCompose_NetworkAliases(t *testing.T) {
+	// No aliases → historical list form, no aliases key.
+	plain := generateCompose("svc-1", "img:latest", nil,
+		resourceLimits{restartPolicy: "unless-stopped"}, nil)
+	if !strings.Contains(plain, "    networks:\n      - stacked\n") {
+		t.Errorf("expected list-form networks block without aliases:\n%s", plain)
+	}
+	if strings.Contains(plain, "aliases:") {
+		t.Errorf("did not expect aliases key without aliases:\n%s", plain)
+	}
+
+	// With aliases → map form carrying the valid labels; invalid dropped.
+	withAliases := generateCompose("svc-1", "img:latest", nil,
+		resourceLimits{restartPolicy: "unless-stopped"},
+		[]string{"api", "old-name", "BAD ALIAS"})
+	for _, want := range []string{
+		"stacked:",
+		"aliases:",
+		"- api",
+		"- old-name",
+	} {
+		if !strings.Contains(withAliases, want) {
+			t.Errorf("expected %q in compose:\n%s", want, withAliases)
+		}
+	}
+	if strings.Contains(withAliases, "BAD ALIAS") {
+		t.Errorf("invalid alias must be filtered:\n%s", withAliases)
+	}
+}
+
 func TestGenerateCompose_OmitsUnsetLimits(t *testing.T) {
 	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{
 		restartPolicy: "unless-stopped",
-	})
+	}, nil)
 	if strings.Contains(out, "mem_limit") {
 		t.Errorf("expected no mem_limit when unset:\n%s", out)
 	}

@@ -142,7 +142,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// of the same name behind, remove it before starting fresh.
 	_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
 
-	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, envPath, op); err != nil {
+	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, envPath, op, creds.NetworkAliases); err != nil {
 		return nil, fail(err)
 	}
 
@@ -287,7 +287,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	if err := ensureVolumeHostDirs(mounts); err != nil {
 		return nil, fail(err)
 	}
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload))
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases)
 	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
@@ -398,8 +398,8 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 // them (standard scaled-service behaviour, both are healthy by then);
 // steady state resolves to the single running slot. recreate /
 // fast-restart already get this for free via `container_name`.
-func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation) error {
-	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload))
+func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation, aliases []string) error {
+	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload), aliases)
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -412,18 +412,28 @@ func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot
 // rollingContainerArgs builds the `docker run` argv for a rolling slot
 // container. Pure (no side effects) so the flag contract — notably the
 // stable `--network-alias` — can be unit-tested without invoking docker.
-func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits) []string {
+func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits, aliases []string) []string {
 	args := []string{
 		"run", "-d",
 		"--name", containerName,
 		"--network=stacked",
 		"--network-alias=" + serviceID,
 		"--restart=" + limits.restartPolicy,
-		"--env-file=" + envPath,
-		"--label", "com.docker.compose.project=" + serviceID,
-		"--label", "com.stacked.kind=service",
-		"--label", "com.stacked.slot=" + slot,
 	}
+	// Additional friendly internal hostnames (current + retained slugs).
+	// The `<serviceID>` alias above is always present as the floor; these
+	// are additive. Skip anything that isn't a valid DNS label.
+	for _, a := range aliases {
+		if validNetworkAlias(a) {
+			args = append(args, "--network-alias="+a)
+		}
+	}
+	args = append(args,
+		"--env-file="+envPath,
+		"--label", "com.docker.compose.project="+serviceID,
+		"--label", "com.stacked.kind=service",
+		"--label", "com.stacked.slot="+slot,
+	)
 	// Resource caps applied only when configured; an unset limit leaves
 	// the container unconstrained (historical behaviour).
 	if limits.memoryMB > 0 {

@@ -34,22 +34,22 @@ func TestValidExtensionName(t *testing.T) {
 		{"tablefunc", true},
 
 		// Rejections — defense in depth against a tampered payload.
-		{"", false},                       // empty
-		{"PgVector", false},               // uppercase
-		{"1starts_with_digit", false},     // leading digit
-		{"-leading-hyphen", false},        // leading non-letter
-		{"_leading_underscore", false},    // leading non-letter
-		{"name with space", false},        // whitespace
-		{`name"quote`, false},             // double-quote
-		{"name'quote", false},             // single-quote
-		{"name;DROP", false},              // semicolon
-		{"name--comment", true},           // hyphens are fine, `--` not a comment in identifier context
-		{"name/*injection*/", false},      // slash
-		{"name`backtick", false},          // backtick
-		{"name\\backslash", false},        // backslash
-		{"name\nnewline", false},          // newline
-		{"name\tnewline", false},          // tab
-		{"a" + repeat("b", 63), false},    // length > 63
+		{"", false},                    // empty
+		{"PgVector", false},            // uppercase
+		{"1starts_with_digit", false},  // leading digit
+		{"-leading-hyphen", false},     // leading non-letter
+		{"_leading_underscore", false}, // leading non-letter
+		{"name with space", false},     // whitespace
+		{`name"quote`, false},          // double-quote
+		{"name'quote", false},          // single-quote
+		{"name;DROP", false},           // semicolon
+		{"name--comment", true},        // hyphens are fine, `--` not a comment in identifier context
+		{"name/*injection*/", false},   // slash
+		{"name`backtick", false},       // backtick
+		{"name\\backslash", false},     // backslash
+		{"name\nnewline", false},       // newline
+		{"name\tnewline", false},       // tab
+		{"a" + repeat("b", 63), false}, // length > 63
 	}
 
 	for _, tc := range cases {

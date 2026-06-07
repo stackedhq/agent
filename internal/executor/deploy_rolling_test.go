@@ -11,6 +11,7 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 		serviceID+"-blue", serviceID, "blue",
 		"registry/app:tag", "/opt/stacked/services/svc-123/.env",
 		resourceLimits{restartPolicy: "unless-stopped"},
+		nil,
 	)
 
 	// The slot container is named per-slot but must alias the bare
@@ -32,10 +33,38 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 	}
 }
 
+func TestRollingContainerArgsFriendlyAliases(t *testing.T) {
+	args := rollingContainerArgs(
+		"svc-1-blue", "svc-1", "blue", "img", "/env",
+		resourceLimits{restartPolicy: "unless-stopped"},
+		[]string{"api", "old-name", "BAD ALIAS", ""},
+	)
+	// Permanent UUID alias plus the two valid friendly aliases.
+	for _, want := range []string{
+		"--network-alias=svc-1",
+		"--network-alias=api",
+		"--network-alias=old-name",
+	} {
+		if !containsFlag(args, want) {
+			t.Errorf("expected %s, got: %v", want, args)
+		}
+	}
+	// Invalid labels must be dropped, never spliced in.
+	for _, bad := range []string{
+		"--network-alias=BAD ALIAS",
+		"--network-alias=",
+	} {
+		if containsFlag(args, bad) {
+			t.Errorf("invalid alias must be filtered, found %q in %v", bad, args)
+		}
+	}
+}
+
 func TestRollingContainerArgsAppliesLimits(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-green", "svc-1", "green", "img", "/env",
 		resourceLimits{cpuMillicores: 1500, memoryMB: 512, restartPolicy: "on-failure"},
+		nil,
 	)
 	if !containsFlag(args, "--memory=512m") {
 		t.Errorf("expected --memory=512m, got: %v", args)
@@ -52,6 +81,7 @@ func TestRollingContainerArgsOmitsUnsetLimits(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-blue", "svc-1", "blue", "img", "/env",
 		resourceLimits{restartPolicy: "unless-stopped"},
+		nil,
 	)
 	for _, a := range args {
 		if strings.HasPrefix(a, "--memory=") || strings.HasPrefix(a, "--cpus=") {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -144,7 +145,7 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	if err := ensureVolumeHostDirs(mounts); err != nil {
 		return nil, fail(err)
 	}
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload))
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
@@ -321,7 +322,7 @@ func (l resourceLimits) cpus() string {
 	return s
 }
 
-func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits) string {
+func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, aliases []string) string {
 	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
 	// managers correctly partition `docker ps` output. The runtimelogs
 	// manager treats label-less containers as services for back-compat
@@ -362,14 +363,44 @@ func generateCompose(serviceID, imageName string, mounts []volumeMount, limits r
     image: %s
 %s    env_file:
       - .env
-%s    networks:
-      - stacked
-    labels:
+%s%s    labels:
       com.stacked.kind: service
 
 networks:
   stacked:
     name: stacked
     external: true
-`, serviceID, serviceID, imageName, resourceBlock.String(), volumesBlock)
+`, serviceID, serviceID, imageName, resourceBlock.String(), volumesBlock, renderServiceNetworks(aliases))
+}
+
+// renderServiceNetworks emits the service-level `networks:` block. With no
+// friendly aliases it's the historical list form (`- stacked`). With aliases
+// it switches to the map form so we can attach extra `--network-alias` values
+// (the human-readable internal hostnames). Docker still registers the compose
+// service key (`<serviceID>`) as an alias in both forms, so the UUID floor is
+// preserved regardless.
+func renderServiceNetworks(aliases []string) string {
+	if len(aliases) == 0 {
+		return "    networks:\n      - stacked\n"
+	}
+	var b strings.Builder
+	b.WriteString("    networks:\n      stacked:\n        aliases:\n")
+	for _, a := range aliases {
+		// Defense-in-depth: the server allocates these from a strict slug,
+		// but skip anything that isn't a plausible DNS label so a bad value
+		// can't corrupt the compose file.
+		if !validNetworkAlias(a) {
+			continue
+		}
+		fmt.Fprintf(&b, "          - %s\n", a)
+	}
+	return b.String()
+}
+
+// validNetworkAlias mirrors the server's slug constraints: a lowercase DNS
+// label, 1–63 chars, alphanumeric with internal hyphens.
+var networkAliasRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func validNetworkAlias(s string) bool {
+	return networkAliasRe.MatchString(s)
 }

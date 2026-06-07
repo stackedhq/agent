@@ -124,7 +124,7 @@ func TestRenderComposeVolumes_Multiple(t *testing.T) {
 }
 
 func TestGenerateCompose_NoVolumes_OmitsBlock(t *testing.T) {
-	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"})
+	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"}, nil)
 	if strings.Contains(out, "volumes:") {
 		t.Fatalf("expected no volumes: block when mounts is nil, got:\n%s", out)
 	}
@@ -140,7 +140,7 @@ func TestGenerateCompose_NoVolumes_OmitsBlock(t *testing.T) {
 func TestGenerateCompose_WithVolumes_IncludesBlock(t *testing.T) {
 	out := generateCompose("svc-1", "img:latest", []volumeMount{
 		{HostPath: "/host", ContainerPath: "/container"},
-	}, resourceLimits{restartPolicy: "unless-stopped"})
+	}, resourceLimits{restartPolicy: "unless-stopped"}, nil)
 	if !strings.Contains(out, "    volumes:\n      - /host:/container\n") {
 		t.Fatalf("expected volumes block in compose, got:\n%s", out)
 	}

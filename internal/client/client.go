@@ -52,10 +52,10 @@ type HeartbeatRequest struct {
 	// preserves whatever was last written for the machine — newer
 	// fields can land in any release without breaking older sibling
 	// agents that share a machine row. See agent.ts buildResourceSnapshot.
-	OtherContainers      []OtherContainer  `json:"otherContainers,omitempty"`
-	TopProcessesByCPU    []ProcessStat     `json:"topProcessesByCpu,omitempty"`
-	TopProcessesByMemory []ProcessStat     `json:"topProcessesByMemory,omitempty"`
-	DiskBreakdown        *DiskBreakdown    `json:"diskBreakdown,omitempty"`
+	OtherContainers      []OtherContainer `json:"otherContainers,omitempty"`
+	TopProcessesByCPU    []ProcessStat    `json:"topProcessesByCpu,omitempty"`
+	TopProcessesByMemory []ProcessStat    `json:"topProcessesByMemory,omitempty"`
+	DiskBreakdown        *DiskBreakdown   `json:"diskBreakdown,omitempty"`
 }
 
 // OtherContainer describes a Docker container running on the box that
@@ -174,6 +174,13 @@ type Credentials struct {
 	// from an explicit 0, which the server sends for worker services
 	// (no exposed port) to signal "skip the TCP probe entirely".
 	Port *int `json:"port,omitempty"`
+	// NetworkAliases are human-readable internal DNS names (slugs of the
+	// service's display name, current + retained-from-renames) the agent
+	// attaches to the container as additional `--network-alias` values on
+	// the `stacked` network. The permanent `<serviceID>` alias is always
+	// emitted separately and is not included here. Empty/absent on older
+	// servers — the service is still reachable by its UUID.
+	NetworkAliases []string `json:"networkAliases,omitempty"`
 }
 
 // CredentialsErrorBody is the server-side error envelope returned
@@ -343,12 +350,12 @@ type MigrationDBCreds struct {
 }
 
 type MigrationCredentials struct {
-	Kind   string            `json:"kind"` // "database" | "volume"
-	Engine string            `json:"engine,omitempty"`
-	Source *MigrationDBCreds `json:"source,omitempty"`
-	Target *MigrationDBCreds `json:"target,omitempty"`
-	SourcePath string         `json:"sourcePath,omitempty"`
-	TargetPath string         `json:"targetPath,omitempty"`
+	Kind       string            `json:"kind"` // "database" | "volume"
+	Engine     string            `json:"engine,omitempty"`
+	Source     *MigrationDBCreds `json:"source,omitempty"`
+	Target     *MigrationDBCreds `json:"target,omitempty"`
+	SourcePath string            `json:"sourcePath,omitempty"`
+	TargetPath string            `json:"targetPath,omitempty"`
 }
 
 type migrationCredentialsResponse struct {
