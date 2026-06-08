@@ -28,7 +28,6 @@ func (e *Executor) SetAccess(op client.Operation) error {
 	port := getIntPayload(op.Payload, "port")
 	accessMode := getStringPayload(op.Payload, "accessMode")
 	bindHost := getStringPayload(op.Payload, "tailscaleIp")
-	allowedIPs := getStringSlicePayload(op.Payload, "allowedIps")
 	credentials := getMapPayload(op.Payload, "credentials")
 
 	if databaseID == "" {
@@ -77,50 +76,19 @@ func (e *Executor) SetAccess(op client.Operation) error {
 
 	// Recreate the container so the new port binding takes effect. compose
 	// leaves it untouched if nothing changed; the named volume survives.
+	//
+	// Note: public mode publishes the port on 0.0.0.0 but the agent does NOT
+	// manage host firewall rules — it runs unprivileged (no iptables/root).
+	// Source-IP restriction for a public database is the user's responsibility
+	// at their cloud firewall / security-group layer; the dashboard makes that
+	// explicit. internal/tailnet never reach a public interface at all.
 	streamer.AddLine("Applying network binding...")
 	streamer.Flush()
 	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
 		return fail(fmt.Errorf("docker compose up: %w", err))
 	}
 
-	// Firewall: only public mode restricts source IPs. For internal/tailnet
-	// the port isn't on a public interface, so any stale rules are removed.
-	if accessMode == "public" {
-		streamer.AddLine(fmt.Sprintf("Reconciling firewall allowlist (%d CIDR(s))...", len(allowedIPs)))
-		streamer.Flush()
-		if err := reconcileDatabaseFirewall(containerName, port, allowedIPs); err != nil {
-			// Don't silently leave the port wide open: surface the failure
-			// so the server can mark the op failed and warn the user.
-			return fail(fmt.Errorf("firewall reconcile: %w", err))
-		}
-	} else {
-		if err := clearDatabaseFirewall(containerName); err != nil {
-			return fail(fmt.Errorf("firewall clear: %w", err))
-		}
-	}
-
 	streamer.AddLine("Done")
 	streamer.Flush()
 	return nil
-}
-
-// getStringSlicePayload pulls a JSON array of strings from a payload. JSON
-// decodes arrays as []interface{}, so we coerce element-wise and drop
-// non-strings. Returns nil when the key is absent.
-func getStringSlicePayload(payload map[string]interface{}, key string) []string {
-	v, ok := payload[key]
-	if !ok {
-		return nil
-	}
-	raw, ok := v.([]interface{})
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(raw))
-	for _, item := range raw {
-		if s, ok := item.(string); ok {
-			out = append(out, s)
-		}
-	}
-	return out
 }
