@@ -41,6 +41,10 @@ func main() {
 	log.Printf("Server: %s", cfg.Agent.Server)
 
 	c := client.New(cfg.Agent.Server, cfg.Agent.Token)
+	// Record the server origin for on-demand TLS `ask` URL rendering
+	// before any op (or the startup proxy reconcile) can regenerate
+	// the Caddyfile.
+	executor.SetServerBaseURL(cfg.Agent.Server)
 	exec := executor.New(c)
 	logMgr := runtimelogs.NewManager(c)
 	dbLogMgr := databaselogs.NewManager(c)
@@ -122,4 +126,3 @@ func runtimeLogReconcileLoop(m *runtimelogs.Manager, interval time.Duration, sto
 		}
 	}
 }
-

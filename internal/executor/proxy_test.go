@@ -484,3 +484,110 @@ func TestParseDomainsLegacyPayloadDefaults(t *testing.T) {
 		t.Fatalf("expected default stripPrefix=true, got false")
 	}
 }
+
+// --- On-demand TLS ---
+
+// withServerBaseURL sets the package-level server origin for the
+// duration of a test and restores it after. Necessary because on-demand
+// TLS rendering reads the global serverBaseURL to build the `ask` URL.
+func withServerBaseURL(t *testing.T, u string) {
+	t.Helper()
+	prev := serverBaseURL
+	SetServerBaseURL(u)
+	t.Cleanup(func() { serverBaseURL = prev })
+}
+
+func TestParseDomainsOnDemandTLSFlag(t *testing.T) {
+	raw := []interface{}{
+		map[string]interface{}{
+			"domain":      "od.example.com",
+			"serviceId":   "svc-1",
+			"port":        float64(3000),
+			"onDemandTls": true,
+		},
+		map[string]interface{}{
+			"domain":    "eager.example.com",
+			"serviceId": "svc-2",
+			"port":      float64(3000),
+		},
+	}
+	parsed := parseDomains(raw)
+	if len(parsed) != 2 {
+		t.Fatalf("expected 2 parsed rows, got %d", len(parsed))
+	}
+	if !parsed[0].OnDemandTLS {
+		t.Fatalf("expected onDemandTls=true on first row")
+	}
+	if parsed[1].OnDemandTLS {
+		t.Fatalf("expected onDemandTls=false (absent) on second row")
+	}
+}
+
+func TestGenerateCaddyfileOnDemandEmitsGlobalAndSiteBlocks(t *testing.T) {
+	withServerBaseURL(t, "https://stacked.rest")
+	parsed := []cachedDomain{
+		{Domain: "od.example.com", ServiceID: "svc-1", Port: 3000, OnDemandTLS: true},
+		{Domain: "eager.example.com", ServiceID: "svc-2", Port: 3000},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+
+	// Global options block with the ask endpoint.
+	if !strings.Contains(out, "on_demand_tls {") {
+		t.Fatalf("expected global on_demand_tls block, got:\n%s", out)
+	}
+	if !strings.Contains(out, "ask https://stacked.rest/api/agent/tls/ask") {
+		t.Fatalf("expected ask URL, got:\n%s", out)
+	}
+	// The on-demand host gets a per-site tls { on_demand } block.
+	odIdx := strings.Index(out, "od.example.com {")
+	if odIdx < 0 {
+		t.Fatalf("missing od.example.com site block, got:\n%s", out)
+	}
+	eagerIdx := strings.Index(out, "eager.example.com {")
+	if eagerIdx < 0 {
+		t.Fatalf("missing eager.example.com site block, got:\n%s", out)
+	}
+	// `on_demand` (the per-site directive) must appear once, inside the
+	// od.example.com block — i.e. after its opening brace and before the
+	// eager block (which is rendered later in host order).
+	siteOnDemand := strings.Index(out, "tls {\n        on_demand")
+	if siteOnDemand < 0 {
+		t.Fatalf("expected per-site tls { on_demand }, got:\n%s", out)
+	}
+	if siteOnDemand < odIdx {
+		t.Fatalf("per-site on_demand should be inside od.example.com block, got:\n%s", out)
+	}
+	// The eager host must NOT get a per-site on_demand directive.
+	eagerBlock := out[eagerIdx:]
+	if strings.Contains(eagerBlock, "on_demand") {
+		t.Fatalf("eager host should not get on_demand, got:\n%s", eagerBlock)
+	}
+}
+
+func TestGenerateCaddyfileNoOnDemandWithoutServerURL(t *testing.T) {
+	// Without a known server origin we can't render a guarded ask
+	// endpoint, so on-demand must degrade to eager issuance rather than
+	// emit an unguarded (open-relay) on_demand_tls block.
+	withServerBaseURL(t, "")
+	parsed := []cachedDomain{
+		{Domain: "od.example.com", ServiceID: "svc-1", Port: 3000, OnDemandTLS: true},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	if strings.Contains(out, "on_demand") {
+		t.Fatalf("expected no on_demand when server URL is unset, got:\n%s", out)
+	}
+}
+
+func TestGenerateCaddyfileNoGlobalBlockWhenNoOnDemand(t *testing.T) {
+	// A normal (no on-demand) config must not gain a global options
+	// block — keeps the rendered file byte-identical to pre-feature
+	// output for every existing install.
+	withServerBaseURL(t, "https://stacked.rest")
+	parsed := []cachedDomain{
+		{Domain: "app.example.com", ServiceID: "svc-1", Port: 3000},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	if strings.Contains(out, "on_demand_tls") {
+		t.Fatalf("did not expect global on_demand_tls block, got:\n%s", out)
+	}
+}

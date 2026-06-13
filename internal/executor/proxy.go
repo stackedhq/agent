@@ -59,6 +59,33 @@ const caddyfileHeader = "# Managed by Stacked\n"
 // domains configured for any service on this machine."
 var domainsCachePath = filepath.Join(proxyDir, "domains.json")
 
+// serverBaseURL is the Stacked server origin (e.g. https://stacked.rest),
+// set once at startup from the agent config via SetServerBaseURL. Used
+// to build the on-demand TLS `ask` endpoint URL when rendering the
+// Caddyfile. Empty until set; generateCaddyfile falls back to eager
+// issuance (no on_demand) when it's empty, since an `on_demand_tls`
+// block without an `ask` guard would make the box an open cert-issuing
+// relay. No mutex: it's written exactly once before the poller starts
+// and only read thereafter.
+var serverBaseURL string
+
+// SetServerBaseURL records the Stacked server origin for on-demand TLS
+// `ask` URL construction. Trailing slash is trimmed so URL joins are
+// clean. Called from main() after config load, before any op runs.
+func SetServerBaseURL(u string) {
+	serverBaseURL = strings.TrimRight(u, "/")
+}
+
+// onDemandAskURL returns the full `ask` endpoint URL Caddy should call
+// before issuing an on-demand certificate, or "" when the server origin
+// is unknown (in which case the caller must not emit on_demand at all).
+func onDemandAskURL() string {
+	if serverBaseURL == "" {
+		return ""
+	}
+	return serverBaseURL + "/api/agent/tls/ask"
+}
+
 // cachedDomain is the on-disk representation of one entry in the
 // proxy_config domains array. It mirrors the JSON keys the server sends
 // so we can decode the live payload straight into this type.
@@ -93,11 +120,19 @@ type cachedDomain struct {
 	// unconditionally. Two cachedDomain entries with the same
 	// Domain and different Path produce a single Caddy site block
 	// with one `handle`/`handle_path` per row.
-	Path        string `json:"path,omitempty"`
+	Path string `json:"path,omitempty"`
 	// Pointer so we can tell "absent" (legacy payload) from
 	// "explicitly false". Absent collapses to true in normalisePath
 	// — default-strip matches what most backends-on-/api want.
-	StripPrefix *bool  `json:"stripPrefix,omitempty"`
+	StripPrefix *bool `json:"stripPrefix,omitempty"`
+
+	// On-demand TLS (server agent-feature ON_DEMAND_TLS+). When true
+	// the site block gets `tls { on_demand }` and the file gets a
+	// global `on_demand_tls { ask <server>/api/agent/tls/ask }` block,
+	// so Caddy defers issuance to the first live request and only
+	// issues for hostnames the ask endpoint authorizes. Absent on
+	// older payloads → false → eager issuance (unchanged behavior).
+	OnDemandTLS bool `json:"onDemandTls,omitempty"`
 }
 
 // effectivePath returns the path this entry routes, defaulting to
@@ -335,15 +370,15 @@ func RegenerateCaddyfile() error {
 // server-driven `proxy_config` op and the agent-internal flip during a
 // rolling deploy. It:
 //
-//   1. Generates the Caddyfile content (slot-aware, via slots.All()).
-//   2. `caddy validate`s the new file inside the running Caddy
-//      container BEFORE writing it. Without this, a malformed file
-//      could cause the next reload to fail and force a fall-back
-//      restart that drops traffic for every service on the box.
-//   3. Writes the file.
-//   4. Reloads Caddy. On reload failure, restores the previous file
-//      and re-reloads — we never let a bad Caddyfile linger on disk
-//      because Caddy reloads on container restart at boot too.
+//  1. Generates the Caddyfile content (slot-aware, via slots.All()).
+//  2. `caddy validate`s the new file inside the running Caddy
+//     container BEFORE writing it. Without this, a malformed file
+//     could cause the next reload to fail and force a fall-back
+//     restart that drops traffic for every service on the box.
+//  3. Writes the file.
+//  4. Reloads Caddy. On reload failure, restores the previous file
+//     and re-reloads — we never let a bad Caddyfile linger on disk
+//     because Caddy reloads on container restart at boot too.
 //
 // This function deliberately does NOT fall back to `docker compose
 // restart caddy` on reload failure (the historical behavior). A restart
@@ -456,6 +491,9 @@ func parseDomains(raw []interface{}) []cachedDomain {
 			stripPtr = &stripCopy
 		}
 
+		// On-demand TLS flag. Absent → false (eager issuance).
+		onDemand, _ := dm["onDemandTls"].(bool)
+
 		switch {
 		case serviceID != "":
 			// Service-backed. Default port matches the historical
@@ -469,6 +507,7 @@ func parseDomains(raw []interface{}) []cachedDomain {
 				Port:        port,
 				Path:        path,
 				StripPrefix: stripPtr,
+				OnDemandTLS: onDemand,
 			})
 		case host != "" && port > 0:
 			// Port-bound. Scheme defaults to http; only http and
@@ -484,6 +523,7 @@ func parseDomains(raw []interface{}) []cachedDomain {
 				Scheme:      scheme,
 				Path:        path,
 				StripPrefix: stripPtr,
+				OnDemandTLS: onDemand,
 			})
 		default:
 			// Neither shape fully populated; skip.
@@ -544,11 +584,35 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 	// so the rendered Caddyfile is stable across renders.
 	hostOrder := make([]string, 0)
 	byHost := make(map[string][]cachedDomain)
+	// A host opts into on-demand TLS if any of its rows do — on_demand
+	// is a per-hostname (TLS) concern, not per-path, so we OR the flag
+	// across the rows that share a hostname.
+	onDemandHost := make(map[string]bool)
 	for _, d := range parsed {
 		if _, seen := byHost[d.Domain]; !seen {
 			hostOrder = append(hostOrder, d.Domain)
 		}
 		byHost[d.Domain] = append(byHost[d.Domain], d)
+		if d.OnDemandTLS {
+			onDemandHost[d.Domain] = true
+		}
+	}
+
+	// Global options block for on-demand TLS. Caddy requires the
+	// `ask` endpoint so issuance is gated to authorized hostnames —
+	// without it the box would issue a cert for any hostname pointed
+	// at it. We therefore only emit on_demand (here AND per-site
+	// below) when the ask URL is known; if the server origin is
+	// unset, on-demand silently degrades to eager issuance rather
+	// than rendering an unguarded (dangerous) on_demand_tls block.
+	askURL := onDemandAskURL()
+	anyOnDemand := askURL != "" && len(onDemandHost) > 0
+	if anyOnDemand {
+		b.WriteString("{\n")
+		b.WriteString("\ton_demand_tls {\n")
+		fmt.Fprintf(&b, "\t\task %s\n", askURL)
+		b.WriteString("\t}\n")
+		b.WriteString("}\n\n")
 	}
 
 	for _, host := range hostOrder {
@@ -574,6 +638,15 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 		})
 
 		fmt.Fprintf(&b, "%s {\n", host)
+
+		// On-demand TLS for this host: defer issuance to the first
+		// live request, gated by the global `ask` endpoint. Only
+		// emitted when the ask URL is known (see anyOnDemand above).
+		if anyOnDemand && onDemandHost[host] {
+			b.WriteString("    tls {\n")
+			b.WriteString("        on_demand\n")
+			b.WriteString("    }\n")
+		}
 
 		// Fast path: single row at root — emit a bare
 		// `reverse_proxy` (no `handle` wrapper). Keeps the
@@ -640,18 +713,18 @@ func writeUpstream(b *strings.Builder, d cachedDomain, state map[string]slots.Sl
 // renderUpstreamHostPort produces a Caddy-safe "host:port" token for a
 // port-bound upstream. Two non-obvious rewrites happen here:
 //
-//   1. Loopback rewrite. The Caddy container is on a docker bridge
-//      network, so the user-typed "127.0.0.1" and "localhost" resolve
-//      to the *container itself*, not the host. We rewrite both to
-//      "host.docker.internal", which the compose file pins to the
-//      host's gateway via `extra_hosts: host-gateway`. This is the
-//      only place the user's intent ("this VPS") matches what they
-//      typed without it.
+//  1. Loopback rewrite. The Caddy container is on a docker bridge
+//     network, so the user-typed "127.0.0.1" and "localhost" resolve
+//     to the *container itself*, not the host. We rewrite both to
+//     "host.docker.internal", which the compose file pins to the
+//     host's gateway via `extra_hosts: host-gateway`. This is the
+//     only place the user's intent ("this VPS") matches what they
+//     typed without it.
 //
-//   2. IPv6 bracketing. Caddy expects `[2001:db8::1]:443` for IPv6
-//      literals. A bare `2001:db8::1:443` is ambiguous and rejected
-//      by the parser. Detected by presence of ":" in the host string
-//      and absence of a leading "[".
+//  2. IPv6 bracketing. Caddy expects `[2001:db8::1]:443` for IPv6
+//     literals. A bare `2001:db8::1:443` is ambiguous and rejected
+//     by the parser. Detected by presence of ":" in the host string
+//     and absence of a leading "[".
 func renderUpstreamHostPort(host string, port int) string {
 	switch strings.ToLower(host) {
 	case "127.0.0.1", "localhost", "::1":
