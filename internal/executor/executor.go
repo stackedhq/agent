@@ -72,6 +72,10 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.DBMigrate(op)
 	case "volume_migrate":
 		err = e.VolumeMigrate(op)
+	case "db_backup":
+		err = e.Backup(op)
+	case "db_restore":
+		err = e.Restore(op)
 	case "tailscale_setup":
 		err = e.TailscaleSetup(op)
 	case "tailscale_disable":

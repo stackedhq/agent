@@ -376,6 +376,114 @@ func (c *Client) GetMigrationCredentials(targetID string) (*MigrationCredentials
 	return &resp.Data, nil
 }
 
+// --- Database backups ---
+
+// ErrBackupsDisabled signals that the server has the backup feature flag
+// turned off (R2_BACKUPS_BUCKET unset). Surfaced as a typed error so the
+// op fails with a clear message instead of a generic transport error.
+var ErrBackupsDisabled = fmt.Errorf("backups disabled on server")
+
+// BackupCredentials are the decrypted DB creds + container name the agent
+// needs to dump/restore. Fetched on-demand so plaintext creds never sit in
+// the operations.payload column (mirrors MigrationCredentials).
+type BackupCredentials struct {
+	Engine        string            `json:"engine"`
+	ContainerName string            `json:"containerName"`
+	Creds         map[string]string `json:"creds"`
+}
+
+type backupCredentialsResponse struct {
+	Data BackupCredentials `json:"data"`
+}
+
+type BackupUploadURL struct {
+	URL       string `json:"url"`
+	Key       string `json:"key"`
+	ExpiresAt string `json:"expiresAt"`
+}
+
+type backupUploadURLResponse struct {
+	Data BackupUploadURL `json:"data"`
+}
+
+type BackupDownloadURL struct {
+	URL string `json:"url"`
+	Key string `json:"key"`
+}
+
+type backupDownloadURLResponse struct {
+	Data BackupDownloadURL `json:"data"`
+}
+
+type BackupConfirm struct {
+	// int64 so dumps >2 GiB report correctly on 32-bit agent builds
+	// (Go `int` is 32-bit there).
+	SizeBytes int64  `json:"sizeBytes"`
+	Sha256    string `json:"sha256,omitempty"`
+}
+
+// GetBackupCredentials fetches decrypted DB creds + container name for a
+// db_backup / db_restore op.
+func (c *Client) GetBackupCredentials(databaseID string) (*BackupCredentials, error) {
+	body, err := c.doJSON("GET", "/api/agent/backup-credentials/"+databaseID, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp backupCredentialsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode backup credentials: %w", err)
+	}
+	return &resp.Data, nil
+}
+
+// RequestBackupUploadURL asks the server for a presigned PUT URL for a
+// backup row's (server-owned) key. Marks the backup row running.
+func (c *Client) RequestBackupUploadURL(backupID string) (*BackupUploadURL, error) {
+	body, err := c.doRequest("POST", "/api/agent/backups/"+backupID+"/upload-url", nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "BACKUPS_DISABLED") {
+			return nil, ErrBackupsDisabled
+		}
+		return nil, err
+	}
+	var resp backupUploadURLResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode backup upload URL: %w", err)
+	}
+	return &resp.Data, nil
+}
+
+// ConfirmBackup records a successful upload (size + sha) in the server
+// manifest. Idempotent server-side.
+func (c *Client) ConfirmBackup(backupID string, confirm *BackupConfirm) error {
+	data, err := json.Marshal(confirm)
+	if err != nil {
+		return fmt.Errorf("marshal backup confirm: %w", err)
+	}
+	_, err = c.doRequest("POST", "/api/agent/backups/"+backupID+"/confirm", bytes.NewReader(data))
+	if err != nil && strings.Contains(err.Error(), "BACKUPS_DISABLED") {
+		return ErrBackupsDisabled
+	}
+	return err
+}
+
+// RequestBackupDownloadURL asks the server for a presigned GET URL to
+// stream a stored backup back into the container during a restore.
+func (c *Client) RequestBackupDownloadURL(backupID string) (*BackupDownloadURL, error) {
+	body, err := c.doRequest("POST", "/api/agent/backups/"+backupID+"/download-url", nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "BACKUPS_DISABLED") {
+			return nil, ErrBackupsDisabled
+		}
+		return nil, err
+	}
+	var resp backupDownloadURLResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode backup download URL: %w", err)
+	}
+	return &resp.Data, nil
+}
+
 func (c *Client) GetCredentials(serviceID string) (*Credentials, error) {
 	body, err := c.doJSON("GET", "/api/agent/credentials/"+serviceID, nil)
 	if err != nil {
