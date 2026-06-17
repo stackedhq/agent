@@ -168,6 +168,17 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	streamer.SetProgress(95)
 	probeRes := e.HealthProbe(streamer, serviceID, probePort)
 
+	// Reconcile away any leftover blue/green state from a previous
+	// rolling run on this service. Switching a service from `rolling`
+	// back to `recreate` (or attaching a volume, which routes the next
+	// rolling deploy through fast-restart) leaves the old <serviceID>-blue
+	// container running, the slot state set, and the Caddyfile still
+	// routing HTTP to that stale slot container. The new <serviceID>
+	// container we just brought up would look healthy while no traffic
+	// ever reaches it. Repoint Caddy at <serviceID> and tear down the
+	// stale slots. No-op for services that were never rolling.
+	reconcileUnslotted(streamer, serviceID, getIntPayloadOr(op.Payload, "stopGraceSec", 10))
+
 	// Phase: Complete (100%)
 	streamer.SetProgress(100)
 	streamer.AddLine("Deploy complete")

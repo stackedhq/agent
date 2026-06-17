@@ -98,3 +98,28 @@ func containsFlag(args []string, flag string) bool {
 	}
 	return false
 }
+
+func TestNeedsUnslottedReconcile(t *testing.T) {
+	cases := []struct {
+		name        string
+		hadSlot     bool
+		blueExists  bool
+		greenExists bool
+		want        bool
+	}{
+		{"clean recreate, nothing to do", false, false, false, false},
+		{"stale slot state only", true, false, false, true},
+		{"orphan blue container only", false, true, false, true},
+		{"orphan green container only", false, false, true, true},
+		{"slot state plus blue container", true, true, false, true},
+		{"both orphan containers", false, true, true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := needsUnslottedReconcile(c.hadSlot, c.blueExists, c.greenExists); got != c.want {
+				t.Fatalf("needsUnslottedReconcile(%v,%v,%v) = %v, want %v",
+					c.hadSlot, c.blueExists, c.greenExists, got, c.want)
+			}
+		})
+	}
+}

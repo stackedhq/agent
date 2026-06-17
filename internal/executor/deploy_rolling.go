@@ -332,10 +332,13 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 		}
 	}
 
-	// Fast-restart never uses slot state — clear any stale entry from
-	// a previous blue/green run on this service so the runtimelogs
-	// and heartbeat filters fall back to the no-slot-label container.
-	_ = slots.Clear(serviceID)
+	// Fast-restart never uses slot state. Reconcile away any leftover
+	// blue/green state from a previous volumeless rolling run: clear the
+	// slot entry, point Caddy back at the bare <serviceID> container, and
+	// tear down the stale <serviceID>-blue/-green containers. Without this
+	// the Caddyfile keeps routing HTTP to the old slot container even
+	// though this deploy already swapped <serviceID> underneath it.
+	reconcileUnslotted(streamer, serviceID, getIntPayloadOr(op.Payload, "stopGraceSec", 10))
 
 	probeRes := e.HealthProbe(streamer, serviceID, probePort)
 	streamer.SetProgress(100)
@@ -445,6 +448,76 @@ func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath str
 	// Image must come last — everything after it is the container's argv.
 	args = append(args, imageName)
 	return args
+}
+
+// reconcileUnslotted tears down any leftover blue/green state for a
+// service that is now deploying in a non-blue/green mode (recreate or
+// fast-restart) and repoints Caddy at the bare <serviceID> container.
+//
+// It runs only when there is something to reconcile: either slot state
+// records a slot for this service, or a <serviceID>-blue/-green container
+// is still present. Checking container presence (not just slot state)
+// self-heals installs left half-broken by an older fast-restart that
+// cleared slot state but never removed the slot container or fixed the
+// Caddyfile.
+//
+// Ordering matters to avoid a 502 gap: we clear slot state and regenerate
+// the Caddyfile FIRST (so the upstream resolves to the now-healthy
+// <serviceID> container), and only THEN drain and remove the old slot
+// containers. Caddy reload failures are logged, not fatal — the new
+// container is already up; a stale Caddyfile self-heals on the next
+// proxy_config op, and we still proceed to remove the dead slots.
+func reconcileUnslotted(streamer *logs.Streamer, serviceID string, graceSec int) {
+	blueContainer := serviceID + "-" + string(slots.Blue)
+	greenContainer := serviceID + "-" + string(slots.Green)
+
+	hadSlot := slots.Active(serviceID) != ""
+	blueExists := containerExists(blueContainer)
+	greenExists := containerExists(greenContainer)
+
+	if !needsUnslottedReconcile(hadSlot, blueExists, greenExists) {
+		return
+	}
+
+	streamer.AddLine("Reconciling leftover blue/green state (slot containers + Caddy upstream)...")
+	streamer.Flush()
+
+	// 1. Repoint traffic at the bare <serviceID> container before we
+	// remove anything: clear slot state, then regenerate the Caddyfile
+	// (which reads slot state and now resolves to <serviceID>).
+	if hadSlot {
+		if err := slots.Clear(serviceID); err != nil {
+			streamer.AddLine("WARN: failed to clear slot state: " + err.Error())
+			streamer.Flush()
+		}
+	}
+	if err := RegenerateCaddyfile(); err != nil {
+		streamer.AddLine("WARN: failed to regenerate Caddyfile after slot cleanup: " + err.Error())
+		streamer.Flush()
+	}
+
+	// 2. Now that Caddy no longer points at the slot containers, drain
+	// and remove them. `docker stop`/`rm` return nonzero when the target
+	// is absent — expected for whichever slot isn't present; ignored.
+	for _, name := range []string{blueContainer, greenContainer} {
+		_, _ = runCommandSilent("", "docker", "stop", "--time="+strconv.Itoa(graceSec), name)
+		_, _ = runCommandSilent("", "docker", "rm", "-f", name)
+	}
+}
+
+// needsUnslottedReconcile is the pure decision for whether
+// reconcileUnslotted has anything to do. Factored out so the trigger
+// rule can be unit-tested without invoking docker or touching slot state.
+func needsUnslottedReconcile(hadSlot, blueExists, greenExists bool) bool {
+	return hadSlot || blueExists || greenExists
+}
+
+// containerExists reports whether a container with the given name is
+// present (running or stopped). Uses `docker inspect`, which exits
+// nonzero when no such container exists.
+func containerExists(name string) bool {
+	_, err := runCommandSilent("", "docker", "inspect", name)
+	return err == nil
 }
 
 // containerNameForSlot returns the container name for a service's slot.
