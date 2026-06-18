@@ -42,6 +42,8 @@ func (e *Executor) Execute(op client.Operation) {
 		result, err = e.Deploy(op)
 	case "release_command":
 		err = e.ReleaseCommand(op)
+	case "cron_run":
+		result, err = e.RunJob(op)
 	case "stop":
 		err = e.Stop(op)
 	case "restart":
