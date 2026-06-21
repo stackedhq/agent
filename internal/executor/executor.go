@@ -70,6 +70,8 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.DisableExtension(op)
 	case "db_set_access":
 		err = e.SetAccess(op)
+	case "db_rotate_password":
+		err = e.RotatePassword(op)
 	case "db_migrate":
 		err = e.DBMigrate(op)
 	case "volume_migrate":
