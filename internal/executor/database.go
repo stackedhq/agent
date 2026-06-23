@@ -138,12 +138,19 @@ func (e *Executor) StartDB(op client.Operation) error {
 
 	log.Printf("Starting database %s", databaseID)
 
+	// Ensure the stacked network exists — it vanishes on Docker/machine restart.
+	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+
 	// `compose start` errors out if the container doesn't exist yet (e.g.
 	// after a manual `docker rm`); fall back to `up -d` which creates it.
 	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "start"); err != nil {
 		log.Printf("compose start failed for %s, falling back to up -d: %v", databaseID, err)
 		streamer.AddLine("compose start failed; recreating container with up -d")
 		streamer.Flush()
+		// Tear down the stale container (releases the port binding) but keep
+		// volumes so data survives. Without this, `up -d` fails with
+		// "port is already allocated" when a ghost container holds the port.
+		_ = e.runCommandWithStreamer(streamer, dir, "docker", "compose", "down")
 		if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d"); err != nil {
 			streamer.AddLine("ERROR: " + err.Error())
 			streamer.Flush()
