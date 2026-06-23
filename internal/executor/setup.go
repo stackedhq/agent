@@ -34,6 +34,12 @@ func (e *Executor) Setup(op client.Operation) error {
 }
 
 func proxyCompose() string {
+	return proxyComposeWithGate(false)
+}
+
+// proxyComposeWithGate returns the proxy docker-compose.yml content.
+// When withGate is true, a gate sidecar service is included.
+func proxyComposeWithGate(withGate bool) string {
 	// `host.docker.internal:host-gateway` makes the host reachable from
 	// inside the Caddy container under a stable hostname. Required for
 	// port-bound domains where the user types host=127.0.0.1 expecting
@@ -46,7 +52,7 @@ func proxyCompose() string {
 	// gateway IP at container start time. Supported on Docker 20.10+
 	// (Q4 2020) on Linux; older daemons will silently fail to add the
 	// host entry but Caddy still starts. We accept that fallback.
-	return `services:
+	base := `services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
@@ -61,7 +67,22 @@ func proxyCompose() string {
       - caddy_config:/config
     networks:
       - stacked
+`
 
+	gateSvc := ""
+	if withGate {
+		gateSvc = `  gate:
+    image: ghcr.io/stackedhq/agent:latest
+    command: ["/stacked-agent", "gate"]
+    restart: unless-stopped
+    volumes:
+      - /opt/stacked/gate:/opt/stacked/gate
+    networks:
+      - stacked
+`
+	}
+
+	return base + gateSvc + `
 volumes:
   caddy_data:
   caddy_config:

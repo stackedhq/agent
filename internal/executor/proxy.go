@@ -133,6 +133,13 @@ type cachedDomain struct {
 	// issues for hostnames the ask endpoint authorizes. Absent on
 	// older payloads → false → eager issuance (unchanged behavior).
 	OnDemandTLS bool `json:"onDemandTls,omitempty"`
+
+	// Auth gate fields. When AuthGateMode is non-empty, Caddy emits
+	// forward_auth to the gate sidecar for this domain.
+	AuthGateMode         string `json:"authGateMode,omitempty"`
+	AuthGateUsername     string `json:"authGateUsername,omitempty"`
+	AuthGatePasswordHash string `json:"authGatePasswordHash,omitempty"`
+	ServiceName          string `json:"serviceName,omitempty"`
 }
 
 // effectivePath returns the path this entry routes, defaulting to
@@ -337,6 +344,11 @@ func (e *Executor) ProxyConfig(op client.Operation) error {
 		log.Printf("proxy_config: persist domains.json failed (non-fatal): %v", err)
 	}
 
+	// Write gate config and manage the gate sidecar lifecycle.
+	if err := reconcileGate(parsed); err != nil {
+		log.Printf("proxy_config: gate reconcile failed (non-fatal): %v", err)
+	}
+
 	if err := writeAndReloadCaddyfile(parsed); err != nil {
 		return err
 	}
@@ -494,6 +506,12 @@ func parseDomains(raw []interface{}) []cachedDomain {
 		// On-demand TLS flag. Absent → false (eager issuance).
 		onDemand, _ := dm["onDemandTls"].(bool)
 
+		// Auth gate fields.
+		authGateMode, _ := dm["authGateMode"].(string)
+		authGateUsername, _ := dm["authGateUsername"].(string)
+		authGatePasswordHash, _ := dm["authGatePasswordHash"].(string)
+		serviceName, _ := dm["serviceName"].(string)
+
 		switch {
 		case serviceID != "":
 			// Service-backed. Default port matches the historical
@@ -502,12 +520,16 @@ func parseDomains(raw []interface{}) []cachedDomain {
 				port = 3000
 			}
 			out = append(out, cachedDomain{
-				Domain:      domain,
-				ServiceID:   serviceID,
-				Port:        port,
-				Path:        path,
-				StripPrefix: stripPtr,
-				OnDemandTLS: onDemand,
+				Domain:               domain,
+				ServiceID:             serviceID,
+				Port:                  port,
+				Path:                  path,
+				StripPrefix:           stripPtr,
+				OnDemandTLS:           onDemand,
+				AuthGateMode:         authGateMode,
+				AuthGateUsername:     authGateUsername,
+				AuthGatePasswordHash: authGatePasswordHash,
+				ServiceName:          serviceName,
 			})
 		case host != "" && port > 0:
 			// Port-bound. Scheme defaults to http; only http and
@@ -648,35 +670,47 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 			b.WriteString("    }\n")
 		}
 
-		// Fast path: single row at root — emit a bare
-		// `reverse_proxy` (no `handle` wrapper). Keeps the
-		// Caddyfile identical to the pre-multi-path output for
-		// every existing single-route domain, so diffing
-		// generated configs across this upgrade is empty.
-		if len(sortedRows) == 1 && sortedRows[0].effectivePath() == "/" {
-			writeUpstream(&b, sortedRows[0], state, "    ")
-		} else {
-			for _, d := range sortedRows {
-				path := d.effectivePath()
-				if path == "/" {
-					// Default fall-through for everything
-					// that didn't match a more specific path.
-					b.WriteString("    handle {\n")
-				} else if d.effectiveStripPrefix() {
-					// `handle_path` matches the prefix AND
-					// strips it before forwarding — the
-					// default for non-root routes because
-					// most backends expect to see paths
-					// relative to their own root.
-					fmt.Fprintf(&b, "    handle_path %s* {\n", path)
-				} else {
-					// Same matcher, prefix preserved —
-					// for backends that build URLs from
-					// `req.path` and need the full string.
-					fmt.Fprintf(&b, "    handle %s* {\n", path)
+		// Check if any row on this host has an auth gate enabled.
+		hostHasGate := false
+		for _, d := range sortedRows {
+			if d.AuthGateMode != "" {
+				hostHasGate = true
+				break
+			}
+		}
+
+		if hostHasGate {
+			// Gate-protected host: proxy /__stacked/* to the gate
+			// sidecar (login page, form POST, logout), then forward_auth
+			// everything else through the gate's /check endpoint.
+			b.WriteString("    handle /__stacked/* {\n")
+			b.WriteString("        reverse_proxy gate:9876\n")
+			b.WriteString("    }\n")
+			b.WriteString("    handle {\n")
+			b.WriteString("        forward_auth gate:9876 {\n")
+			b.WriteString("            uri /check\n")
+			b.WriteString("            header_up X-Original-URI {uri}\n")
+			b.WriteString("            header_up X-Forwarded-Host {host}\n")
+			b.WriteString("        }\n")
+			// Emit upstream(s) inside the gated handle block
+			if len(sortedRows) == 1 && sortedRows[0].effectivePath() == "/" {
+				writeUpstream(&b, sortedRows[0], state, "        ")
+			} else {
+				for _, d := range sortedRows {
+					writePathHandle(&b, d, state, "        ")
 				}
-				writeUpstream(&b, d, state, "        ")
-				b.WriteString("    }\n")
+			}
+			b.WriteString("    }\n")
+		} else {
+			// No gate — original rendering path.
+			// Fast path: single row at root — emit a bare
+			// `reverse_proxy` (no `handle` wrapper).
+			if len(sortedRows) == 1 && sortedRows[0].effectivePath() == "/" {
+				writeUpstream(&b, sortedRows[0], state, "    ")
+			} else {
+				for _, d := range sortedRows {
+					writePathHandle(&b, d, state, "    ")
+				}
 			}
 		}
 
@@ -710,6 +744,21 @@ func writeUpstream(b *strings.Builder, d cachedDomain, state map[string]slots.Sl
 	fmt.Fprintf(b, "%sreverse_proxy %s:%d\n", indent, host, d.Port)
 }
 
+// writePathHandle emits a single handle/handle_path block for a multi-path row.
+// Factored out so both gated and ungated code paths share the logic.
+func writePathHandle(b *strings.Builder, d cachedDomain, state map[string]slots.Slot, indent string) {
+	path := d.effectivePath()
+	if path == "/" {
+		fmt.Fprintf(b, "%shandle {\n", indent)
+	} else if d.effectiveStripPrefix() {
+		fmt.Fprintf(b, "%shandle_path %s* {\n", indent, path)
+	} else {
+		fmt.Fprintf(b, "%shandle %s* {\n", indent, path)
+	}
+	writeUpstream(b, d, state, indent+"    ")
+	fmt.Fprintf(b, "%s}\n", indent)
+}
+
 // renderUpstreamHostPort produces a Caddy-safe "host:port" token for a
 // port-bound upstream. Two non-obvious rewrites happen here:
 //
@@ -734,4 +783,80 @@ func renderUpstreamHostPort(host string, port int) string {
 		return fmt.Sprintf("[%s]:%d", host, port)
 	}
 	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// --- Auth gate sidecar lifecycle ---
+
+const (
+	gateDir        = "/opt/stacked/gate"
+	gateConfigPath = "/opt/stacked/gate/config.json"
+)
+
+// gateConfig mirrors cmd/gate's GateConfig for JSON serialization.
+type gateConfig struct {
+	Domains map[string]gateDomainEntry `json:"domains"`
+}
+
+type gateDomainEntry struct {
+	Mode         string `json:"mode"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"passwordHash"`
+	ServiceName  string `json:"serviceName"`
+}
+
+// reconcileGate writes the gate config.json and ensures the gate
+// container is running when at least one domain has an auth gate,
+// or stopped when none do.
+func reconcileGate(parsed []cachedDomain) error {
+	cfg := gateConfig{Domains: make(map[string]gateDomainEntry)}
+	for _, d := range parsed {
+		if d.AuthGateMode == "" {
+			continue
+		}
+		name := d.ServiceName
+		if name == "" {
+			name = d.Domain
+		}
+		cfg.Domains[d.Domain] = gateDomainEntry{
+			Mode:         d.AuthGateMode,
+			Username:     d.AuthGateUsername,
+			PasswordHash: d.AuthGatePasswordHash,
+			ServiceName:  name,
+		}
+	}
+
+	needsGate := len(cfg.Domains) > 0
+
+	if needsGate {
+		if err := ensureDir(gateDir); err != nil {
+			return fmt.Errorf("create gate dir: %w", err)
+		}
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := writeFile(gateConfigPath, string(data)); err != nil {
+			return fmt.Errorf("write gate config: %w", err)
+		}
+	}
+
+	// Reconcile the proxy compose to include/exclude the gate service.
+	composePath := filepath.Join(proxyDir, "docker-compose.yml")
+	want := proxyComposeWithGate(needsGate)
+	existing, _ := os.ReadFile(composePath)
+	if string(existing) != want {
+		if err := writeFile(composePath, want); err != nil {
+			return fmt.Errorf("write proxy compose: %w", err)
+		}
+		// Recreate containers to pick up the new compose file.
+		if out, err := runCommandSilent(proxyDir, "docker", "compose", "up", "-d"); err != nil {
+			return fmt.Errorf("compose up after gate change: %s: %w", out, err)
+		}
+	} else if needsGate {
+		// Config changed but compose didn't — restart the gate
+		// container so it re-reads config.json.
+		_, _ = runCommandSilent(proxyDir, "docker", "compose", "restart", "gate")
+	}
+
+	return nil
 }

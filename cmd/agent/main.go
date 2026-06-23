@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	gate "github.com/stackedapp/stacked/agent/cmd/gate"
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/config"
 	"github.com/stackedapp/stacked/agent/internal/databaselogs"
@@ -27,6 +28,10 @@ const (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Println(heartbeat.Version)
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "gate" {
+		gate.Run()
 		return
 	}
 
