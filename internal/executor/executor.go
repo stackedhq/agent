@@ -46,6 +46,8 @@ func (e *Executor) Execute(op client.Operation) {
 		result, err = e.RunJob(op)
 	case "stop":
 		err = e.Stop(op)
+	case "service_destroy":
+		err = e.ServiceDestroy(op)
 	case "restart":
 		err = e.Restart(op)
 	case "setup":
