@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/slots"
@@ -338,6 +340,9 @@ func (e *Executor) ProxyConfig(op client.Operation) error {
 	}
 
 	parsed := parseDomains(domains)
+	if err := validatePortBoundHosts(parsed); err != nil {
+		return err
+	}
 	if err := persistDomains(parsed); err != nil {
 		// Persistence failure shouldn't block the reload — the in-memory
 		// regen below still works. Log and continue.
@@ -402,7 +407,10 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 	prev, _ := os.ReadFile(caddyfilePath) // best-effort backup for rollback
 
 	state := slots.All()
-	content := generateCaddyfile(parsed, state)
+	content, err := generateCaddyfileChecked(parsed, state)
+	if err != nil {
+		return err
+	}
 
 	// Validate the candidate config inside the Caddy container before
 	// touching the live file. The container's `/etc/caddy/Caddyfile` is
@@ -521,11 +529,11 @@ func parseDomains(raw []interface{}) []cachedDomain {
 			}
 			out = append(out, cachedDomain{
 				Domain:               domain,
-				ServiceID:             serviceID,
-				Port:                  port,
-				Path:                  path,
-				StripPrefix:           stripPtr,
-				OnDemandTLS:           onDemand,
+				ServiceID:            serviceID,
+				Port:                 port,
+				Path:                 path,
+				StripPrefix:          stripPtr,
+				OnDemandTLS:          onDemand,
 				AuthGateMode:         authGateMode,
 				AuthGateUsername:     authGateUsername,
 				AuthGatePasswordHash: authGatePasswordHash,
@@ -553,6 +561,18 @@ func parseDomains(raw []interface{}) []cachedDomain {
 		}
 	}
 	return out
+}
+
+func validatePortBoundHosts(parsed []cachedDomain) error {
+	for _, d := range parsed {
+		if !d.isPortBound() {
+			continue
+		}
+		if err := validateUpstreamHost(d.Host); err != nil {
+			return fmt.Errorf("invalid port-bound upstream host for %s: %w", d.Domain, err)
+		}
+	}
+	return nil
 }
 
 func persistDomains(parsed []cachedDomain) error {
@@ -596,6 +616,15 @@ func loadDomains() ([]cachedDomain, error) {
 //     name is the bare serviceID. Used during the very first rolling
 //     deploy of a service migrating off recreate.
 func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) string {
+	content, err := generateCaddyfileChecked(parsed, state)
+	if err != nil {
+		log.Printf("proxy: rejected unsafe Caddyfile payload: %v", err)
+		return caddyfileHeader + "# invalid proxy config rejected\n"
+	}
+	return content
+}
+
+func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot) (string, error) {
 	var b strings.Builder
 	b.WriteString("# Managed by Stacked \u2014 do not edit manually\n\n")
 
@@ -694,10 +723,14 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 			b.WriteString("        }\n")
 			// Emit upstream(s) inside the gated handle block
 			if len(sortedRows) == 1 && sortedRows[0].effectivePath() == "/" {
-				writeUpstream(&b, sortedRows[0], state, "        ")
+				if err := writeUpstream(&b, sortedRows[0], state, "        "); err != nil {
+					return "", err
+				}
 			} else {
 				for _, d := range sortedRows {
-					writePathHandle(&b, d, state, "        ")
+					if err := writePathHandle(&b, d, state, "        "); err != nil {
+						return "", err
+					}
 				}
 			}
 			b.WriteString("    }\n")
@@ -706,10 +739,14 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 			// Fast path: single row at root — emit a bare
 			// `reverse_proxy` (no `handle` wrapper).
 			if len(sortedRows) == 1 && sortedRows[0].effectivePath() == "/" {
-				writeUpstream(&b, sortedRows[0], state, "    ")
+				if err := writeUpstream(&b, sortedRows[0], state, "    "); err != nil {
+					return "", err
+				}
 			} else {
 				for _, d := range sortedRows {
-					writePathHandle(&b, d, state, "    ")
+					if err := writePathHandle(&b, d, state, "    "); err != nil {
+						return "", err
+					}
 				}
 			}
 		}
@@ -719,7 +756,7 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 		b.WriteString("    header Server Stacked\n")
 		fmt.Fprintf(&b, "}\n\n")
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // writeUpstream emits the single `reverse_proxy` line for a row,
@@ -727,26 +764,30 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 // and the multi-row handle path share one code path — keeps the
 // upstream-resolution rules (slots, IPv6 brackets, loopback rewrite)
 // in exactly one place.
-func writeUpstream(b *strings.Builder, d cachedDomain, state map[string]slots.Slot, indent string) {
+func writeUpstream(b *strings.Builder, d cachedDomain, state map[string]slots.Slot, indent string) error {
 	if d.isPortBound() {
-		hp := renderUpstreamHostPort(d.Host, d.Port)
+		hp, err := renderUpstreamHostPort(d.Host, d.Port)
+		if err != nil {
+			return fmt.Errorf("invalid port-bound upstream host for %s: %w", d.Domain, err)
+		}
 		if d.Scheme == "https" {
 			fmt.Fprintf(b, "%sreverse_proxy https://%s\n", indent, hp)
 		} else {
 			fmt.Fprintf(b, "%sreverse_proxy %s\n", indent, hp)
 		}
-		return
+		return nil
 	}
 	host := d.ServiceID
 	if slot, ok := state[d.ServiceID]; ok && slot != slots.Legacy {
 		host = d.ServiceID + "-" + string(slot)
 	}
 	fmt.Fprintf(b, "%sreverse_proxy %s:%d\n", indent, host, d.Port)
+	return nil
 }
 
 // writePathHandle emits a single handle/handle_path block for a multi-path row.
 // Factored out so both gated and ungated code paths share the logic.
-func writePathHandle(b *strings.Builder, d cachedDomain, state map[string]slots.Slot, indent string) {
+func writePathHandle(b *strings.Builder, d cachedDomain, state map[string]slots.Slot, indent string) error {
 	path := d.effectivePath()
 	if path == "/" {
 		fmt.Fprintf(b, "%shandle {\n", indent)
@@ -755,8 +796,11 @@ func writePathHandle(b *strings.Builder, d cachedDomain, state map[string]slots.
 	} else {
 		fmt.Fprintf(b, "%shandle %s* {\n", indent, path)
 	}
-	writeUpstream(b, d, state, indent+"    ")
+	if err := writeUpstream(b, d, state, indent+"    "); err != nil {
+		return err
+	}
 	fmt.Fprintf(b, "%s}\n", indent)
+	return nil
 }
 
 // renderUpstreamHostPort produces a Caddy-safe "host:port" token for a
@@ -774,15 +818,80 @@ func writePathHandle(b *strings.Builder, d cachedDomain, state map[string]slots.
 //     literals. A bare `2001:db8::1:443` is ambiguous and rejected
 //     by the parser. Detected by presence of ":" in the host string
 //     and absence of a leading "[".
-func renderUpstreamHostPort(host string, port int) string {
+func renderUpstreamHostPort(host string, port int) (string, error) {
+	if err := validateUpstreamHost(host); err != nil {
+		return "", err
+	}
 	switch strings.ToLower(host) {
 	case "127.0.0.1", "localhost", "::1":
 		host = "host.docker.internal"
 	}
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-		return fmt.Sprintf("[%s]:%d", host, port)
+		return fmt.Sprintf("[%s]:%d", host, port), nil
 	}
-	return fmt.Sprintf("%s:%d", host, port)
+	return fmt.Sprintf("%s:%d", host, port), nil
+}
+
+func validateUpstreamHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("host is empty")
+	}
+	for _, r := range host {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("host contains whitespace or control characters")
+		}
+	}
+	if strings.ContainsAny(host, "{}\"'#/\\") {
+		return fmt.Errorf("host contains characters that are unsafe in Caddyfile upstream tokens")
+	}
+
+	addrHost := host
+	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
+		if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
+			return fmt.Errorf("invalid bracketed IPv6 host")
+		}
+		addrHost = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+		addr, err := netip.ParseAddr(addrHost)
+		if err != nil || !addr.Is6() {
+			return fmt.Errorf("invalid bracketed IPv6 host")
+		}
+		return nil
+	}
+
+	if _, err := netip.ParseAddr(addrHost); err == nil {
+		return nil
+	}
+	if strings.Contains(host, ":") {
+		return fmt.Errorf("invalid IP literal")
+	}
+	if !isRFC1123Hostname(host) {
+		return fmt.Errorf("host must be an IP literal or RFC-1123 hostname")
+	}
+	return nil
+}
+
+func isRFC1123Hostname(host string) bool {
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		for i, r := range label {
+			isLetter := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'
+			isDigit := r >= '0' && r <= '9'
+			isHyphen := r == '-'
+			if !isLetter && !isDigit && !isHyphen {
+				return false
+			}
+			if isHyphen && (i == 0 || i == len(label)-1) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // --- Auth gate sidecar lifecycle ---

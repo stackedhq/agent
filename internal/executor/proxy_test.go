@@ -86,7 +86,12 @@ func TestRenderUpstreamHostPortRewritesLoopback(t *testing.T) {
 		"::1":       "host.docker.internal:80",
 	}
 	for input, want := range cases {
-		if got := renderUpstreamHostPort(input, 80); got != want {
+		got, err := renderUpstreamHostPort(input, 80)
+		if err != nil {
+			t.Errorf("%s returned error: %v", input, err)
+			continue
+		}
+		if got != want {
 			t.Errorf("%s -> %s, want %s", input, got, want)
 		}
 	}
@@ -100,7 +105,12 @@ func TestRenderUpstreamHostPortLeavesOtherHostsAlone(t *testing.T) {
 		"upstream.lan":         "upstream.lan:443",
 	}
 	for input, want := range cases {
-		if got := renderUpstreamHostPort(input, 443); got != want {
+		got, err := renderUpstreamHostPort(input, 443)
+		if err != nil {
+			t.Errorf("%s returned error: %v", input, err)
+			continue
+		}
+		if got != want {
 			t.Errorf("%s -> %s, want %s", input, got, want)
 		}
 	}
@@ -113,9 +123,63 @@ func TestRenderUpstreamHostPortBracketsIPv6(t *testing.T) {
 		"[2001:db8::1]": "[2001:db8::1]:8080", // already-bracketed passes through
 	}
 	for input, want := range cases {
-		if got := renderUpstreamHostPort(input, 8080); got != want {
+		got, err := renderUpstreamHostPort(input, 8080)
+		if err != nil {
+			t.Errorf("%s returned error: %v", input, err)
+			continue
+		}
+		if got != want {
 			t.Errorf("%s -> %s, want %s", input, got, want)
 		}
+	}
+}
+
+func TestValidateUpstreamHostRejectsCaddyfileTokenInjection(t *testing.T) {
+	valid := []string{
+		"10.0.0.5",
+		"2001:db8::1",
+		"[2001:db8::1]",
+		"localhost",
+		"plex",
+		"upstream-1.example.com",
+	}
+	for _, host := range valid {
+		t.Run("valid/"+host, func(t *testing.T) {
+			if err := validateUpstreamHost(host); err != nil {
+				t.Fatalf("expected %q to be valid: %v", host, err)
+			}
+		})
+	}
+
+	invalid := []string{
+		"bad host",
+		"example.com\nheader X Y",
+		"example.com {",
+		"example.com}",
+		"example.com#comment",
+		"'example.com'",
+		"http://example.com",
+		"foo\\bar",
+		"_bad.example.com",
+		"-bad.example.com",
+		"bad-.example.com",
+		"2001:db8::zz",
+	}
+	for _, host := range invalid {
+		t.Run("invalid/"+strings.NewReplacer("\n", "\\n", "/", "_").Replace(host), func(t *testing.T) {
+			if err := validateUpstreamHost(host); err == nil {
+				t.Fatalf("expected %q to be rejected", host)
+			}
+		})
+	}
+}
+
+func TestGenerateCaddyfileCheckedRejectsInvalidPortBoundHost(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "bad.example.com", Host: "127.0.0.1\nrespond /pwn", Port: 8080, Scheme: "http"},
+	}
+	if out, err := generateCaddyfileChecked(parsed, map[string]slots.Slot{}); err == nil {
+		t.Fatalf("expected invalid host to fail, got output:\n%s", out)
 	}
 }
 
