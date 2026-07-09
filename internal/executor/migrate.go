@@ -124,12 +124,6 @@ func (e *Executor) DBMigrate(op client.Operation) error {
 func (e *Executor) VolumeMigrate(op client.Operation) error {
 	srcPath := getStringPayload(op.Payload, "sourceVolumePath")
 	tgtPath := getStringPayload(op.Payload, "targetVolumePath")
-	if srcPath == "" {
-		return fmt.Errorf("volume_migrate requires sourceVolumePath")
-	}
-	if tgtPath == "" {
-		return fmt.Errorf("volume_migrate requires targetVolumePath")
-	}
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) error {
@@ -137,6 +131,13 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 		streamer.Flush()
 		return err
 	}
+
+	cleanSrcPath, cleanTgtPath, err := validateMigratePaths(srcPath, tgtPath)
+	if err != nil {
+		return fail(err)
+	}
+	srcPath = cleanSrcPath
+	tgtPath = cleanTgtPath
 
 	streamer.SetProgress(0)
 	streamer.AddLine(fmt.Sprintf("Volume copy: %s → %s", srcPath, tgtPath))
@@ -203,6 +204,103 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 	streamer.AddLine("Volume migration complete.")
 	streamer.Flush()
 	return nil
+}
+
+// validateMigratePaths returns cleaned source and target paths after
+// enforcing the agent-side security boundary for volume migrations. The
+// source is read-only, so it only needs to be a sane absolute path. The
+// target is destructive (RemoveAll + writable docker mount), so it must stay
+// inside Stacked's managed volume namespace both lexically and after resolving
+// symlinks in the existing path prefix.
+func validateMigratePaths(srcPath, tgtPath string) (string, string, error) {
+	return validateMigratePathsWithRoot(srcPath, tgtPath, managedVolumeRoot)
+}
+
+func validateMigratePathsWithRoot(srcPath, tgtPath, managedRoot string) (string, string, error) {
+	cleanSrc, err := cleanMigratePath("source", srcPath)
+	if err != nil {
+		return "", "", err
+	}
+	cleanTgt, err := cleanMigratePath("target", tgtPath)
+	if err != nil {
+		return "", "", err
+	}
+
+	if !isPathUnderManagedRoot(cleanTgt, managedRoot) {
+		return "", "", fmt.Errorf("volume_migrate target path %s is outside managed volume root %s", cleanTgt, filepath.Clean(managedRoot))
+	}
+
+	resolvedTarget, err := resolveExistingPathPrefix(cleanTgt)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve target path %s: %w", cleanTgt, err)
+	}
+	if !isPathUnderManagedRoot(resolvedTarget, managedRoot) {
+		return "", "", fmt.Errorf("volume_migrate target path %s resolves outside managed volume root %s", cleanTgt, filepath.Clean(managedRoot))
+	}
+
+	return cleanSrc, cleanTgt, nil
+}
+
+func cleanMigratePath(kind, path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("volume_migrate requires %sVolumePath", kind)
+	}
+	if strings.ContainsRune(path, 0) {
+		return "", fmt.Errorf("volume_migrate %s path contains NUL byte", kind)
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("volume_migrate %s path must be absolute", kind)
+	}
+	if hasDotDotSegment(path) {
+		return "", fmt.Errorf("volume_migrate %s path must not contain '..' segments", kind)
+	}
+	return filepath.Clean(path), nil
+}
+
+func hasDotDotSegment(path string) bool {
+	for _, part := range strings.Split(path, string(os.PathSeparator)) {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func isPathUnderManagedRoot(path, managedRoot string) bool {
+	cleanPath := filepath.Clean(path)
+	if managedRoot == managedVolumeRoot {
+		return isManagedHostPath(cleanPath)
+	}
+	cleanRoot := filepath.Clean(managedRoot)
+	return strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator))
+}
+
+func resolveExistingPathPrefix(path string) (string, error) {
+	current := filepath.Clean(path)
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			rel, err := filepath.Rel(current, path)
+			if err != nil {
+				return "", err
+			}
+			if rel == "." {
+				return filepath.Clean(resolved), nil
+			}
+			return filepath.Clean(filepath.Join(resolved, rel)), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing ancestor")
+		}
+		current = parent
+	}
 }
 
 // dumpToolsForEngine returns (source-side tool, target-side tool) for

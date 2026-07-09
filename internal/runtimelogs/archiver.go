@@ -64,6 +64,10 @@ const (
 	// the agreed 256 KiB compressed target without us having to track
 	// gzip output size mid-write.
 	archiveMaxRawBytes = 1 * 1024 * 1024
+	// Hard cap on the actual object PUT to R2. This is a defense-in-depth
+	// client-side limit for presigned URLs, which do not enforce size on
+	// the server side.
+	maxLogArchiveBytes = 2 * 1024 * 1024
 )
 
 func NewArchiver(c *client.Client, serviceID string) *Archiver {
@@ -174,6 +178,10 @@ func (a *Archiver) flush() {
 		return
 	}
 	gzipped := gz.Bytes()
+	if len(gzipped) > maxLogArchiveBytes {
+		log.Printf("archiver[%s]: compressed chunk too large (%d bytes > %d); dropping %d lines", a.serviceID, len(gzipped), maxLogArchiveBytes, lines)
+		return
+	}
 
 	issued, err := a.client.RequestLogArchiveURL(a.serviceID)
 	if err != nil {
