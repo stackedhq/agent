@@ -1,10 +1,14 @@
 package executor
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
@@ -28,6 +32,85 @@ import (
 // run's exit code. A non-zero exit returns an error (the exit status is in
 // the message); the server marks the run failed.
 func (e *Executor) RunJob(op client.Operation) (map[string]interface{}, error) {
+	mode := getStringPayload(op.Payload, "mode")
+	if mode == "http" {
+		return e.runHTTPJob(op)
+	}
+	return e.runCommandJob(op)
+}
+
+// runHTTPJob makes an HTTP request from the agent host. Runs on the same
+// network as the user's containers, so internal URLs (e.g.
+// http://my-service:3000/api/cron) work.
+func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, error) {
+	url := getStringPayload(op.Payload, "httpUrl")
+	if url == "" {
+		return nil, fmt.Errorf("cron_run http mode requires httpUrl")
+	}
+	method := getStringPayload(op.Payload, "httpMethod")
+	if method == "" {
+		method = "GET"
+	}
+
+	streamer := logs.NewStreamer(e.Client, op.ID)
+	fail := func(err error) (map[string]interface{}, error) {
+		streamer.AddLine("ERROR: " + err.Error())
+		streamer.Flush()
+		return nil, err
+	}
+
+	streamer.SetProgress(0)
+	streamer.AddLine(fmt.Sprintf("HTTP job: %s %s", method, url))
+	streamer.Flush()
+
+	var bodyReader io.Reader
+	if body := getStringPayload(op.Payload, "httpBody"); body != "" {
+		bodyReader = strings.NewReader(body)
+	}
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return fail(fmt.Errorf("build request: %w", err))
+	}
+
+	// Parse JSON headers from payload if present.
+	if hdrs := getStringPayload(op.Payload, "httpHeaders"); hdrs != "" {
+		parsed := parseJSONHeaders(hdrs)
+		for k, v := range parsed {
+			req.Header.Set(k, v)
+		}
+	}
+
+	httpClient := &http.Client{Timeout: 5 * time.Minute}
+	streamer.SetProgress(50)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fail(fmt.Errorf("request failed: %w", err))
+	}
+	defer resp.Body.Close()
+
+	// Read a snippet of the body for logs (cap at 4KB).
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	snippet := string(bodyBytes)
+
+	streamer.AddLine(fmt.Sprintf("Response: %d %s", resp.StatusCode, resp.Status))
+	if snippet != "" {
+		streamer.AddLine(snippet)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		streamer.SetProgress(100)
+		streamer.AddLine("HTTP job completed successfully.")
+		streamer.Flush()
+		return map[string]interface{}{"exitCode": 0}, nil
+	}
+
+	streamer.Flush()
+	return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(snippet))
+}
+
+func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, error) {
 	serviceID := getStringPayload(op.Payload, "serviceId")
 	if serviceID == "" {
 		return nil, fmt.Errorf("cron_run requires serviceId in payload")
@@ -128,4 +211,20 @@ func (e *Executor) RunJob(op client.Operation) (map[string]interface{}, error) {
 	streamer.AddLine("Job completed successfully.")
 	streamer.Flush()
 	return map[string]interface{}{"exitCode": 0}, nil
+}
+
+// parseJSONHeaders parses a JSON object string into a flat string map.
+// Returns empty map on any parse error — headers are best-effort.
+func parseJSONHeaders(raw string) map[string]string {
+	out := map[string]string{}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return out
+	}
+	for k, v := range parsed {
+		if s, ok := v.(string); ok {
+			out[k] = s
+		}
+	}
+	return out
 }
