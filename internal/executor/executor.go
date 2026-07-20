@@ -82,6 +82,8 @@ func (e *Executor) Execute(op client.Operation) {
 		err = e.Backup(op)
 	case "db_restore":
 		err = e.Restore(op)
+	case "db_query":
+		result, err = e.QueryDatabase(op)
 	case "tailscale_setup":
 		err = e.TailscaleSetup(op)
 	case "tailscale_disable":

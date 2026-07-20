@@ -381,6 +381,32 @@ func (c *Client) GetMigrationCredentials(targetID string) (*MigrationCredentials
 	return &resp.Data, nil
 }
 
+// --- Database query console ---
+
+type DatabaseQuery struct {
+	Query         string            `json:"query"`
+	ContainerName string            `json:"containerName"`
+	Creds         map[string]string `json:"creds"`
+}
+
+type databaseQueryResponse struct {
+	Data DatabaseQuery `json:"data"`
+}
+
+// GetDatabaseQuery retrieves the short-lived query text and credentials for
+// a claimed db_query operation. Neither belongs in the durable op payload.
+func (c *Client) GetDatabaseQuery(operationID string) (*DatabaseQuery, error) {
+	body, err := c.doJSON("GET", "/api/agent/database-query/"+operationID, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp databaseQueryResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode database query: %w", err)
+	}
+	return &resp.Data, nil
+}
+
 // --- Database backups ---
 
 // ErrBackupsDisabled signals that the server has the backup feature flag
