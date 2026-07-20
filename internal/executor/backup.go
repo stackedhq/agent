@@ -221,7 +221,7 @@ func dumpAndUpload(
 	if err != nil {
 		return fmt.Errorf("request upload URL: %w", err)
 	}
-	if err := uploadFileToURL(issued.URL, tmpPath, info.Size()); err != nil {
+	if err := uploadFileToURL(issued.URL, issued.Method, issued.Headers, tmpPath, info.Size()); err != nil {
 		return fmt.Errorf("upload to R2: %w", err)
 	}
 	if err := c.ConfirmBackup(backupID, &client.BackupConfirm{
@@ -291,19 +291,30 @@ func downloadAndRestore(
 // uploadFileToURL PUTs a file to a presigned URL with an explicit
 // Content-Length (R2 single PUT requires it). Uses a dedicated client with
 // no timeout — large dumps can take a while.
-func uploadFileToURL(url, path string, size int64) error {
+func uploadFileToURL(url, method string, headers map[string]string, path string, size int64) error {
+	if method == "" {
+		method = http.MethodPut
+	}
+	if method != http.MethodPut {
+		return fmt.Errorf("unsupported signed upload method %q", method)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	req, err := http.NewRequest("PUT", url, f)
+	req, err := http.NewRequest(method, url, f)
 	if err != nil {
 		return err
 	}
 	req.ContentLength = size
-	req.Header.Set("Content-Type", "application/gzip")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/gzip")
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

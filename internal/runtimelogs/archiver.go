@@ -194,13 +194,26 @@ func (a *Archiver) flush() {
 		return
 	}
 
-	req, err := http.NewRequestWithContext(a.ctx, "PUT", issued.URL, bytes.NewReader(gzipped))
+	method := issued.Method
+	if method == "" {
+		method = http.MethodPut
+	}
+	if method != http.MethodPut {
+		log.Printf("archiver[%s]: unsupported signed upload method %q", a.serviceID, method)
+		return
+	}
+	req, err := http.NewRequestWithContext(a.ctx, method, issued.URL, bytes.NewReader(gzipped))
 	if err != nil {
 		log.Printf("archiver[%s]: build PUT: %v", a.serviceID, err)
 		return
 	}
 	req.ContentLength = int64(len(gzipped))
-	req.Header.Set("Content-Type", "application/gzip")
+	for key, value := range issued.Headers {
+		req.Header.Set(key, value)
+	}
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/gzip")
+	}
 	resp, err := a.httpC.Do(req)
 	if err != nil {
 		log.Printf("archiver[%s]: PUT failed: %v", a.serviceID, err)

@@ -284,6 +284,11 @@ type LogArchiveURL struct {
 	URL       string `json:"url"`
 	Key       string `json:"key"`
 	ExpiresAt string `json:"expiresAt"`
+	// Method and Headers are optional for compatibility with older servers.
+	// R2 currently issues PUT URLs, but future signing implementations may
+	// require additional signed headers.
+	Method  string            `json:"method,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 type logArchiveURLResponse struct {
@@ -397,9 +402,11 @@ type backupCredentialsResponse struct {
 }
 
 type BackupUploadURL struct {
-	URL       string `json:"url"`
-	Key       string `json:"key"`
-	ExpiresAt string `json:"expiresAt"`
+	URL       string            `json:"url"`
+	Key       string            `json:"key"`
+	ExpiresAt string            `json:"expiresAt"`
+	Method    string            `json:"method,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
 }
 
 type backupUploadURLResponse struct {
@@ -557,7 +564,18 @@ func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, error) 
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		message := strings.TrimSpace(string(respBody))
+		const maxErrorBodyBytes = 2048
+		if len(message) > maxErrorBodyBytes {
+			message = message[:maxErrorBodyBytes] + "…"
+		}
+		if message == "" {
+			message = "empty response body"
+		}
+		if requestID := resp.Header.Get("X-Request-Id"); requestID != "" {
+			return nil, fmt.Errorf("HTTP %d (request %s): %s", resp.StatusCode, requestID, message)
+		}
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, message)
 	}
 
 	return respBody, nil
