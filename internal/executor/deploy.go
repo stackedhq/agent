@@ -273,8 +273,19 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 	return imageName, nil
 }
 
-// buildEnvFile creates a .env file content from a key-value map.
-// Keys are sorted for deterministic output.
+// buildEnvFile creates a .env file content from a key-value map, consumed
+// by docker compose's per-service `env_file:` directive. Keys are sorted
+// for deterministic output.
+//
+// Values are written verbatim — do NOT wrap them in quotes. Unlike a
+// `.env` file used for Compose variable *substitution* (a project-root
+// `.env` next to the compose file), values loaded via a service's
+// `env_file:` list are never quote-stripped by Docker Compose: quote
+// characters are passed straight through as literal content of the
+// container's environment variable. An earlier version of this function
+// quoted values containing spaces/special characters to make the file
+// look like valid shell-quoted `.env` syntax, which instead baked literal
+// `"…"` characters into values like `SMTP_FROM=Riffado <noreply@...>`.
 func buildEnvFile(vars map[string]string) string {
 	keys := make([]string, 0, len(vars))
 	for k := range vars {
@@ -284,14 +295,9 @@ func buildEnvFile(vars map[string]string) string {
 
 	var b strings.Builder
 	for _, k := range keys {
-		// Quote values that contain spaces, newlines, or special chars
-		v := vars[k]
-		if strings.ContainsAny(v, " \t\n\"'$`\\#") {
-			v = "\"" + strings.ReplaceAll(strings.ReplaceAll(v, "\\", "\\\\"), "\"", "\\\"") + "\""
-		}
 		b.WriteString(k)
 		b.WriteByte('=')
-		b.WriteString(v)
+		b.WriteString(vars[k])
 		b.WriteByte('\n')
 	}
 	return b.String()
