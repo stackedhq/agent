@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -137,15 +138,23 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 		}
 	}
 
-	// Generate docker-compose.yml using the image. Volumes are pulled
-	// from the op payload — absent / empty / malformed payloads yield
-	// an empty mounts list and the template renders identically to the
-	// pre-host-volumes version.
-	mounts := parseVolumes(op.Payload)
-	if err := ensureVolumeHostDirs(mounts); err != nil {
+	// Materialize managed file mounts only after the image is ready, but before
+	// Compose can start the container. Their plaintext never enters the payload
+	// or logs.
+	volumeMounts := parseVolumes(op.Payload)
+	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
 		return nil, fail(err)
 	}
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases)
+	fileMounts, err := e.prepareFileMounts(op, serviceID)
+	if err != nil {
+		return nil, fail(err)
+	}
+	mounts, err := mergeFileMounts(volumeMounts, fileMounts)
+	if err != nil {
+		return nil, fail(err)
+	}
+	startCommand := dockerCommandOverride(op.Payload)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
@@ -339,7 +348,7 @@ func (l resourceLimits) cpus() string {
 	return s
 }
 
-func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, aliases []string) string {
+func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, aliases []string, startCommand string) string {
 	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
 	// managers correctly partition `docker ps` output. The runtimelogs
 	// manager treats label-less containers as services for back-compat
@@ -362,6 +371,7 @@ func generateCompose(serviceID, imageName string, mounts []volumeMount, limits r
 	// for `ensureVolumeHostDirs` before invoking `docker compose up` so
 	// the bind sources exist with predictable mode/ownership.
 	volumesBlock := renderComposeVolumes(mounts)
+	commandBlock := renderComposeCommand(startCommand)
 	// Resource block: restart policy is always emitted; mem_limit / cpus
 	// only when the service has a configured cap (otherwise the container
 	// runs unlimited, matching the historical behaviour). `mem_limit` and
@@ -378,7 +388,7 @@ func generateCompose(serviceID, imageName string, mounts []volumeMount, limits r
   %s:
     container_name: %s
     image: %s
-%s    env_file:
+%s%s    env_file:
       - .env
 %s%s    labels:
       com.stacked.kind: service
@@ -387,7 +397,7 @@ networks:
   stacked:
     name: stacked
     external: true
-`, serviceID, serviceID, imageName, resourceBlock.String(), volumesBlock, renderServiceNetworks(aliases))
+`, serviceID, serviceID, imageName, resourceBlock.String(), commandBlock, volumesBlock, renderServiceNetworks(aliases))
 }
 
 // renderServiceNetworks emits the service-level `networks:` block. With no
@@ -396,6 +406,25 @@ networks:
 // (the human-readable internal hostnames). Docker still registers the compose
 // service key (`<serviceID>`) as an alias in both forms, so the UUID floor is
 // preserved regardless.
+// renderComposeCommand uses JSON-array syntax, which is also valid YAML. It
+// prevents YAML injection and matches the rolling `docker run` path: execute
+// the override through a shell while preserving the image ENTRYPOINT.
+func dockerCommandOverride(payload map[string]interface{}) string {
+	if getStringPayload(payload, "dockerImage") == "" {
+		return ""
+	}
+	return strings.TrimSpace(getStringPayload(payload, "startCommand"))
+}
+
+func renderComposeCommand(command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return ""
+	}
+	encoded, _ := json.Marshal([]string{"sh", "-lc", command})
+	return "    command: " + string(encoded) + "\n"
+}
+
 func renderServiceNetworks(aliases []string) string {
 	if len(aliases) == 0 {
 		return "    networks:\n      - stacked\n"

@@ -66,7 +66,7 @@ func TestGenerateCompose_AppliesLimits(t *testing.T) {
 		cpuMillicores: 1500,
 		memoryMB:      512,
 		restartPolicy: "always",
-	}, nil)
+	}, nil, "")
 	for _, want := range []string{
 		"restart: always",
 		"mem_limit: 512m",
@@ -81,7 +81,7 @@ func TestGenerateCompose_AppliesLimits(t *testing.T) {
 func TestGenerateCompose_NetworkAliases(t *testing.T) {
 	// No aliases → historical list form, no aliases key.
 	plain := generateCompose("svc-1", "img:latest", nil,
-		resourceLimits{restartPolicy: "unless-stopped"}, nil)
+		resourceLimits{restartPolicy: "unless-stopped"}, nil, "")
 	if !strings.Contains(plain, "    networks:\n      - stacked\n") {
 		t.Errorf("expected list-form networks block without aliases:\n%s", plain)
 	}
@@ -92,7 +92,7 @@ func TestGenerateCompose_NetworkAliases(t *testing.T) {
 	// With aliases → map form carrying the valid labels; invalid dropped.
 	withAliases := generateCompose("svc-1", "img:latest", nil,
 		resourceLimits{restartPolicy: "unless-stopped"},
-		[]string{"api", "old-name", "BAD ALIAS"})
+		[]string{"api", "old-name", "BAD ALIAS"}, "")
 	for _, want := range []string{
 		"stacked:",
 		"aliases:",
@@ -108,10 +108,35 @@ func TestGenerateCompose_NetworkAliases(t *testing.T) {
 	}
 }
 
+func TestGenerateCompose_EscapesDockerImageCommand(t *testing.T) {
+	command := "node server.js\nlabels: [injected]"
+	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"}, nil, command)
+	if !strings.Contains(out, "    command: [\"sh\",\"-lc\",\"node server.js\\nlabels: [injected]\"]\n") {
+		t.Fatalf("command must be a JSON-quoted YAML argv array:\n%s", out)
+	}
+}
+
+func TestDockerCommandOverrideTrimsAndRequiresDockerImage(t *testing.T) {
+	if got := dockerCommandOverride(map[string]interface{}{
+		"dockerImage":  "image:latest",
+		"startCommand": "  node server.js  ",
+	}); got != "node server.js" {
+		t.Fatalf("override = %q", got)
+	}
+	if got := dockerCommandOverride(map[string]interface{}{
+		"startCommand": "node server.js",
+	}); got != "" {
+		t.Fatalf("source build must not get a compose override: %q", got)
+	}
+	if block := renderComposeCommand("   "); block != "" {
+		t.Fatalf("whitespace-only command rendered: %q", block)
+	}
+}
+
 func TestGenerateCompose_OmitsUnsetLimits(t *testing.T) {
 	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{
 		restartPolicy: "unless-stopped",
-	}, nil)
+	}, nil, "")
 	if strings.Contains(out, "mem_limit") {
 		t.Errorf("expected no mem_limit when unset:\n%s", out)
 	}

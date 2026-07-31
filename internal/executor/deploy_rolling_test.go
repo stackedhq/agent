@@ -11,7 +11,7 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 		serviceID+"-blue", serviceID, "blue",
 		"registry/app:tag", "/opt/stacked/services/svc-123/.env",
 		resourceLimits{restartPolicy: "unless-stopped"},
-		nil,
+		nil, "",
 	)
 
 	// The slot container is named per-slot but must alias the bare
@@ -37,7 +37,7 @@ func TestRollingContainerArgsFriendlyAliases(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-blue", "svc-1", "blue", "img", "/env",
 		resourceLimits{restartPolicy: "unless-stopped"},
-		[]string{"api", "old-name", "BAD ALIAS", ""},
+		[]string{"api", "old-name", "BAD ALIAS", ""}, "",
 	)
 	// Permanent UUID alias plus the two valid friendly aliases.
 	for _, want := range []string{
@@ -64,7 +64,7 @@ func TestRollingContainerArgsAppliesLimits(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-green", "svc-1", "green", "img", "/env",
 		resourceLimits{cpuMillicores: 1500, memoryMB: 512, restartPolicy: "on-failure"},
-		nil,
+		nil, "",
 	)
 	if !containsFlag(args, "--memory=512m") {
 		t.Errorf("expected --memory=512m, got: %v", args)
@@ -81,7 +81,7 @@ func TestRollingContainerArgsOmitsUnsetLimits(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-blue", "svc-1", "blue", "img", "/env",
 		resourceLimits{restartPolicy: "unless-stopped"},
-		nil,
+		nil, "",
 	)
 	for _, a := range args {
 		if strings.HasPrefix(a, "--memory=") || strings.HasPrefix(a, "--cpus=") {
@@ -121,5 +121,40 @@ func TestNeedsUnslottedReconcile(t *testing.T) {
 					c.hadSlot, c.blueExists, c.greenExists, got, c.want)
 			}
 		})
+	}
+}
+
+func TestRequiresFastRestartForAnyAttachedStorage(t *testing.T) {
+	cases := []struct {
+		name       string
+		volumes    bool
+		fileMounts bool
+		want       bool
+	}{
+		{"no storage", false, false, false},
+		{"directory volume", true, false, true},
+		{"managed file", false, true, true},
+		{"both", true, true, true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := requiresFastRestart(test.volumes, test.fileMounts); got != test.want {
+				t.Fatalf("requiresFastRestart(%v, %v) = %v, want %v", test.volumes, test.fileMounts, got, test.want)
+			}
+		})
+	}
+}
+
+func TestRollingContainerArgsAppliesDockerImageCommand(t *testing.T) {
+	args := rollingContainerArgs("svc-blue", "svc", "blue", "image", "/env",
+		resourceLimits{restartPolicy: "unless-stopped"}, nil, "node server.js && echo ready")
+	want := []string{"image", "sh", "-lc", "node server.js && echo ready"}
+	if len(args) < len(want) {
+		t.Fatalf("missing command args: %v", args)
+	}
+	for i, value := range want {
+		if args[len(args)-len(want)+i] != value {
+			t.Fatalf("command suffix = %v, want %v", args[len(args)-len(want):], want)
+		}
 	}
 }

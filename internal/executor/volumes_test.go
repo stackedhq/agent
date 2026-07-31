@@ -97,7 +97,7 @@ func TestRenderComposeVolumes_RW(t *testing.T) {
 	out := renderComposeVolumes([]volumeMount{
 		{HostPath: "/host/a", ContainerPath: "/c/a"},
 	})
-	want := "    volumes:\n      - /host/a:/c/a\n"
+	want := "    volumes:\n      - \"/host/a:/c/a\"\n"
 	if out != want {
 		t.Fatalf("mismatch:\ngot:  %q\nwant: %q", out, want)
 	}
@@ -107,7 +107,7 @@ func TestRenderComposeVolumes_RO(t *testing.T) {
 	out := renderComposeVolumes([]volumeMount{
 		{HostPath: "/host/a", ContainerPath: "/c/a", ReadOnly: true},
 	})
-	if !strings.Contains(out, ":/c/a:ro\n") {
+	if !strings.Contains(out, ":/c/a:ro\"\n") {
 		t.Fatalf("expected :ro suffix in output, got %q", out)
 	}
 }
@@ -117,14 +117,14 @@ func TestRenderComposeVolumes_Multiple(t *testing.T) {
 		{HostPath: "/h1", ContainerPath: "/c1"},
 		{HostPath: "/h2", ContainerPath: "/c2", ReadOnly: true},
 	})
-	want := "    volumes:\n      - /h1:/c1\n      - /h2:/c2:ro\n"
+	want := "    volumes:\n      - \"/h1:/c1\"\n      - \"/h2:/c2:ro\"\n"
 	if out != want {
 		t.Fatalf("mismatch:\ngot:  %q\nwant: %q", out, want)
 	}
 }
 
 func TestGenerateCompose_NoVolumes_OmitsBlock(t *testing.T) {
-	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"}, nil)
+	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"}, nil, "")
 	if strings.Contains(out, "volumes:") {
 		t.Fatalf("expected no volumes: block when mounts is nil, got:\n%s", out)
 	}
@@ -140,8 +140,8 @@ func TestGenerateCompose_NoVolumes_OmitsBlock(t *testing.T) {
 func TestGenerateCompose_WithVolumes_IncludesBlock(t *testing.T) {
 	out := generateCompose("svc-1", "img:latest", []volumeMount{
 		{HostPath: "/host", ContainerPath: "/container"},
-	}, resourceLimits{restartPolicy: "unless-stopped"}, nil)
-	if !strings.Contains(out, "    volumes:\n      - /host:/container\n") {
+	}, resourceLimits{restartPolicy: "unless-stopped"}, nil, "")
+	if !strings.Contains(out, "    volumes:\n      - \"/host:/container\"\n") {
 		t.Fatalf("expected volumes block in compose, got:\n%s", out)
 	}
 }

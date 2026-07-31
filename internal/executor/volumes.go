@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
@@ -102,9 +103,9 @@ func parseVolumes(payload map[string]interface{}) []volumeMount {
 //
 // Output shape:
 //
-//	    volumes:
-//	      - /host/path:/container/path
-//	      - /host/path:/container/path:ro
+//	volumes:
+//	  - /host/path:/container/path
+//	  - /host/path:/container/path:ro
 //
 // Leading whitespace is 6 spaces because the service block in
 // generateCompose is indented under `services:` at depth 2 (4 spaces),
@@ -116,11 +117,14 @@ func renderComposeVolumes(mounts []volumeMount) string {
 	var b strings.Builder
 	b.WriteString("    volumes:\n")
 	for _, m := range mounts {
+		value := m.HostPath + ":" + m.ContainerPath
 		if m.ReadOnly {
-			fmt.Fprintf(&b, "      - %s:%s:ro\n", m.HostPath, m.ContainerPath)
-		} else {
-			fmt.Fprintf(&b, "      - %s:%s\n", m.HostPath, m.ContainerPath)
+			value += ":ro"
 		}
+		// A JSON string is a YAML scalar. Quote the complete short-form
+		// mount so paths supplied by the server cannot add YAML structure.
+		encoded, _ := json.Marshal(value)
+		fmt.Fprintf(&b, "      - %s\n", encoded)
 	}
 	return b.String()
 }

@@ -199,6 +199,19 @@ type CredentialsResponse struct {
 	Error *CredentialsErrorBody `json:"error,omitempty"`
 }
 
+// FileMount contains the decrypted contents for one managed file mount. It is
+// fetched separately from the operation payload so plaintext never persists in
+// the operation record.
+type FileMount struct {
+	ID            string `json:"id"`
+	ContainerPath string `json:"containerPath"`
+	Content       string `json:"content"`
+}
+
+type fileMountsResponse struct {
+	Data []FileMount `json:"data"`
+}
+
 // CredentialsError is returned by GetCredentials when the server
 // responded with a typed error envelope. Distinct from transport
 // errors so callers can format it differently in the deploy log
@@ -515,6 +528,20 @@ func (c *Client) RequestBackupDownloadURL(backupID string) (*BackupDownloadURL, 
 		return nil, fmt.Errorf("decode backup download URL: %w", err)
 	}
 	return &resp.Data, nil
+}
+
+// GetFileMounts retrieves the decrypted managed files for a claimed deploy
+// or release operation. The operation ID scopes this request server-side.
+func (c *Client) GetFileMounts(operationID string) ([]FileMount, error) {
+	body, err := c.doJSON("GET", "/api/agent/operations/"+operationID+"/file-mounts", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp fileMountsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode file mounts: %w", err)
+	}
+	return resp.Data, nil
 }
 
 func (c *Client) GetCredentials(serviceID string) (*Credentials, error) {

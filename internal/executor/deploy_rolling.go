@@ -44,17 +44,21 @@ func (e *Executor) deployRolling(op client.Operation, streamer *logs.Streamer) (
 	// (via generateCompose) so we don't re-walk the payload further
 	// down. This branch is purely about whether blue and green can
 	// coexist safely; the actual mounting is owned by generateCompose.
-	mounts := parseVolumes(op.Payload)
-	hasVolumes := len(mounts) > 0
-
-	if hasVolumes {
-		streamer.AddLine("Rolling mode: fast restart (volumes attached, can't run two slots concurrently).")
+	if requiresFastRestart(len(parseVolumes(op.Payload)) > 0, hasFileMounts(op.Payload)) {
+		streamer.AddLine("Rolling mode: fast restart (storage attached, can't run two slots concurrently).")
 		streamer.Flush()
 		return e.deployFastRestart(op, streamer, serviceID)
 	}
 	streamer.AddLine("Rolling mode: zero-downtime blue/green.")
 	streamer.Flush()
 	return e.deployBlueGreen(op, streamer, serviceID)
+}
+
+// requiresFastRestart selects exclusive storage semantics for rolling deploys.
+// Managed files are read-only, but they still require a current materialized
+// source and therefore follow the same conservative path as host volumes.
+func requiresFastRestart(hasVolumes, hasFileMounts bool) bool {
+	return hasVolumes || hasFileMounts
 }
 
 // deployBlueGreen brings up the inactive slot, health-gates it, flips
@@ -283,11 +287,20 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// `<serviceID>` so volumes mount exclusively (only one writer at
 	// a time). Reuses the existing compose template — the recreate
 	// path's container shape — so logs/metrics keying is unchanged.
-	mounts := parseVolumes(op.Payload)
-	if err := ensureVolumeHostDirs(mounts); err != nil {
+	volumeMounts := parseVolumes(op.Payload)
+	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
 		return nil, fail(err)
 	}
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases)
+	fileMounts, err := e.prepareFileMounts(op, serviceID)
+	if err != nil {
+		return nil, fail(err)
+	}
+	mounts, err := mergeFileMounts(volumeMounts, fileMounts)
+	if err != nil {
+		return nil, fail(err)
+	}
+	startCommand := dockerCommandOverride(op.Payload)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
 	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
@@ -402,7 +415,8 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 // steady state resolves to the single running slot. recreate /
 // fast-restart already get this for free via `container_name`.
 func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation, aliases []string) error {
-	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload), aliases)
+	startCommand := dockerCommandOverride(op.Payload)
+	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload), aliases, startCommand)
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -415,7 +429,8 @@ func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot
 // rollingContainerArgs builds the `docker run` argv for a rolling slot
 // container. Pure (no side effects) so the flag contract — notably the
 // stable `--network-alias` — can be unit-tested without invoking docker.
-func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits, aliases []string) []string {
+func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits, aliases []string, startCommand string) []string {
+	startCommand = strings.TrimSpace(startCommand)
 	args := []string{
 		"run", "-d",
 		"--name", containerName,
@@ -445,8 +460,12 @@ func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath str
 	if c := limits.cpus(); c != "" {
 		args = append(args, "--cpus="+c)
 	}
-	// Image must come last — everything after it is the container's argv.
 	args = append(args, imageName)
+	// Docker-image start commands are shell commands. Passing them after the
+	// image preserves its ENTRYPOINT while supplying its command arguments.
+	if startCommand != "" {
+		args = append(args, "sh", "-lc", startCommand)
+	}
 	return args
 }
 

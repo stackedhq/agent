@@ -22,12 +22,12 @@ import (
 // We deliberately use `docker run --rm` rather than `docker exec` against
 // a pre-started slot, for two reasons:
 //
-//   1. The new slot doesn't need to be running yet — saves time and
-//      avoids the "container started but migrations failed, now what?"
-//      cleanup path.
-//   2. The semantics are identical to Heroku's release-phase dyno and
-//      Fly's release_command (which spins up a temporary VM): one image
-//      version, one process, exit code is the gate.
+//  1. The new slot doesn't need to be running yet — saves time and
+//     avoids the "container started but migrations failed, now what?"
+//     cleanup path.
+//  2. The semantics are identical to Heroku's release-phase dyno and
+//     Fly's release_command (which spins up a temporary VM): one image
+//     version, one process, exit code is the gate.
 //
 // The handler reuses the deploy payload shape verbatim — the server
 // duplicates the deploy op's payload onto the release op so this code
@@ -121,6 +121,13 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		return fail(fmt.Errorf("write .env: %w", err))
 	}
 
+	// Release containers see the same managed files as the deploy target, so
+	// migrations that read configuration behave identically to the app.
+	fileMounts, err := e.prepareFileMounts(op, serviceID)
+	if err != nil {
+		return fail(err)
+	}
+
 	// Make sure the stacked network exists — the migration command may
 	// need to reach the user's database container, which sits on it.
 	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
@@ -137,9 +144,9 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		"--network=stacked",
 		"--env-file=" + envPath,
 		"--name", serviceID + "-release",
-		imageName,
-		"sh", "-lc", releaseCmd,
 	}
+	args = append(args, fileMountDockerArgs(fileMounts)...)
+	args = append(args, imageName, "sh", "-lc", releaseCmd)
 	if err := e.runCommandWithStreamer(streamer, dir, "docker", args...); err != nil {
 		return fail(fmt.Errorf("release command failed: %w", err))
 	}
@@ -149,5 +156,3 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 	streamer.Flush()
 	return nil
 }
-
-
