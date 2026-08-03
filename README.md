@@ -53,8 +53,8 @@ Get your token from the Stacked dashboard under **Machines → Add Machine**.
 | Type | What it does |
 |---|---|
 | `deploy` | Git clone/pull → `docker compose up -d --build` |
-| `stop` | `docker compose down` |
-| `restart` | `docker compose restart` |
+| `stop` | `docker compose stop` (pause; keeps containers/volumes) |
+| `restart` | `docker compose restart`, falls back to `up -d` if containers are missing |
 | `setup` | Verify Docker, create network, start Caddy |
 | `proxy_config` | Regenerate Caddyfile, reload Caddy |
 | `self_update` | Download new binary, replace, restart |

@@ -15,8 +15,8 @@ internal/
 │   ├── executor.go        # Operation dispatcher + runCommand helpers
 │   ├── deploy.go          # Deploy: git clone → nixpacks build → docker compose up
 │   ├── selfupdate.go      # Self-update: download binary → replace → os.Exit(0)
-│   ├── stop.go            # Stop: docker compose down
-│   ├── restart.go         # Restart: docker compose restart
+│   ├── stop.go            # Stop/pause: docker compose stop
+│   ├── restart.go         # Resume/restart: compose restart, fallback up -d
 │   ├── setup.go           # Setup: verify docker, create network, start caddy
 │   └── proxy.go           # Proxy config: regenerate Caddyfile, reload caddy
 ├── heartbeat/heartbeat.go # Version const, system metrics, 10s heartbeat loop
