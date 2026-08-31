@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/dockerlogs"
 )
 
 const (
@@ -78,18 +79,7 @@ func NewForwarder(c *client.Client, serviceID, containerID string) *Forwarder {
 func (f *Forwarder) Run() {
 	defer close(f.done)
 
-	since := f.readCursor()
-
-	args := []string{"logs", "-f", "--timestamps"}
-	if since != "" {
-		args = append(args, "--since", since)
-	} else {
-		// First run for this service: avoid replaying days of history.
-		// One minute is enough for "I just deployed and want to see boot".
-		args = append(args, "--since", "1m")
-	}
-	args = append(args, f.containerID)
-
+	args := dockerlogs.FollowArgs(f.containerID, f.readCursor(), time.Now())
 	cmd := exec.CommandContext(f.ctx, "docker", args...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -172,9 +162,23 @@ func (f *Forwarder) scan(r io.Reader, level string) {
 	// doesn't kill the scanner.
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+	skipped := 0
 	for scanner.Scan() {
 		raw := scanner.Text()
 		ts, line := splitTimestamp(raw)
+		if ts != "" && !dockerlogs.ShouldShip(ts, time.Now()) {
+			// Historical json-file replay. Advance the cursor so a
+			// restart does not start from the same ancient timestamp,
+			// but do not ship or archive the line.
+			f.mu.Lock()
+			f.lastTimestamp = ts
+			f.mu.Unlock()
+			skipped++
+			if skipped%50 == 0 {
+				f.writeCursor()
+			}
+			continue
+		}
 		if len(line) > maxLineBytes {
 			line = line[:maxLineBytes] + " …[truncated]"
 		}
@@ -221,7 +225,16 @@ func (f *Forwarder) flush() {
 
 	if err := f.client.SendServiceLogs(f.serviceID, batch); err != nil {
 		log.Printf("runtimelogs[%s]: send failed (%d lines dropped): %v", f.serviceID, len(batch), err)
+		if d := client.SendBackoff(err); d > 0 {
+			select {
+			case <-time.After(d):
+			case <-f.ctx.Done():
+			}
+		}
 	}
+	// Persist the cursor on every successful (or dropped) flush so a
+	// crash mid-follow does not restart from an ancient on-disk stamp.
+	f.writeCursor()
 }
 
 // splitTimestamp pulls the leading RFC3339Nano timestamp prepended by

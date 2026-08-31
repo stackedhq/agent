@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -586,6 +587,10 @@ func (c *Client) doJSON(method, path string, payload interface{}) ([]byte, error
 			return body, nil
 		}
 		lastErr = err
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusTooManyRequests {
+			break
+		}
 
 		// Re-create reader for retry if we had a body
 		if payload != nil {
@@ -626,9 +631,13 @@ func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, error) 
 			message = "empty response body"
 		}
 		if requestID := resp.Header.Get("X-Request-Id"); requestID != "" {
-			return nil, fmt.Errorf("HTTP %d (request %s): %s", resp.StatusCode, requestID, message)
+			message = fmt.Sprintf("(request %s): %s", requestID, message)
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, message)
+		return nil, &HTTPError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			Message:    message,
+		}
 	}
 
 	return respBody, nil
