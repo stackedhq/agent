@@ -89,20 +89,26 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	streamer.AddLine(fmt.Sprintf("Active slot: %q \u2192 deploying to %q.", string(currentSlot), string(newSlot)))
 	streamer.Flush()
 
-	// Memory-headroom precheck. Blue/green peaks at 2× the service's
-	// memory limit because both slots run concurrently. On a small VPS
-	// (1 GB) with a 600 MB service, starting the second slot would OOM
-	// the host and likely kill the live container too. Fail fast with
-	// a useful error instead. Skipped when the service has no memory
-	// limit configured — we can't compute a budget then, and the user
-	// has opted out of resource limits anyway.
-	if limitMB := getIntPayloadOr(op.Payload, "memoryLimitMb", 0); limitMB > 0 {
-		if avail := heartbeat.AvailableMemoryMB(); avail > 0 && avail < uint64(limitMB)*2 {
-			return nil, fail(fmt.Errorf(
-				"insufficient memory headroom for blue/green: need %d MB free (2× service limit), have %d MB available; raise the VPS size or switch to recreate mode",
-				limitMB*2, avail,
-			))
-		}
+	// Memory-headroom precheck. Blue/green runs two copies briefly, so
+	// we need enough free RAM for a second copy of the *live*
+	// container's actual RSS. memoryLimitMb is a Docker cap, not a
+	// reservation — MemAvailable already excludes the live container,
+	// and requiring 2× the ceiling blocked deploys of services that
+	// were nowhere near their cap. Unmeasurable usage fails open
+	// rather than treating the cap as reserved.
+	liveName := containerNameForSlot(serviceID, currentSlot)
+	liveUsageMB := int(heartbeat.ContainerMemoryMB(liveName))
+	limitMB := getIntPayloadOr(op.Payload, "memoryLimitMb", 0)
+	availMB := heartbeat.AvailableMemoryMB()
+	if err := blueGreenHeadroomError(liveUsageMB, limitMB, availMB); err != nil {
+		return nil, fail(err)
+	}
+	if liveUsageMB > 0 {
+		streamer.AddLine(fmt.Sprintf(
+			"Memory headroom: live container using %d MB, %d MB available (limit is a cap, not reserved).",
+			liveUsageMB, availMB,
+		))
+		streamer.Flush()
 	}
 
 	// Phase 1: resolve image (pull or build). This may have been done
@@ -237,6 +243,39 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		result["probeError"] = probeRes.Error
 	}
 	return result, nil
+}
+
+// blueGreenMemoryNeedMB is the extra RAM a second slot is expected to
+// consume. Limits are caps, not reservations: we budget the live
+// container's actual RSS (plus a small boot-spike buffer), never 2×
+// the configured ceiling. Zero live usage means we cannot estimate
+// and the caller should skip the check.
+func blueGreenMemoryNeedMB(liveUsageMB, limitMB int) int {
+	if liveUsageMB <= 0 {
+		return 0
+	}
+	need := liveUsageMB + 64
+	if limitMB > 0 && need > limitMB {
+		need = limitMB
+	}
+	return need
+}
+
+// blueGreenHeadroomError fails the deploy when the host does not have
+// enough free RAM for a second copy of the live container. availMB == 0
+// means /proc/meminfo was unreadable; fail open in that case.
+func blueGreenHeadroomError(liveUsageMB, limitMB int, availMB uint64) error {
+	need := blueGreenMemoryNeedMB(liveUsageMB, limitMB)
+	if need <= 0 || availMB == 0 {
+		return nil
+	}
+	if availMB < uint64(need) {
+		return fmt.Errorf(
+			"insufficient memory for blue/green: live container is using %d MB, need %d MB free for a second copy, have %d MB available; raise the VPS size or switch to recreate mode",
+			liveUsageMB, need, availMB,
+		)
+	}
+	return nil
 }
 
 // deployFastRestart implements the volume-aware path: pre-pull the

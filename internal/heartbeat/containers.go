@@ -226,6 +226,22 @@ func dockerStats(ids []string) map[string]containerStats {
 	return result
 }
 
+// ContainerMemoryMB returns the live RSS of a running container in
+// megabytes. Returns 0 when the container is missing, stopped, or
+// docker stats cannot be parsed. Used by blue/green deploys to budget
+// a second copy of actual usage rather than the configured memory cap.
+func ContainerMemoryMB(name string) uint64 {
+	if name == "" {
+		return 0
+	}
+	for _, s := range dockerStats([]string{name}) {
+		if s.memBytes > 0 {
+			return s.memBytes / (1024 * 1024)
+		}
+	}
+	return 0
+}
+
 // collectOtherContainers enumerates Docker containers on this host that
 // are *not* managed by Stacked, and returns their current `docker stats`
 // snapshot.
