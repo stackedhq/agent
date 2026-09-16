@@ -235,9 +235,8 @@ func readCPUStat() (idle, total uint64) {
 // in megabytes. Returns 0 if the file is unreadable or the field is
 // missing (non-Linux hosts, exotic kernels). Used by the rolling-deploy
 // executor for the pre-flight memory-headroom check: starting a second
-// container alongside the live one needs roughly 2× the service's
-// memory limit to fit, and a 1 GB VPS should fail the deploy fast
-// rather than OOM-killing the host.
+// container alongside the live one needs roughly the live container's
+// current RSS (not 2× its Docker memory cap) to fit.
 func AvailableMemoryMB() uint64 {
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {

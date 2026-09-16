@@ -158,3 +158,55 @@ func TestRollingContainerArgsAppliesDockerImageCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestBlueGreenMemoryNeedMB(t *testing.T) {
+	cases := []struct {
+		name        string
+		live, limit int
+		want        int
+	}{
+		{name: "unmeasurable live usage skips the budget", live: 0, limit: 1024, want: 0},
+		{name: "negative live usage skips the budget", live: -1, limit: 512, want: 0},
+		{name: "actual RSS plus 64 MB boot buffer", live: 180, limit: 1024, want: 244},
+		{name: "never budgets more than the Docker cap", live: 500, limit: 512, want: 512},
+		{name: "unlimited services still budget live RSS", live: 180, limit: 0, want: 244},
+		{name: "cap equal to live RSS stays at the cap", live: 512, limit: 512, want: 512},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := blueGreenMemoryNeedMB(c.live, c.limit); got != c.want {
+				t.Fatalf("blueGreenMemoryNeedMB(%d, %d) = %d, want %d", c.live, c.limit, got, c.want)
+			}
+		})
+	}
+}
+
+func TestBlueGreenHeadroomError(t *testing.T) {
+	if err := blueGreenHeadroomError(180, 1024, 300); err != nil {
+		t.Fatalf("enough free RAM for live RSS must pass: %v", err)
+	}
+	if err := blueGreenHeadroomError(180, 1024, 244); err != nil {
+		t.Fatalf("exactly the needed budget must pass: %v", err)
+	}
+	err := blueGreenHeadroomError(180, 1024, 100)
+	if err == nil {
+		t.Fatal("expected failure when free RAM is below live RSS + buffer")
+	}
+	if !strings.Contains(err.Error(), "live container is using 180 MB") {
+		t.Fatalf("error should cite live usage, got %v", err)
+	}
+	if strings.Contains(err.Error(), "2×") || strings.Contains(err.Error(), "2048") {
+		t.Fatalf("error must not treat the cap as reserved, got %v", err)
+	}
+	if err := blueGreenHeadroomError(180, 1024, 0); err != nil {
+		t.Fatalf("unreadable meminfo must fail open: %v", err)
+	}
+	if err := blueGreenHeadroomError(0, 1024, 50); err != nil {
+		t.Fatalf("unmeasurable live RSS must fail open even on a small box: %v", err)
+	}
+	// The old 2×-limit check would have failed this: 1 GB cap, 180 MB
+	// live, 400 MB free. Caps are not reservations.
+	if err := blueGreenHeadroomError(180, 1024, 400); err != nil {
+		t.Fatalf("400 MB free for a 180 MB live container must pass: %v", err)
+	}
+}
