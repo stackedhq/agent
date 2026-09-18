@@ -40,11 +40,10 @@ const permsHealDisableEnv = "STACKED_DISABLE_VOLUME_PERMS_HEAL"
 //
 //	{ hostPath: string, containerPath: string, readOnly?: bool, mode?: string }
 //
-// `mode` is a UX hint from the dashboard ("managed" vs "custom") and
-// the agent does not branch on it — both modes resolve to a bind mount
-// at the supplied hostPath. We deliberately keep the agent oblivious
-// to managed-vs-custom because the path is fully materialized server-
-// side; the only correct behavior is "mount what you're told".
+// `mode` is a UX hint from the dashboard ("managed" vs "custom").
+// The agent does not trust that field. It classifies mounts from the
+// resolved host path: managed volumes under managedVolumeRoot are
+// always allowed; every other host bind needs a machine-local allowlist.
 type volumeMount struct {
 	HostPath      string
 	ContainerPath string
