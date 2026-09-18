@@ -326,8 +326,8 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// `<serviceID>` so volumes mount exclusively (only one writer at
 	// a time). Reuses the existing compose template — the recreate
 	// path's container shape — so logs/metrics keying is unchanged.
-	volumeMounts := parseVolumes(op.Payload)
-	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
+	volumeMounts, err := prepareHostVolumeMounts(op.Payload, streamer.AddLine)
+	if err != nil {
 		return nil, fail(err)
 	}
 	fileMounts, err := e.prepareFileMounts(op, serviceID)
