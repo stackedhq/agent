@@ -66,7 +66,7 @@ func requiresFastRestart(hasVolumes, hasFileMounts bool) bool {
 // Failures pre-flip leave the old slot serving untouched.
 func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer, serviceID string) (map[string]interface{}, error) {
 	dir := serviceDir(serviceID)
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}
 
@@ -131,7 +131,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return nil, fail(fmt.Errorf("write .env: %w", err))
 	}
 
@@ -288,7 +288,7 @@ func blueGreenHeadroomError(liveUsageMB, limitMB int, availMB uint64) error {
 // see a clear failure log and can redeploy a known-good image.
 func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streamer, serviceID string) (map[string]interface{}, error) {
 	dir := serviceDir(serviceID)
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}
 
@@ -309,7 +309,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return nil, fail(fmt.Errorf("write .env: %w", err))
 	}
 

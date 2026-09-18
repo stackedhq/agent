@@ -36,6 +36,9 @@ func main() {
 	}
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	// Defense in depth alongside systemd UMask=0077: files created without
+	// an explicit chmod stay owner-only. Helpers still chmod public files.
+	syscall.Umask(0o077)
 	log.Printf("Starting Stacked agent v%s", heartbeat.Version)
 
 	cfg, err := config.Load()
@@ -64,6 +67,9 @@ func main() {
 	// recover via subsequent ops.
 	if err := executor.ReconcileProxy(); err != nil {
 		log.Printf("Startup proxy reconcile skipped: %v", err)
+	}
+	if err := executor.ReconcileSecretPermissions(); err != nil {
+		log.Printf("Startup secret permission reconcile skipped: %v", err)
 	}
 
 	stop := make(chan struct{})

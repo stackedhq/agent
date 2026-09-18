@@ -151,7 +151,7 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 	}
 
 	dir := serviceDir(serviceID)
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return fail(fmt.Errorf("create service dir: %w", err))
 	}
 
@@ -171,7 +171,7 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return fail(fmt.Errorf("write .env: %w", err))
 	}
 
