@@ -21,7 +21,10 @@ import (
 // replaces it when the port mapping actually changes, so a no-op reconcile is
 // cheap and the data volume is always preserved.
 func (e *Executor) SetAccess(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_set_access")
+	if err != nil {
+		return err
+	}
 	dbType := getStringPayload(op.Payload, "dbType")
 	containerName := getStringPayload(op.Payload, "containerName")
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
@@ -30,9 +33,6 @@ func (e *Executor) SetAccess(op client.Operation) error {
 	bindHost := getStringPayload(op.Payload, "tailscaleIp")
 	credentials := getMapPayload(op.Payload, "credentials")
 
-	if databaseID == "" {
-		return fmt.Errorf("db_set_access requires databaseId")
-	}
 	if dbType == "" {
 		return fmt.Errorf("db_set_access requires dbType")
 	}
@@ -65,7 +65,10 @@ func (e *Executor) SetAccess(op client.Operation) error {
 	if err != nil {
 		return fail(fmt.Errorf("generate compose: %w", err))
 	}
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return fail(err)
+	}
 	if err := ensureDir(dir); err != nil {
 		return fail(fmt.Errorf("create database dir: %w", err))
 	}

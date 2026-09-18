@@ -8,15 +8,18 @@ import (
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/ids"
 	"github.com/stackedapp/stacked/agent/internal/logs"
 )
 
-const databasesDir = "/opt/stacked/databases"
+// Overridable in tests so traversal cases can prove we never write or
+// RemoveAll outside the intended child.
+var databasesDir = "/opt/stacked/databases"
 
 // databaseDir returns the working directory for a given database. Mirrors
 // `serviceDir` in shape so debugging / on-disk inspection feels familiar.
-func databaseDir(databaseID string) string {
-	return filepath.Join(databasesDir, databaseID)
+func databaseDir(databaseID string) (string, error) {
+	return ids.Child(databasesDir, databaseID)
 }
 
 // Provision pulls the database image and brings up its container. Streams
@@ -27,7 +30,10 @@ func databaseDir(databaseID string) string {
 // Idempotent on retry: `compose up -d` is a no-op against an already-running
 // container, and `docker pull` is a fast no-op when the image is cached.
 func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error) {
-	databaseID := getStringPayload(op.Payload, "databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_provision")
+	if err != nil {
+		return nil, err
+	}
 	dbType := getStringPayload(op.Payload, "dbType")
 	port := getIntPayload(op.Payload, "port")
 	containerName := getStringPayload(op.Payload, "containerName")
@@ -43,9 +49,6 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	}
 	bindHost := getStringPayload(op.Payload, "tailscaleIp")
 
-	if databaseID == "" {
-		return nil, fmt.Errorf("db_provision requires databaseId")
-	}
 	if dbType == "" {
 		return nil, fmt.Errorf("db_provision requires dbType")
 	}
@@ -59,7 +62,10 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 		return nil, fmt.Errorf("db_provision requires containerName")
 	}
 
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return nil, err
+	}
 	if err := ensureDir(dir); err != nil {
 		return nil, fmt.Errorf("create database dir: %w", err)
 	}
@@ -122,12 +128,15 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 // that happens normally is a manual `docker rm` between Stop and Start, but
 // it's a recoverable state we shouldn't punish the user for.
 func (e *Executor) StartDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_start requires databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_start")
+	if err != nil {
+		return err
 	}
 
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
 		return fmt.Errorf("database %s has no compose file at %s — re-provision required", databaseID, dir)
 	}
@@ -167,12 +176,15 @@ func (e *Executor) StartDB(op client.Operation) error {
 // metadata stays intact for the next Start. Volumes obviously persist
 // either way; the difference is whether the container shell sticks around.
 func (e *Executor) StopDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_stop requires databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_stop")
+	if err != nil {
+		return err
 	}
 
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
 		// No compose file = nothing to stop. Treat as success; the row is
 		// already in a no-database-running state and a Start will surface
@@ -202,12 +214,15 @@ func (e *Executor) StopDB(op client.Operation) error {
 // Idempotent on a missing dir so a retry after a partial failure still
 // succeeds (e.g. compose down ran but rm -rf raced with another process).
 func (e *Executor) DestroyDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_destroy requires databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_destroy")
+	if err != nil {
+		return err
 	}
 
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		log.Printf("DestroyDB: dir %s already gone, treating as success", dir)
 		return nil

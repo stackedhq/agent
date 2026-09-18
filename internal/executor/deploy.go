@@ -18,14 +18,16 @@ import (
 )
 
 func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
-	serviceID := getStringPayload(op.Payload, "serviceId")
+	serviceID, err := requireServiceID(op.Payload, "deploy")
+	if err != nil {
+		return nil, err
+	}
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
 
-	if serviceID == "" {
-		return nil, fmt.Errorf("deploy requires serviceId in payload")
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return nil, err
 	}
-
-	dir := serviceDir(serviceID)
 	if err := ensureDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}
