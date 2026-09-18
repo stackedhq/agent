@@ -2,3 +2,5 @@ dist/
 /agent
 
 .DS_Store
+.release-signing.key
+*.pem

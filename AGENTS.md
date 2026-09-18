@@ -14,11 +14,12 @@ internal/
 ├── executor/
 │   ├── executor.go        # Operation dispatcher + runCommand helpers
 │   ├── deploy.go          # Deploy: git clone → nixpacks build → docker compose up
-│   ├── selfupdate.go      # Self-update: download binary → replace → os.Exit(0)
+│   ├── selfupdate.go      # Self-update: signed GitHub release → verify → replace → os.Exit(0)
 │   ├── stop.go            # Stop/pause: docker compose stop
 │   ├── restart.go         # Resume/restart: compose restart, fallback up -d
 │   ├── setup.go           # Setup: verify docker, create network, start caddy
 │   └── proxy.go           # Proxy config: regenerate Caddyfile, reload caddy
+├── releaseverify/         # SemVer + SHA-256 + Ed25519 checks for releases
 ├── heartbeat/heartbeat.go # Version const, system metrics, 10s heartbeat loop
 ├── logs/streamer.go       # Batches command output → POST /agent/ops/:id/logs
 └── poller/poller.go       # 5s poll loop, claims + executes operations sequentially
@@ -37,7 +38,7 @@ make build
 # -X github.com/stackedapp/stacked/agent/internal/heartbeat.Version=X.Y.Z
 ```
 
-**Releasing:** Tag with `vX.Y.Z` and push — GitHub Actions builds binaries and creates a release.
+**Releasing:** Tag with `vX.Y.Z` and push — GitHub Actions builds binaries, signs `SHA256SUMS`, attests provenance, and creates a release. Notes generation is a separate read-only job. Details in `docs/releasing.md`.
 
 ```bash
 git tag v0.7.0
@@ -91,7 +92,7 @@ If a release changes an embedded template and you want it to land on existing in
 
 - **Log streaming**: Commands run via `runCommand` or `runCommandWithStreamer`, output goes through `logs.Streamer` which batches lines and POSTs to the server every 1s or 50 lines
 - **Progress reporting**: `streamer.SetProgress(N)` + `streamer.AddLine("==> Phase...")` at deploy phase boundaries
-- **Self-update**: Downloads new binary → replaces in-place → `os.Exit(0)` → systemd restarts with new binary
+- **Self-update**: Validates SemVer, downloads binary + `SHA256SUMS` + `.sig` from `github.com/stackedhq/agent` only, verifies Ed25519 then SHA-256, replaces in-place, `os.Exit(0)` → systemd restarts. Failure leaves the existing binary. Downgrades need `allowDowngrade=true`.
 - **All operations are sequential**: Poller claims pending ops and executes them one at a time
 
 ## State Files
