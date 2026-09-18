@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -22,8 +23,53 @@ func New(server, token string) *Client {
 		server: server,
 		token:  token,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:       30 * time.Second,
+			CheckRedirect: restrictRedirects,
 		},
+	}
+}
+
+// restrictRedirects keeps authenticated control-plane requests on the
+// configured origin. Cross-origin hops and HTTPS-to-HTTP downgrades would
+// either leak the Bearer token or let a MITM swap operation payloads.
+func restrictRedirects(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	from := via[0].URL
+	to := req.URL
+	if from.Scheme == "https" && to.Scheme != "https" {
+		return fmt.Errorf("refusing TLS downgrade redirect to %s", to)
+	}
+	if !sameOrigin(from, to) {
+		return fmt.Errorf("refusing cross-origin redirect to %s", to)
+	}
+	return nil
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	default:
+		return ""
 	}
 }
 
