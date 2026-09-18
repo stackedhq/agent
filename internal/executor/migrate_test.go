@@ -8,14 +8,15 @@ import (
 )
 
 func TestValidateMigratePathsAcceptsManagedTarget(t *testing.T) {
-	src, tgt, err := validateMigratePaths("/var/lib/dokploy/data/", managedVolumeRoot+"svc-1/data/")
+	target := managedVolumeRoot + testServiceID + "/data/"
+	src, tgt, err := validateMigratePaths("/var/lib/dokploy/data/", target)
 	if err != nil {
 		t.Fatalf("validateMigratePaths returned error: %v", err)
 	}
 	if src != "/var/lib/dokploy/data" {
 		t.Fatalf("source cleaned to %q", src)
 	}
-	if tgt != filepath.Clean(managedVolumeRoot+"svc-1/data") {
+	if tgt != filepath.Clean(managedVolumeRoot+testServiceID+"/data") {
 		t.Fatalf("target cleaned to %q", tgt)
 	}
 }
@@ -32,7 +33,7 @@ func TestValidateMigratePathsRejectsUnsafeSource(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, _, err := validateMigratePaths(c.src, managedVolumeRoot+"svc-1/data")
+			_, _, err := validateMigratePaths(c.src, managedVolumeRoot+testServiceID+"/data")
 			if err == nil {
 				t.Fatalf("expected error")
 			}
@@ -48,10 +49,11 @@ func TestValidateMigratePathsRejectsUnsafeTarget(t *testing.T) {
 		{"empty", ""},
 		{"relative", "opt/stacked/data/services/svc-1/data"},
 		{"outside managed root", "/etc"},
-		{"lookalike root", "/opt/stacked/data/services-backup/svc-1/data"},
+		{"lookalike root", "/opt/stacked/data/services-backup/" + testServiceID + "/data"},
 		{"exact managed root", filepath.Clean(managedVolumeRoot)},
-		{"dotdot", managedVolumeRoot + "svc-1/../svc-2/data"},
-		{"nul", managedVolumeRoot + "svc-1/data\x00tail"},
+		{"non-uuid service", managedVolumeRoot + "svc-1/data"},
+		{"dotdot", managedVolumeRoot + testServiceID + "/../svc-2/data"},
+		{"nul", managedVolumeRoot + testServiceID + "/data\x00tail"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

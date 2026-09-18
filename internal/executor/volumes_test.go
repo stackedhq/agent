@@ -2,6 +2,7 @@ package executor
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -146,29 +147,49 @@ func TestGenerateCompose_WithVolumes_IncludesBlock(t *testing.T) {
 	}
 }
 
+const testServiceID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
 func TestIsManagedHostPath(t *testing.T) {
+	leaf := managedVolumeRoot + testServiceID + "/data-abc123"
+	parent := managedVolumeRoot + testServiceID
 	cases := []struct {
 		path string
 		want bool
 	}{
-		{"/opt/stacked/data/services/svc-1/data-abc123", true},
-		{"/opt/stacked/data/services/svc-1", true},
-		// Exact root without trailing path: anchored on trailing slash,
-		// so the bare root (which we never materialize as a volume) is
-		// classified as not-managed. Harmless either way — we never
-		// produce that path.
+		{leaf, true},
+		{parent, true},
+		{parent + "/", true},
+		// Canonical Clean of a .. that still lands on the UUID silo.
+		{parent + "/foo/../data-abc123", true},
+		// Exact root without a service UUID is not managed.
 		{"/opt/stacked/data/services", false},
+		// Non-UUID service component must not match — no chmod/heal.
+		{"/opt/stacked/data/services/svc-1/data-abc123", false},
+		{"/opt/stacked/data/services/SVC-NOT-A-UUID", false},
 		// Look-alike sibling dirs must not match.
-		{"/opt/stacked/data/services-backup/svc-1", false},
-		{"/opt/stacked/data/other/svc-1", false},
+		{"/opt/stacked/data/services-backup/" + testServiceID, false},
+		{"/opt/stacked/data/other/" + testServiceID, false},
 		{"/srv/myapp/data", false},
 		{"/data", false},
 		{"", false},
+		{"opt/stacked/data/services/" + testServiceID + "/data", false},
 	}
 	for _, c := range cases {
 		if got := isManagedHostPath(c.path); got != c.want {
 			t.Errorf("isManagedHostPath(%q) = %v, want %v", c.path, got, c.want)
 		}
+	}
+}
+
+func TestManagedServiceParent_CanonicalUUID(t *testing.T) {
+	want := filepath.Join("/opt/stacked/data/services", testServiceID)
+	got, ok := managedServiceParent(managedVolumeRoot + testServiceID + "/vol/sub")
+	if !ok || got != want {
+		t.Fatalf("managedServiceParent = %q, %v; want %q, true", got, ok, want)
+	}
+	// .. escaping the UUID silo must fail, not resolve to another tree.
+	if _, ok := managedServiceParent("/opt/stacked/data/services/" + testServiceID + "/../../etc/passwd"); ok {
+		t.Fatal("escaped path accepted")
 	}
 }
 
@@ -374,5 +395,153 @@ func TestEnsureVolumeHostDirs_CustomPath_NotChmoded(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(customPath, permsHealSentinel)); !os.IsNotExist(err) {
 		t.Errorf("sentinel must not be written to custom paths, stat err = %v", err)
+	}
+}
+
+func assertPerm(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if perm := info.Mode().Perm(); perm != want {
+		t.Fatalf("%s perm = %o, want %o", path, perm, want)
+	}
+}
+
+func TestProtectManagedVolumeLayout_Parent0700Leaf0777(t *testing.T) {
+	base := t.TempDir()
+	parent := filepath.Join(base, testServiceID)
+	leaf := filepath.Join(parent, "data-abc")
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	restricted := filepath.Join(leaf, "db")
+	if err := os.WriteFile(restricted, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := protectManagedVolumeLayout(leaf, parent); err != nil {
+		t.Fatalf("protect: %v", err)
+	}
+	assertPerm(t, parent, 0o700)
+	assertPerm(t, leaf, 0o777)
+	assertPerm(t, restricted, 0o666)
+}
+
+func TestProtectManagedVolumeLayout_DoesNotWorldOpenServiceParent(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), testServiceID)
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Mounting the UUID dir itself must not 0777 it — that would undo the silo.
+	if err := protectManagedVolumeLayout(parent, parent); err != nil {
+		t.Fatalf("protect: %v", err)
+	}
+	assertPerm(t, parent, 0o700)
+}
+
+func TestChmodDirNoFollow_RefusesSymlink(t *testing.T) {
+	target := t.TempDir()
+	if err := os.Chmod(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), testServiceID)
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := chmodDirNoFollow(link, 0o700); err == nil {
+		t.Fatal("expected symlink chmod to fail")
+	}
+	assertPerm(t, target, 0o755)
+}
+
+func TestReconcileManagedServiceParents_LocksUUIDDirsOnly(t *testing.T) {
+	root := t.TempDir()
+	good := filepath.Join(root, testServiceID)
+	other := filepath.Join(root, "not-a-uuid")
+	leaf := filepath.Join(good, "data")
+	for _, dir := range []string{good, other, leaf} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(leaf, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reconcileManagedServiceParentsAt(root); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	assertPerm(t, good, 0o700)
+	assertPerm(t, other, 0o755)
+	assertPerm(t, leaf, 0o777)
+}
+
+func TestReconcileManagedServiceParents_SkipsSymlink(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Chmod(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, testServiceID)
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	if err := reconcileManagedServiceParentsAt(root); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("service parent should remain a symlink: %v %v", info, err)
+	}
+	assertPerm(t, outside, 0o755)
+}
+
+func TestReconcileManagedServiceParents_MissingRootIsNoop(t *testing.T) {
+	if err := reconcileManagedServiceParentsAt(filepath.Join(t.TempDir(), "missing")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnrelatedUIDCannotTraverseServiceParent(t *testing.T) {
+	// t.TempDir lives under a private TMPDIR; nobody cannot even reach
+	// it. Fixture under /tmp so the only gate is the service parent.
+	base, err := os.MkdirTemp("/tmp", "stacked-vol-acl-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := filepath.Join(base, testServiceID)
+	leaf := filepath.Join(parent, "data-abc")
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := protectManagedVolumeLayout(leaf, parent); err != nil {
+		t.Fatalf("protect: %v", err)
+	}
+	assertPerm(t, parent, 0o700)
+	assertPerm(t, leaf, 0o777)
+
+	// Owner can still use the Docker-compatible leaf.
+	f, err := os.CreateTemp(leaf, "write-")
+	if err != nil {
+		t.Fatalf("owner cannot write leaf: %v", err)
+	}
+	f.Close()
+
+	if err := exec.Command("sudo", "-n", "-u", "nobody", "true").Run(); err != nil {
+		t.Skipf("passwordless sudo -u nobody unavailable: %v", err)
+	}
+	if err := exec.Command("sudo", "-n", "-u", "nobody", "test", "-x", parent).Run(); err == nil {
+		t.Fatal("unrelated uid traversed 0700 service parent")
+	}
+	if err := exec.Command("sudo", "-n", "-u", "nobody", "test", "-r", leaf).Run(); err == nil {
+		t.Fatal("unrelated uid reached 0777 leaf through private parent")
 	}
 }

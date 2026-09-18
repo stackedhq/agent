@@ -10,10 +10,6 @@ import (
 	"github.com/stackedapp/stacked/agent/internal/logs"
 )
 
-// managedVolumeDataDir is the parent of per-service managed-volume dirs.
-// Keep in sync with packages/web/src/lib/volume-paths.ts MANAGED_VOLUME_ROOT.
-const managedVolumeDataDir = "/opt/stacked/data/services"
-
 // ServiceDestroy tears down a service for good: stops the container(s),
 // removes the compose dir, and optionally deletes managed-volume host dirs.
 // Mirrors DestroyDB semantics. Idempotent — missing dirs are a no-op.
@@ -56,7 +52,7 @@ func (e *Executor) ServiceDestroy(op client.Operation) error {
 
 	// 3. Remove managed-volume data dir (/opt/stacked/data/services/<id>)
 	if removeVolumes {
-		volumeDir := filepath.Join(managedVolumeDataDir, serviceID)
+		volumeDir := filepath.Join(managedServiceDataRoot, serviceID)
 		if _, err := os.Stat(volumeDir); err == nil {
 			log.Printf("Removing managed volume dir %s", volumeDir)
 			if err := os.RemoveAll(volumeDir); err != nil {
