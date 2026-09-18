@@ -20,7 +20,9 @@ All connections are initiated outbound from the agent. Works through any firewal
 curl -fsSL https://stacked.rest/install.sh | sh -s -- --token stk_<your-token>
 ```
 
-This installs Docker (if needed), the agent binary, and a systemd service. The agent runs as a dedicated `stacked` user — not root.
+This installs Docker (if needed), the agent binary, and a systemd service. The agent process runs as a dedicated `stacked` user, not as uid 0. That is **not** a host isolation boundary: `stacked` is in the `docker` group, so it can drive the rootful Docker daemon. **A compromised Stacked account, agent token, or control plane is equivalent to VPS root.**
+
+Run the agent on a **dedicated VPS**. Do not co-locate unrelated sensitive workloads on the same machine until a narrower Docker helper exists. Full threat model, rootless evaluation, and the helper migration plan: [docs/trust-boundary.md](docs/trust-boundary.md).
 
 Get your token from the Stacked dashboard under **Machines → Add Machine**.
 
@@ -31,6 +33,16 @@ Get your token from the Stacked dashboard under **Machines → Add Machine**.
 | `--token` | Agent token (required) | — |
 | `--server` | Stacked server URL | `https://stacked.rest` |
 | `--force` | Reinstall even if already present | `false` |
+
+## Trust boundary
+
+| Layer | What it actually contains |
+|---|---|
+| systemd `User=stacked` + `ProtectSystem=strict` | The agent process. Not `dockerd`. |
+| `docker` group + `/var/run/docker.sock` | Nothing. This is root-equivalent. |
+| Stacked dashboard / agent token | Operators of this VPS. Treat accordingly. |
+
+Until [the helper in the trust-boundary doc](docs/trust-boundary.md) ships, assume any code path that can make the agent run a Docker API call can take the host.
 
 ## What it does on your server
 
