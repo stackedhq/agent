@@ -86,6 +86,34 @@ git push origin main --tags
 
 If a release adds new system dependencies or changes `install.sh`, include `REQUIRES-REINSTALL` in the release notes. The dashboard will show users a manual reinstall command instead of the auto-update button.
 
+## Container isolation
+
+Every service container now starts with a reduced breakout surface, and each service gets its own Docker network so a compromised app cannot scan sibling workloads.
+
+**Defaults (compose and rolling are equivalent):**
+
+- `no-new-privileges:true`
+- `cap_drop: [ALL]` (add capabilities back with `capAdd`)
+- `pids_limit: 1024` (databases: `4096` plus the `CHOWN`/`SETUID`/`SETGID`/`FOWNER`/`SETPCAP`/`DAC_OVERRIDE`/`SYS_NICE` set official engine images need)
+- Per-service network `stacked-svc-<serviceId>`; Caddy is attached so HTTP still works
+- Managed databases join `stacked-db-<databaseId>`, the shared `stacked-data` plane, and `stacked` (for `networkIsolation: false` services)
+- Services without `linkedDatabaseIds` also join `stacked-data` so existing `DATABASE_URL` hostnames keep working
+
+**Payload escape hatches**
+
+| Field | Effect |
+|---|---|
+| `isolationRelaxed: true` | Historical Docker defaults: no cap drop, no `no-new-privileges`, no PID cap; shared `stacked` network |
+| `networkIsolation: false` | Shared `stacked` network only (keep the capability defaults) |
+| `allowPrivilegeEscalation: true` | Omit `no-new-privileges` |
+| `privileged: true` | `--privileged`; skips cap drop/add |
+| `capAdd` / `capDrop` | Opt-in capabilities; `capDrop` replaces the default `[ALL]` when present |
+| `pidsLimit` | Override the PID cap |
+| `readOnlyRoot: true` | Read-only rootfs plus tmpfs on `/tmp`, `/run`, `/var/run`. Declared volume mounts stay writable unless `:ro` |
+| `tmpfs` | Extra writable tmpfs paths |
+| `linkedServiceIds` | Join those services' networks |
+| `linkedDatabaseIds` | Join only those DB networks (presence of the key, even empty, skips `stacked-data`) |
+
 ## Building from source
 
 Requires Go 1.23+.
