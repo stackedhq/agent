@@ -24,6 +24,12 @@ This installs Docker (if needed), the agent binary, and a systemd service. The a
 
 Get your token from the Stacked dashboard under **Machines → Add Machine**.
 
+### Prerequisites
+
+Docker is installed by `install.sh` when missing. **Tailscale is not.** Enabling Tailscale from the dashboard requires the official `tailscale` package already on the host (`tailscale` on `PATH`, `tailscaled` running). The agent never downloads or executes remote installers — it runs as the unprivileged `stacked` user and cannot elevate.
+
+Install Tailscale with the [upstream package](https://tailscale.com/kb/1031/install-linux) for your distro (pinned apt/yum repo + signed packages), then enable it from the dashboard.
+
 ### Options
 
 | Flag | Description | Default |
