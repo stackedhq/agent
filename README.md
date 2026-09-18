@@ -29,7 +29,7 @@ Get your token from the Stacked dashboard under **Machines → Add Machine**.
 | Flag | Description | Default |
 |---|---|---|
 | `--token` | Agent token (required) | — |
-| `--server` | Stacked server URL | `https://stacked.rest` |
+| `--server` | Stacked server origin (`https://` only; no path/userinfo/query). `http://` is accepted only for loopback with `STACKED_ALLOW_INSECURE_HTTP=1` | `https://stacked.rest` |
 | `--force` | Reinstall even if already present | `false` |
 
 ## What it does on your server
