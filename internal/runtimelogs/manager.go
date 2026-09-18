@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/ids"
 	"github.com/stackedapp/stacked/agent/internal/slots"
 )
 
@@ -198,27 +199,8 @@ func listStackedContainers() []containerRow {
 	return filterActiveSlot(rows)
 }
 
-// isUUID is a cheap shape check for the 8-4-4-4-12 hex form. We only
-// need to reject things like "proxy" or compose-project slugs that
-// would 500 the server's UUID-typed query — not validate version /
-// variant bits.
 func isUUID(s string) bool {
-	if len(s) != 36 {
-		return false
-	}
-	for i, c := range s {
-		switch i {
-		case 8, 13, 18, 23:
-			if c != '-' {
-				return false
-			}
-		default:
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-				return false
-			}
-		}
-	}
-	return true
+	return ids.Valid(s)
 }
 
 // warnedNonUUID tracks projects we've already warned about so a

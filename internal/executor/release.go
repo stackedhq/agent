@@ -34,9 +34,9 @@ import (
 // path can resolve image, env, network, etc. exactly the same way as
 // the deploy executor.
 func (e *Executor) ReleaseCommand(op client.Operation) error {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return fmt.Errorf("release_command requires serviceId in payload")
+	serviceID, err := requireServiceID(op.Payload, "release_command")
+	if err != nil {
+		return err
 	}
 
 	releaseCmd := getStringPayload(op.Payload, "releaseCommand")
@@ -72,7 +72,10 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 	// we have to clone + nixpacks-build before we can run the command —
 	// the build is identical to what the deploy op will do, and docker's
 	// layer cache makes the second build (in the deploy op) ~instant.
-	dir := serviceDir(serviceID)
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return fail(err)
+	}
 	if err := ensureDir(dir); err != nil {
 		return fail(fmt.Errorf("create service dir: %w", err))
 	}

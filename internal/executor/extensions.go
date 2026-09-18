@@ -52,20 +52,19 @@ func (e *Executor) DisableExtension(op client.Operation) error {
 }
 
 func (e *Executor) runExtensionOp(op client.Operation, enable bool) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	containerName := getStringPayload(op.Payload, "containerName")
-	extName := getStringPayload(op.Payload, "extensionName")
-	dbUser := getStringPayload(op.Payload, "dbUser")
-	dbName := getStringPayload(op.Payload, "dbName")
-
 	verb := "db_extension_enable"
 	if !enable {
 		verb = "db_extension_disable"
 	}
 
-	if databaseID == "" {
-		return fmt.Errorf("%s requires databaseId", verb)
+	if _, err := requireDatabaseID(op.Payload, verb); err != nil {
+		return err
 	}
+	containerName := getStringPayload(op.Payload, "containerName")
+	extName := getStringPayload(op.Payload, "extensionName")
+	dbUser := getStringPayload(op.Payload, "dbUser")
+	dbName := getStringPayload(op.Payload, "dbName")
+
 	if containerName == "" {
 		return fmt.Errorf("%s requires containerName", verb)
 	}

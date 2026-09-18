@@ -10,14 +10,18 @@ import (
 	"path/filepath"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/ids"
 	"github.com/stackedapp/stacked/agent/internal/logs"
 )
 
 const (
-	stackedDir  = "/opt/stacked"
-	servicesDir = "/opt/stacked/services"
-	proxyDir    = "/opt/stacked/proxy"
+	stackedDir = "/opt/stacked"
+	proxyDir   = "/opt/stacked/proxy"
 )
+
+// Overridable in tests so traversal cases can prove we never write or
+// RemoveAll outside the intended child.
+var servicesDir = "/opt/stacked/services"
 
 // Executor handles running operations dispatched by the poller.
 type Executor struct {
@@ -138,9 +142,32 @@ func (e *Executor) Execute(op client.Operation) {
 	})
 }
 
-// serviceDir returns the working directory for a service.
-func serviceDir(serviceID string) string {
-	return filepath.Join(servicesDir, serviceID)
+func requireServiceID(payload map[string]interface{}, verb string) (string, error) {
+	id := getStringPayload(payload, "serviceId")
+	if id == "" {
+		return "", fmt.Errorf("%s requires serviceId in payload", verb)
+	}
+	if err := ids.Validate(id); err != nil {
+		return "", fmt.Errorf("invalid serviceId: %w", err)
+	}
+	return id, nil
+}
+
+func requireDatabaseID(payload map[string]interface{}, verb string) (string, error) {
+	id := getStringPayload(payload, "databaseId")
+	if id == "" {
+		return "", fmt.Errorf("%s requires databaseId", verb)
+	}
+	if err := ids.Validate(id); err != nil {
+		return "", fmt.Errorf("invalid databaseId: %w", err)
+	}
+	return id, nil
+}
+
+// serviceDir returns the working directory for a service, or an error if
+// serviceID is not a confined UUID child of servicesDir.
+func serviceDir(serviceID string) (string, error) {
+	return ids.Child(servicesDir, serviceID)
 }
 
 // runCommand executes a command, streaming stdout/stderr to the Stacked API.
