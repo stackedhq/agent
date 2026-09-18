@@ -6,6 +6,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // SetAccess reconciles a database's external exposure to match the server's
@@ -21,35 +22,18 @@ import (
 // replaces it when the port mapping actually changes, so a no-op reconcile is
 // cheap and the data volume is always preserved.
 func (e *Executor) SetAccess(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	dbType := getStringPayload(op.Payload, "dbType")
-	containerName := getStringPayload(op.Payload, "containerName")
-	dockerImage := getStringPayload(op.Payload, "dockerImage")
-	port := getIntPayload(op.Payload, "port")
-	accessMode := getStringPayload(op.Payload, "accessMode")
-	bindHost := getStringPayload(op.Payload, "tailscaleIp")
-	credentials := getMapPayload(op.Payload, "credentials")
-
-	if databaseID == "" {
-		return fmt.Errorf("db_set_access requires databaseId")
+	p, err := typedPayload[opschema.DBSetAccess](op)
+	if err != nil {
+		return err
 	}
-	if dbType == "" {
-		return fmt.Errorf("db_set_access requires dbType")
-	}
-	if containerName == "" {
-		return fmt.Errorf("db_set_access requires containerName")
-	}
-	if port == 0 {
-		return fmt.Errorf("db_set_access requires port")
-	}
-	switch accessMode {
-	case "internal", "tailnet", "public":
-	default:
-		return fmt.Errorf("db_set_access: invalid accessMode %q", accessMode)
-	}
-	if accessMode == "tailnet" && bindHost == "" {
-		return fmt.Errorf("db_set_access: tailnet mode requires a tailscale IP")
-	}
+	databaseID := p.DatabaseID
+	dbType := p.DBType
+	containerName := p.ContainerName
+	dockerImage := p.DockerImage
+	port := p.Port
+	accessMode := p.AccessMode
+	bindHost := p.TailscaleIP
+	credentials := p.Credentials
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) error {

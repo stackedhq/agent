@@ -9,6 +9,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 const databasesDir = "/opt/stacked/databases"
@@ -27,37 +28,18 @@ func databaseDir(databaseID string) string {
 // Idempotent on retry: `compose up -d` is a no-op against an already-running
 // container, and `docker pull` is a fast no-op when the image is cached.
 func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error) {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	dbType := getStringPayload(op.Payload, "dbType")
-	port := getIntPayload(op.Payload, "port")
-	containerName := getStringPayload(op.Payload, "containerName")
-	dockerImage := getStringPayload(op.Payload, "dockerImage")
-	credentials := getMapPayload(op.Payload, "credentials")
-	// External exposure. Absent → "public" to preserve historical behavior
-	// for older servers that don't send the field (the new server always
-	// sends "internal" for freshly-provisioned databases). bindHost carries
-	// the machine's Tailscale IP and is only consulted in tailnet mode.
-	accessMode := getStringPayload(op.Payload, "accessMode")
-	if accessMode == "" {
-		accessMode = "public"
+	p, err := typedPayload[opschema.DBProvision](op)
+	if err != nil {
+		return nil, err
 	}
-	bindHost := getStringPayload(op.Payload, "tailscaleIp")
-
-	if databaseID == "" {
-		return nil, fmt.Errorf("db_provision requires databaseId")
-	}
-	if dbType == "" {
-		return nil, fmt.Errorf("db_provision requires dbType")
-	}
-	if port == 0 {
-		return nil, fmt.Errorf("db_provision requires port")
-	}
-	if dockerImage == "" {
-		return nil, fmt.Errorf("db_provision requires dockerImage")
-	}
-	if containerName == "" {
-		return nil, fmt.Errorf("db_provision requires containerName")
-	}
+	databaseID := p.DatabaseID
+	dbType := p.DBType
+	port := p.Port
+	containerName := p.ContainerName
+	dockerImage := p.DockerImage
+	credentials := p.Credentials
+	accessMode := p.AccessMode
+	bindHost := p.TailscaleIP
 
 	dir := databaseDir(databaseID)
 	if err := ensureDir(dir); err != nil {
@@ -122,10 +104,11 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 // that happens normally is a manual `docker rm` between Stop and Start, but
 // it's a recoverable state we shouldn't punish the user for.
 func (e *Executor) StartDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_start requires databaseId")
+	p, err := typedPayload[opschema.DatabaseRef](op)
+	if err != nil {
+		return err
 	}
+	databaseID := p.DatabaseID
 
 	dir := databaseDir(databaseID)
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
@@ -167,10 +150,11 @@ func (e *Executor) StartDB(op client.Operation) error {
 // metadata stays intact for the next Start. Volumes obviously persist
 // either way; the difference is whether the container shell sticks around.
 func (e *Executor) StopDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_stop requires databaseId")
+	p, err := typedPayload[opschema.DatabaseRef](op)
+	if err != nil {
+		return err
 	}
+	databaseID := p.DatabaseID
 
 	dir := databaseDir(databaseID)
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
@@ -202,10 +186,11 @@ func (e *Executor) StopDB(op client.Operation) error {
 // Idempotent on a missing dir so a retry after a partial failure still
 // succeeds (e.g. compose down ran but rm -rf raced with another process).
 func (e *Executor) DestroyDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_destroy requires databaseId")
+	p, err := typedPayload[opschema.DatabaseRef](op)
+	if err != nil {
+		return err
 	}
+	databaseID := p.DatabaseID
 
 	dir := databaseDir(databaseID)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -291,6 +276,9 @@ func renderDatabasePorts(accessMode, bindHost string, hostPort, nativePort int) 
 }
 
 func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string, accessMode, bindHost string) (string, error) {
+	if !opschema.ValidImageRef(image) || !opschema.ValidComposeServiceName(containerName) {
+		return "", fmt.Errorf("refusing to render database compose from unvalidated image or container name")
+	}
 	portsBlock := renderDatabasePorts(accessMode, bindHost, port, databaseNativePort(dbType))
 	switch dbType {
 	case "postgres":

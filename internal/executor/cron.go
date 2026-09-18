@@ -12,6 +12,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // RunJob handles the `cron_run` op type — a scheduled job. Runs the user's
@@ -32,25 +33,22 @@ import (
 // run's exit code. A non-zero exit returns an error (the exit status is in
 // the message); the server marks the run failed.
 func (e *Executor) RunJob(op client.Operation) (map[string]interface{}, error) {
-	mode := getStringPayload(op.Payload, "mode")
-	if mode == "http" {
-		return e.runHTTPJob(op)
+	p, err := typedPayload[opschema.CronRun](op)
+	if err != nil {
+		return nil, err
 	}
-	return e.runCommandJob(op)
+	if p.Mode == "http" {
+		return e.runHTTPJob(op, p)
+	}
+	return e.runCommandJob(op, p)
 }
 
 // runHTTPJob makes an HTTP request from the agent host. Runs on the same
 // network as the user's containers, so internal URLs (e.g.
 // http://my-service:3000/api/cron) work.
-func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, error) {
-	url := getStringPayload(op.Payload, "httpUrl")
-	if url == "" {
-		return nil, fmt.Errorf("cron_run http mode requires httpUrl")
-	}
-	method := getStringPayload(op.Payload, "httpMethod")
-	if method == "" {
-		method = "GET"
-	}
+func (e *Executor) runHTTPJob(op client.Operation, p opschema.CronRun) (map[string]interface{}, error) {
+	url := p.HTTPURL
+	method := p.HTTPMethod
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) (map[string]interface{}, error) {
@@ -64,7 +62,7 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 	streamer.Flush()
 
 	var bodyReader io.Reader
-	if body := getStringPayload(op.Payload, "httpBody"); body != "" {
+	if body := p.HTTPBody; body != "" {
 		bodyReader = strings.NewReader(body)
 	}
 
@@ -74,7 +72,7 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 	}
 
 	// Parse JSON headers from payload if present.
-	if hdrs := getStringPayload(op.Payload, "httpHeaders"); hdrs != "" {
+	if hdrs := p.HTTPHeaders; hdrs != "" {
 		parsed := parseJSONHeaders(hdrs)
 		for k, v := range parsed {
 			req.Header.Set(k, v)
@@ -110,16 +108,9 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 	return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(snippet))
 }
 
-func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, error) {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return nil, fmt.Errorf("cron_run requires serviceId in payload")
-	}
-
-	command := getStringPayload(op.Payload, "command")
-	if strings.TrimSpace(command) == "" {
-		return nil, fmt.Errorf("cron_run requires a command")
-	}
+func (e *Executor) runCommandJob(op client.Operation, p opschema.CronRun) (map[string]interface{}, error) {
+	serviceID := p.ServiceID
+	command := p.Command
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) (map[string]interface{}, error) {
@@ -134,7 +125,7 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 
 	// Resolve the image without rebuilding. Pinned dockerImage wins; else
 	// the git-build image name the deploy path produced.
-	dockerImage := getStringPayload(op.Payload, "dockerImage")
+	dockerImage := p.DockerImage
 	imageName := dockerImage
 	if imageName == "" {
 		imageName = "stacked-" + serviceID
@@ -183,7 +174,7 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 	streamer.AddLine("Running job: " + command)
 	streamer.Flush()
 
-	runID := getStringPayload(op.Payload, "runId")
+	runID := p.RunID
 	containerName := serviceID + "-cron"
 	if runID != "" {
 		// Short suffix keeps concurrent manual + scheduled runs from

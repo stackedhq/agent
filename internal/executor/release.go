@@ -10,6 +10,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // ReleaseCommand handles the `release_command` op type — Heroku-style
@@ -34,12 +35,12 @@ import (
 // path can resolve image, env, network, etc. exactly the same way as
 // the deploy executor.
 func (e *Executor) ReleaseCommand(op client.Operation) error {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return fmt.Errorf("release_command requires serviceId in payload")
+	p, err := typedPayload[opschema.ServiceDeploy](op)
+	if err != nil {
+		return err
 	}
-
-	releaseCmd := getStringPayload(op.Payload, "releaseCommand")
+	serviceID := p.ServiceID
+	releaseCmd := p.ReleaseCommand
 	if strings.TrimSpace(releaseCmd) == "" {
 		// Server should never enqueue a release op without a command,
 		// but defend against it: a no-op release is correct behavior.
@@ -77,7 +78,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		return fail(fmt.Errorf("create service dir: %w", err))
 	}
 
-	dockerImage := getStringPayload(op.Payload, "dockerImage")
+	dockerImage := p.DockerImage
 	var imageName string
 
 	if dockerImage != "" {

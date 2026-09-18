@@ -14,6 +14,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // Backup dumps a database container with the engine-appropriate tool
@@ -26,11 +27,12 @@ import (
 // straight to R2 because a presigned single PUT needs a Content-Length up
 // front, and database dumps can be large. The temp file is always removed.
 func (e *Executor) Backup(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	backupID := getStringPayload(op.Payload, "backupId")
-	if databaseID == "" || backupID == "" {
-		return fmt.Errorf("db_backup requires databaseId and backupId")
+	p, err := typedPayload[opschema.DBBackup](op)
+	if err != nil {
+		return err
 	}
+	databaseID := p.DatabaseID
+	backupID := p.BackupID
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) error {
@@ -83,12 +85,13 @@ func (e *Executor) Backup(op client.Operation) error {
 // Same-container restore only: the dump goes back into the same DB it came
 // from. Cross-database restore is intentionally out of scope.
 func (e *Executor) Restore(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	restoreBackupID := getStringPayload(op.Payload, "restoreBackupId")
-	safetyBackupID := getStringPayload(op.Payload, "safetyBackupId")
-	if databaseID == "" || restoreBackupID == "" {
-		return fmt.Errorf("db_restore requires databaseId and restoreBackupId")
+	p, err := typedPayload[opschema.DBRestore](op)
+	if err != nil {
+		return err
 	}
+	databaseID := p.DatabaseID
+	restoreBackupID := p.RestoreBackupID
+	safetyBackupID := p.SafetyBackupID
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) error {

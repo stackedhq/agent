@@ -12,6 +12,7 @@ import (
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/heartbeat"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 	"github.com/stackedapp/stacked/agent/internal/slots"
 )
 
@@ -33,25 +34,22 @@ import (
 // shared between two writers, and the platform can't introspect what's
 // inside it (SQLite vs. uploads dir vs. RO config) to know if sharing
 // would be safe.
-func (e *Executor) deployRolling(op client.Operation, streamer *logs.Streamer) (map[string]interface{}, error) {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return nil, fmt.Errorf("rolling deploy requires serviceId in payload")
-	}
+func (e *Executor) deployRolling(op client.Operation, p opschema.ServiceDeploy, streamer *logs.Streamer) (map[string]interface{}, error) {
+	serviceID := p.ServiceID
 
 	// Parse once — the slice length picks the sub-strategy, and the
 	// parsed entries are reused by deployBlueGreen / deployFastRestart
 	// (via generateCompose) so we don't re-walk the payload further
 	// down. This branch is purely about whether blue and green can
 	// coexist safely; the actual mounting is owned by generateCompose.
-	if requiresFastRestart(len(parseVolumes(op.Payload)) > 0, hasFileMounts(op.Payload)) {
+	if requiresFastRestart(len(p.Volumes) > 0, p.HasFileMounts) {
 		streamer.AddLine("Rolling mode: fast restart (storage attached, can't run two slots concurrently).")
 		streamer.Flush()
-		return e.deployFastRestart(op, streamer, serviceID)
+		return e.deployFastRestart(op, p, streamer, serviceID)
 	}
 	streamer.AddLine("Rolling mode: zero-downtime blue/green.")
 	streamer.Flush()
-	return e.deployBlueGreen(op, streamer, serviceID)
+	return e.deployBlueGreen(op, p, streamer, serviceID)
 }
 
 // requiresFastRestart selects exclusive storage semantics for rolling deploys.
@@ -64,7 +62,7 @@ func requiresFastRestart(hasVolumes, hasFileMounts bool) bool {
 // deployBlueGreen brings up the inactive slot, health-gates it, flips
 // Caddy upstream to the new slot, drains the old slot, and removes it.
 // Failures pre-flip leave the old slot serving untouched.
-func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer, serviceID string) (map[string]interface{}, error) {
+func (e *Executor) deployBlueGreen(op client.Operation, p opschema.ServiceDeploy, streamer *logs.Streamer, serviceID string) (map[string]interface{}, error) {
 	dir := serviceDir(serviceID)
 	if err := ensureDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
@@ -98,7 +96,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// rather than treating the cap as reserved.
 	liveName := containerNameForSlot(serviceID, currentSlot)
 	liveUsageMB := int(heartbeat.ContainerMemoryMB(liveName))
-	limitMB := getIntPayloadOr(op.Payload, "memoryLimitMb", 0)
+	limitMB := p.MemoryLimitMB
 	availMB := heartbeat.AvailableMemoryMB()
 	if err := blueGreenHeadroomError(liveUsageMB, limitMB, availMB); err != nil {
 		return nil, fail(err)
@@ -166,8 +164,8 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	if creds.Port != nil {
 		probePort = *creds.Port
 	}
-	healthPath := getStringPayload(op.Payload, "healthCheckPath")
-	timeoutSec := getIntPayloadOr(op.Payload, "healthCheckTimeoutSec", 60)
+	healthPath := p.HealthCheckPath
+	timeoutSec := p.HealthCheckTimeoutSec
 	// Worker services (port <= 0) expose no port — there's nothing to
 	// gate on. Skip straight to the Caddy flip (which is a no-op for a
 	// service with no domains) rather than abort on an impossible probe.
@@ -213,7 +211,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// Phase 7: drain and remove the old slot. `docker stop --time=N`
 	// sends SIGTERM, waits up to N seconds for graceful shutdown, then
 	// SIGKILLs. The grace period is the user's `stop_grace_sec`.
-	graceSec := getIntPayloadOr(op.Payload, "stopGraceSec", 10)
+	graceSec := p.StopGraceSec
 	oldContainer := containerNameForSlot(serviceID, prevSlot)
 	streamer.AddLine(fmt.Sprintf("Draining old container %s (grace=%ds)...", oldContainer, graceSec))
 	streamer.Flush()
@@ -286,7 +284,7 @@ func blueGreenHeadroomError(liveUsageMB, limitMB int, availMB uint64) error {
 // reliable rollback when the volume is mid-migrated is its own thing.
 // Failure leaves the user on the new container; if it's broken, they
 // see a clear failure log and can redeploy a known-good image.
-func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streamer, serviceID string) (map[string]interface{}, error) {
+func (e *Executor) deployFastRestart(op client.Operation, p opschema.ServiceDeploy, streamer *logs.Streamer, serviceID string) (map[string]interface{}, error) {
 	dir := serviceDir(serviceID)
 	if err := ensureDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
@@ -326,7 +324,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// `<serviceID>` so volumes mount exclusively (only one writer at
 	// a time). Reuses the existing compose template — the recreate
 	// path's container shape — so logs/metrics keying is unchanged.
-	volumeMounts := parseVolumes(op.Payload)
+	volumeMounts := volumeMountsFrom(p)
 	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
 		return nil, fail(err)
 	}
@@ -338,8 +336,8 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	if err != nil {
 		return nil, fail(err)
 	}
-	startCommand := dockerCommandOverride(op.Payload)
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
+	startCommand := p.DockerCommandOverride()
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFrom(p), creds.NetworkAliases, startCommand)
 	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
@@ -351,7 +349,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// in place because the image changed — we explicitly stop first
 	// so SIGTERM has the configured grace, and so the gap window is
 	// bounded by `stopGraceSec + container start + health gate`.
-	graceSec := getIntPayloadOr(op.Payload, "stopGraceSec", 10)
+	graceSec := p.StopGraceSec
 	streamer.SetProgress(70)
 	streamer.AddLine(fmt.Sprintf("Stopping old container (grace=%ds)...", graceSec))
 	streamer.Flush()
@@ -368,8 +366,8 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	if creds.Port != nil {
 		probePort = *creds.Port
 	}
-	healthPath := getStringPayload(op.Payload, "healthCheckPath")
-	timeoutSec := getIntPayloadOr(op.Payload, "healthCheckTimeoutSec", 60)
+	healthPath := p.HealthCheckPath
+	timeoutSec := p.HealthCheckTimeoutSec
 	// Workers expose no port — nothing to gate on.
 	if probePort <= 0 {
 		streamer.SetProgress(90)
@@ -390,7 +388,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// tear down the stale <serviceID>-blue/-green containers. Without this
 	// the Caddyfile keeps routing HTTP to the old slot container even
 	// though this deploy already swapped <serviceID> underneath it.
-	reconcileUnslotted(streamer, serviceID, getIntPayloadOr(op.Payload, "stopGraceSec", 10))
+	reconcileUnslotted(streamer, serviceID, p.StopGraceSec)
 
 	probeRes := e.HealthProbe(streamer, serviceID, probePort)
 	streamer.SetProgress(100)
@@ -415,7 +413,11 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 // build). The release op, if it ran, already populated either path's
 // cache, so this is near-instant on the second call.
 func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, creds *client.Credentials, streamer *logs.Streamer) (string, error) {
-	dockerImage := getStringPayload(op.Payload, "dockerImage")
+	p, err := typedPayload[opschema.ServiceDeploy](op)
+	if err != nil {
+		return "", err
+	}
+	dockerImage := p.DockerImage
 	if dockerImage != "" {
 		streamer.SetProgress(20)
 		streamer.AddLine("Pulling image " + dockerImage + "...")
@@ -454,8 +456,12 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 // steady state resolves to the single running slot. recreate /
 // fast-restart already get this for free via `container_name`.
 func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation, aliases []string) error {
-	startCommand := dockerCommandOverride(op.Payload)
-	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload), aliases, startCommand)
+	p, err := typedPayload[opschema.ServiceDeploy](op)
+	if err != nil {
+		return err
+	}
+	startCommand := p.DockerCommandOverride()
+	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFrom(p), aliases, startCommand)
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

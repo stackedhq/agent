@@ -8,6 +8,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // managedVolumeDataDir is the parent of per-service managed-volume dirs.
@@ -18,15 +19,12 @@ const managedVolumeDataDir = "/opt/stacked/data/services"
 // removes the compose dir, and optionally deletes managed-volume host dirs.
 // Mirrors DestroyDB semantics. Idempotent — missing dirs are a no-op.
 func (e *Executor) ServiceDestroy(op client.Operation) error {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return fmt.Errorf("service_destroy requires serviceId in payload")
+	p, err := typedPayload[opschema.ServiceDestroy](op)
+	if err != nil {
+		return err
 	}
-
-	removeVolumes := true
-	if rv, ok := op.Payload["removeVolumes"].(bool); ok {
-		removeVolumes = rv
-	}
+	serviceID := p.ServiceID
+	removeVolumes := p.RemoveVolumes
 
 	dir := serviceDir(serviceID)
 	streamer := logs.NewStreamer(e.Client, op.ID)

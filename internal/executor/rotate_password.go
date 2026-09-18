@@ -6,6 +6,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // RotatePassword changes the database password in the running engine, then
@@ -22,15 +23,19 @@ import (
 // (identical to what db_provision/db_set_access produce) and `compose up -d`
 // to reconcile the env vars. The data volume is preserved.
 func (e *Executor) RotatePassword(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	dbType := getStringPayload(op.Payload, "dbType")
-	containerName := getStringPayload(op.Payload, "containerName")
-	dockerImage := getStringPayload(op.Payload, "dockerImage")
-	port := getIntPayload(op.Payload, "port")
-	accessMode := getStringPayload(op.Payload, "accessMode")
-	bindHost := getStringPayload(op.Payload, "tailscaleIp")
-	oldCreds := getMapPayload(op.Payload, "oldCredentials")
-	newCreds := getMapPayload(op.Payload, "newCredentials")
+	p, err := typedPayload[opschema.DBRotatePassword](op)
+	if err != nil {
+		return err
+	}
+	databaseID := p.DatabaseID
+	dbType := p.DBType
+	containerName := p.ContainerName
+	dockerImage := p.DockerImage
+	port := p.Port
+	accessMode := p.AccessMode
+	bindHost := p.TailscaleIP
+	oldCreds := p.OldCredentials
+	newCreds := p.NewCredentials
 
 	if databaseID == "" {
 		return fmt.Errorf("db_rotate_password requires databaseId")

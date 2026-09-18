@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // Stop pauses a service. Uses `compose stop` (NOT `down`) so container
@@ -16,10 +17,11 @@ import (
 // Mirrors StopDB. A missing compose file is treated as success — nothing is
 // running and a later Restart will surface the real error if the dir is gone.
 func (e *Executor) Stop(op client.Operation) error {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return fmt.Errorf("stop requires serviceId in payload")
+	p, err := typedPayload[opschema.ServiceRef](op)
+	if err != nil {
+		return err
 	}
+	serviceID := p.ServiceID
 
 	dir := serviceDir(serviceID)
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // errOpenEnded signals to executor.Execute() that the handler has taken
@@ -50,10 +51,11 @@ var tailscaleAuthURLRe = regexp.MustCompile(`https://login\.tailscale\.com/a/[A-
 // install error, immediate exit) return a normal error and the
 // executor reports `failed` as usual.
 func (e *Executor) TailscaleSetup(op client.Operation) error {
-	hostname := getStringPayload(op.Payload, "hostname")
-	if hostname == "" {
-		return fmt.Errorf("tailscale_setup requires hostname in payload")
+	p, err := typedPayload[opschema.TailscaleSetup](op)
+	if err != nil {
+		return err
 	}
+	hostname := p.Hostname
 
 	// Idempotent install. On Debian/Ubuntu hosts (the only thing we
 	// officially support today) the official upstream installer is the
