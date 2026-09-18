@@ -6,6 +6,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // extensionNameRe constrains what we accept as a Postgres extension name
@@ -30,10 +31,10 @@ func validExtensionName(s string) bool {
 // We connect via `docker exec ... psql` rather than over the published
 // port for two reasons:
 //
-//   1. The official `postgres` image trusts local-socket peer auth, so
-//      we don't need the password in the payload.
-//   2. It works regardless of the host's network config, including hosts
-//      where the database port isn't bound to localhost.
+//  1. The official `postgres` image trusts local-socket peer auth, so
+//     we don't need the password in the payload.
+//  2. It works regardless of the host's network config, including hosts
+//     where the database port isn't bound to localhost.
 //
 // Defense-in-depth on the extension name: the server already validates
 // against a closed allowlist, but we re-validate here with a strict
@@ -52,11 +53,15 @@ func (e *Executor) DisableExtension(op client.Operation) error {
 }
 
 func (e *Executor) runExtensionOp(op client.Operation, enable bool) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	containerName := getStringPayload(op.Payload, "containerName")
-	extName := getStringPayload(op.Payload, "extensionName")
-	dbUser := getStringPayload(op.Payload, "dbUser")
-	dbName := getStringPayload(op.Payload, "dbName")
+	p, err := typedPayload[opschema.DBExtension](op)
+	if err != nil {
+		return err
+	}
+	databaseID := p.DatabaseID
+	containerName := p.ContainerName
+	extName := p.ExtensionName
+	dbUser := p.DBUser
+	dbName := p.DBName
 
 	verb := "db_extension_enable"
 	if !enable {

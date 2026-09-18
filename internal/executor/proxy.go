@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 	"github.com/stackedapp/stacked/agent/internal/slots"
 )
 
@@ -325,21 +326,16 @@ func parsePortInUseFromDocker(out string) (int, string) {
 // errors (which the dispatcher then wraps in `{error: ...}` as
 // before).
 func (e *Executor) ProxyConfig(op client.Operation) error {
-	domainsRaw, ok := op.Payload["domains"]
-	if !ok {
-		return fmt.Errorf("proxy_config requires domains in payload")
-	}
-
-	domains, ok := domainsRaw.([]interface{})
-	if !ok {
-		return fmt.Errorf("proxy_config domains must be an array")
+	p, err := typedPayload[opschema.ProxyConfig](op)
+	if err != nil {
+		return err
 	}
 
 	if err := ensureProxy(); err != nil {
 		return fmt.Errorf("ensure proxy: %w", err)
 	}
 
-	parsed := parseDomains(domains)
+	parsed := cachedDomainsFrom(p.Domains)
 	if err := validatePortBoundHosts(parsed); err != nil {
 		return err
 	}
@@ -563,6 +559,23 @@ func parseDomains(raw []interface{}) []cachedDomain {
 	return out
 }
 
+func validateCachedDomain(d cachedDomain) error {
+	return opschema.Domain{
+		Domain:               d.Domain,
+		ServiceID:            d.ServiceID,
+		Port:                 d.Port,
+		Host:                 d.Host,
+		Scheme:               d.Scheme,
+		Path:                 d.Path,
+		StripPrefix:          d.StripPrefix,
+		OnDemandTLS:          d.OnDemandTLS,
+		AuthGateMode:         d.AuthGateMode,
+		AuthGateUsername:     d.AuthGateUsername,
+		AuthGatePasswordHash: d.AuthGatePasswordHash,
+		ServiceName:          d.ServiceName,
+	}.Validate()
+}
+
 func validatePortBoundHosts(parsed []cachedDomain) error {
 	for _, d := range parsed {
 		if !d.isPortBound() {
@@ -625,6 +638,11 @@ func generateCaddyfile(parsed []cachedDomain, state map[string]slots.Slot) strin
 }
 
 func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot) (string, error) {
+	for _, d := range parsed {
+		if err := validateCachedDomain(d); err != nil {
+			return "", err
+		}
+	}
 	var b strings.Builder
 	b.WriteString("# Managed by Stacked \u2014 do not edit manually\n\n")
 

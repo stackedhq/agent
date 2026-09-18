@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // Dokploy → Stacked routing takeover.
@@ -79,22 +80,11 @@ const dokployTraefikContainer = "dokploy-traefik"
 //	  }
 //	}
 func (e *Executor) DokployTakeoverProbe(op client.Operation) (map[string]interface{}, error) {
-	containerNamesRaw, _ := op.Payload["containerNames"].([]interface{})
-	containerNames := make([]string, 0, len(containerNamesRaw))
-	for _, raw := range containerNamesRaw {
-		name, ok := raw.(string)
-		if !ok {
-			continue
-		}
-		name = strings.TrimSpace(name)
-		// Defensive: container names follow [a-zA-Z0-9_.-]+. Anything
-		// outside that set is either a typo or a payload tampering
-		// attempt — skip rather than feed to docker inspect.
-		if name == "" || !isSafeContainerName(name) {
-			continue
-		}
-		containerNames = append(containerNames, name)
+	p, err := typedPayload[opschema.DokployProbe](op)
+	if err != nil {
+		return nil, err
 	}
+	containerNames := p.ContainerNames
 
 	swarmInfo := probeSwarm()
 	result := map[string]interface{}{
@@ -196,7 +186,11 @@ func detectDokployNetwork() string {
 // don't have to redetect here. If the payload omits it we fall back
 // to detection for safety.
 func (e *Executor) DokployCaddyAttachNetwork(op client.Operation) error {
-	network, _ := op.Payload["network"].(string)
+	p, err := typedPayload[opschema.DokployNetwork](op)
+	if err != nil {
+		return err
+	}
+	network := p.Network
 	network = strings.TrimSpace(network)
 	if network == "" {
 		network = detectDokployNetwork()
@@ -230,7 +224,11 @@ func (e *Executor) DokployCaddyAttachNetwork(op client.Operation) error {
 // idempotent — disconnecting a container that isn't on the network
 // returns success.
 func (e *Executor) DokployCaddyDetachNetwork(op client.Operation) error {
-	network, _ := op.Payload["network"].(string)
+	p, err := typedPayload[opschema.DokployNetwork](op)
+	if err != nil {
+		return err
+	}
+	network := p.Network
 	network = strings.TrimSpace(network)
 	if network == "" {
 		network = detectDokployNetwork()

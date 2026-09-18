@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // Restart resumes or restarts a service.
@@ -17,10 +18,11 @@ import (
 // cases are a pre-fix agent that used `compose down` for pause, or a
 // manual `docker rm`. Mirrors StartDB's recovery path.
 func (e *Executor) Restart(op client.Operation) error {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return fmt.Errorf("restart requires serviceId in payload")
+	p, err := typedPayload[opschema.ServiceRef](op)
+	if err != nil {
+		return err
 	}
+	serviceID := p.ServiceID
 
 	dir := serviceDir(serviceID)
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {

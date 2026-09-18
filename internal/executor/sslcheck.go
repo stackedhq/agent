@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // SslCheck inspects Caddy's certificate data directory for each requested
@@ -31,30 +32,11 @@ import (
 // Payload shape: { "domains": [{ "domain": "foo.com" }, ...] }
 // Result shape:  { "<domain>": "active" | "pending", ... }
 func (e *Executor) SslCheck(op client.Operation) (map[string]interface{}, error) {
-	domainsRaw, ok := op.Payload["domains"]
-	if !ok {
-		return nil, fmt.Errorf("ssl_check requires domains in payload")
+	p, err := typedPayload[opschema.SSLCheck](op)
+	if err != nil {
+		return nil, err
 	}
-	domainList, ok := domainsRaw.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("ssl_check domains must be an array")
-	}
-
-	// Filter and validate. Skip anything that fails the safety check —
-	// this op runs inside `docker compose exec` so we want zero shell
-	// injection surface even though payload comes from our own server.
-	domains := make([]string, 0, len(domainList))
-	for _, d := range domainList {
-		dm, ok := d.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		domain, _ := dm["domain"].(string)
-		if domain == "" || !isSafeDomain(domain) {
-			continue
-		}
-		domains = append(domains, domain)
-	}
+	domains := p.Domains
 
 	result := make(map[string]interface{}, len(domains))
 	if len(domains) == 0 {

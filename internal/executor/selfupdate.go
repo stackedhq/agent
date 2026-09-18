@@ -10,18 +10,19 @@ import (
 	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 const agentBinaryPath = "/opt/stacked/agent"
 
 // SelfUpdate downloads the latest agent binary and restarts the service.
 func (e *Executor) SelfUpdate(op client.Operation) error {
-	targetVersion := getStringPayload(op.Payload, "targetVersion")
-	if targetVersion == "" {
-		return fmt.Errorf("self_update requires targetVersion in payload")
+	p, err := typedPayload[opschema.SelfUpdate](op)
+	if err != nil {
+		return err
 	}
-
-	downloadURL := getStringPayload(op.Payload, "downloadUrl")
+	targetVersion := p.TargetVersion
+	downloadURL := p.DownloadURL
 	if downloadURL == "" {
 		arch := runtime.GOARCH
 		downloadURL = fmt.Sprintf(

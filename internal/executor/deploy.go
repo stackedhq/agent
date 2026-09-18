@@ -15,15 +15,16 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	dockerImage := getStringPayload(op.Payload, "dockerImage")
-
-	if serviceID == "" {
-		return nil, fmt.Errorf("deploy requires serviceId in payload")
+	p, err := typedPayload[opschema.ServiceDeploy](op)
+	if err != nil {
+		return nil, err
 	}
+	serviceID := p.ServiceID
+	dockerImage := p.DockerImage
 
 	dir := serviceDir(serviceID)
 	if err := ensureDir(dir); err != nil {
@@ -38,8 +39,8 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// in-place container replacement path defined in the rest of this
 	// function. `rolling` hands off to deployRolling, which owns the
 	// blue/green and fast-restart paths.
-	if strategy := getStringPayload(op.Payload, "deployStrategy"); strategy == "rolling" {
-		return e.deployRolling(op, streamer)
+	if p.DeployStrategy == "rolling" {
+		return e.deployRolling(op, p, streamer)
 	}
 
 	// Write deploy errors to the log stream so they appear in the UI
@@ -141,7 +142,7 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// Materialize managed file mounts only after the image is ready, but before
 	// Compose can start the container. Their plaintext never enters the payload
 	// or logs.
-	volumeMounts := parseVolumes(op.Payload)
+	volumeMounts := volumeMountsFrom(p)
 	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
 		return nil, fail(err)
 	}
@@ -153,8 +154,8 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, fail(err)
 	}
-	startCommand := dockerCommandOverride(op.Payload)
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
+	startCommand := p.DockerCommandOverride()
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFrom(p), creds.NetworkAliases, startCommand)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
@@ -186,7 +187,7 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// container we just brought up would look healthy while no traffic
 	// ever reaches it. Repoint Caddy at <serviceID> and tear down the
 	// stale slots. No-op for services that were never rolling.
-	reconcileUnslotted(streamer, serviceID, getIntPayloadOr(op.Payload, "stopGraceSec", 10))
+	reconcileUnslotted(streamer, serviceID, p.StopGraceSec)
 
 	// Phase: Complete (100%)
 	streamer.SetProgress(100)
@@ -208,10 +209,14 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 
 // buildFromSource clones the repo and builds an image with Nixpacks.
 func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, creds *client.Credentials, streamer *logs.Streamer) (string, error) {
-	gitBranch := getStringPayload(op.Payload, "gitBranch")
-	commitSha := getStringPayload(op.Payload, "commitSha")
-	buildCommand := getStringPayload(op.Payload, "buildCommand")
-	startCommand := getStringPayload(op.Payload, "startCommand")
+	p, err := typedPayload[opschema.ServiceDeploy](op)
+	if err != nil {
+		return "", err
+	}
+	gitBranch := p.GitBranch
+	commitSha := p.CommitSHA
+	buildCommand := p.BuildCommand
+	startCommand := p.StartCommand
 
 	if gitBranch == "" {
 		gitBranch = "main"
@@ -221,7 +226,7 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 
 	gitRepo := creds.GitCloneUrl
 	if gitRepo == "" {
-		gitRepo = getStringPayload(op.Payload, "gitRepo")
+		gitRepo = p.GitRepo
 		if gitRepo == "" {
 			return "", fmt.Errorf("no git clone URL available")
 		}
@@ -349,6 +354,10 @@ func (l resourceLimits) cpus() string {
 }
 
 func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, aliases []string, startCommand string) string {
+	if !opschema.ValidComposeServiceName(serviceID) || !opschema.ValidImageRef(imageName) || !opschema.ValidRestartPolicy(limits.restartPolicy) {
+		log.Printf("refusing to render compose from unvalidated inputs")
+		return ""
+	}
 	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
 	// managers correctly partition `docker ps` output. The runtimelogs
 	// manager treats label-less containers as services for back-compat

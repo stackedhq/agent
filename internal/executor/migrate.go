@@ -12,6 +12,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
+	"github.com/stackedapp/stacked/agent/internal/opschema"
 )
 
 // DBMigrate dumps a Dokploy-managed source database container into a
@@ -28,14 +29,12 @@ import (
 // `GetMigrationCredentials` so the operations.payload column never holds
 // plaintext source credentials.
 func (e *Executor) DBMigrate(op client.Operation) error {
-	targetID := getStringPayload(op.Payload, "migrationTargetId")
-	dbType := getStringPayload(op.Payload, "dbType")
-	if targetID == "" {
-		return fmt.Errorf("db_migrate requires migrationTargetId")
+	p, err := typedPayload[opschema.DBMigrate](op)
+	if err != nil {
+		return err
 	}
-	if dbType == "" {
-		return fmt.Errorf("db_migrate requires dbType")
-	}
+	targetID := p.MigrationTargetID
+	dbType := p.DBType
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) error {
@@ -122,8 +121,12 @@ func (e *Executor) DBMigrate(op client.Operation) error {
 // Source contents are read-only (mounted ro). Target is recreated on every
 // run for idempotent retries.
 func (e *Executor) VolumeMigrate(op client.Operation) error {
-	srcPath := getStringPayload(op.Payload, "sourceVolumePath")
-	tgtPath := getStringPayload(op.Payload, "targetVolumePath")
+	p, err := typedPayload[opschema.VolumeMigrate](op)
+	if err != nil {
+		return err
+	}
+	srcPath := p.SourceVolumePath
+	tgtPath := p.TargetVolumePath
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) error {
