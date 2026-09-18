@@ -175,9 +175,8 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		return fail(fmt.Errorf("write .env: %w", err))
 	}
 
-	// Make sure the stacked network exists — the job may need to reach the
-	// user's database container, which sits on it.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	iso := isolationFromPayload(op.Payload)
+	nets := networkPlanFromPayload(serviceID, op.Payload, creds.NetworkAliases)
 
 	streamer.SetProgress(50)
 	streamer.AddLine("Running job: " + command)
@@ -195,15 +194,7 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		containerName = serviceID + "-cron-" + suffix
 	}
 
-	args := []string{
-		"run", "--rm",
-		"--network=stacked",
-		"--env-file=" + envPath,
-		"--name", containerName,
-		imageName,
-		"sh", "-lc", command,
-	}
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", args...); err != nil {
+	if err := e.runOneShotContainer(streamer, dir, containerName, imageName, envPath, iso, nets, nil, []string{"sh", "-lc", command}); err != nil {
 		return fail(fmt.Errorf("job command failed: %w", err))
 	}
 
