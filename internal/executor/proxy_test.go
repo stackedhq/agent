@@ -1,7 +1,12 @@
 package executor
 
 import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stackedapp/stacked/agent/internal/slots"
@@ -346,6 +351,162 @@ func TestParsePortInUseFromDockerNoMatch(t *testing.T) {
 	port, holder := parsePortInUseFromDocker(out)
 	if port != 0 || holder != "" {
 		t.Errorf("expected zero values, got port=%d holder=%q", port, holder)
+	}
+}
+
+func wrapListenErrno(port int, errno syscall.Errno) error {
+	return fmt.Errorf("probe port %d: %w", port, &net.OpError{
+		Op:  "listen",
+		Net: "tcp",
+		Err: &os.SyscallError{Syscall: "bind", Err: errno},
+	})
+}
+
+func withProbePort(t *testing.T, fn func(int) error) {
+	t.Helper()
+	orig := probePort
+	probePort = fn
+	t.Cleanup(func() { probePort = orig })
+}
+
+func TestCheckPortConflictAddrInUse(t *testing.T) {
+	withProbePort(t, func(port int) error {
+		return wrapListenErrno(port, syscall.EADDRINUSE)
+	})
+	got := checkPortConflict()
+	if got == nil {
+		t.Fatal("expected ProxyConfigError")
+	}
+	if got.Code != "port_in_use" || got.Port != 80 {
+		t.Fatalf("code/port: %+v", got)
+	}
+	if !strings.Contains(got.Message, "already in use") && !strings.Contains(got.Message, "held by container") {
+		t.Fatalf("want in-use phrasing, got %q", got.Message)
+	}
+}
+
+func TestCheckPortConflictAccessDenied(t *testing.T) {
+	withProbePort(t, func(port int) error {
+		return wrapListenErrno(port, syscall.EACCES)
+	})
+	got := checkPortConflict()
+	if got == nil {
+		t.Fatal("expected ProxyConfigError")
+	}
+	if got.Code != "port_permission_denied" || got.Port != 80 {
+		t.Fatalf("code/port: %+v", got)
+	}
+	if !strings.Contains(got.Message, "permission denied") || !strings.Contains(got.Message, "CAP_NET_BIND_SERVICE") {
+		t.Fatalf("want EACCES wording, got %q", got.Message)
+	}
+	if strings.Contains(got.Message, "already in use") {
+		t.Fatalf("EACCES must not look like a bind conflict: %q", got.Message)
+	}
+}
+
+func TestCheckPortConflictGeneric(t *testing.T) {
+	withProbePort(t, func(port int) error {
+		return fmt.Errorf("probe port %d: %w", port, errors.New("network is unreachable"))
+	})
+	got := checkPortConflict()
+	if got == nil {
+		t.Fatal("expected ProxyConfigError")
+	}
+	if got.Code != "port_probe_failed" || got.Port != 80 {
+		t.Fatalf("code/port: %+v", got)
+	}
+	if !strings.Contains(got.Message, "network is unreachable") {
+		t.Fatalf("want underlying error string, got %q", got.Message)
+	}
+	if strings.Contains(got.Message, "already in use") {
+		t.Fatalf("generic error must not look like a bind conflict: %q", got.Message)
+	}
+}
+
+func TestPortListenErrorAddrInUse(t *testing.T) {
+	err := wrapListenErrno(80, syscall.EADDRINUSE)
+	got := portListenError(80, err)
+	if got == nil {
+		t.Fatal("expected ProxyConfigError")
+	}
+	if got.Code != "port_in_use" || got.Port != 80 {
+		t.Fatalf("code/port: %+v", got)
+	}
+	if !strings.Contains(got.Message, "port 80 is already in use on this machine") &&
+		!strings.Contains(got.Message, "is held by container") {
+		t.Fatalf("want in-use phrasing, got %q", got.Message)
+	}
+	if strings.Contains(got.Message, "permission denied") || strings.Contains(got.Message, "listen failed") {
+		t.Fatalf("EADDRINUSE should not use the generic/permission wording: %q", got.Message)
+	}
+}
+
+func TestPortListenErrorAccessDenied(t *testing.T) {
+	err := wrapListenErrno(80, syscall.EACCES)
+	got := portListenError(80, err)
+	if got == nil {
+		t.Fatal("expected ProxyConfigError")
+	}
+	if got.Code != "port_permission_denied" || got.Port != 80 {
+		t.Fatalf("code/port: %+v", got)
+	}
+	if got.Holder != "" {
+		t.Fatalf("EACCES should not run holder lookup wording; holder=%q", got.Holder)
+	}
+	if !strings.Contains(got.Message, "permission denied") {
+		t.Fatalf("want permission denied, got %q", got.Message)
+	}
+	if !strings.Contains(got.Message, "CAP_NET_BIND_SERVICE") {
+		t.Fatalf("want CAP_NET_BIND_SERVICE hint, got %q", got.Message)
+	}
+	if !strings.Contains(got.Message, "permission denied") || !strings.Contains(got.Message, err.Error()) {
+		t.Fatalf("want underlying error in message, got %q", got.Message)
+	}
+	if strings.Contains(got.Message, "already in use") {
+		t.Fatalf("EACCES must not look like a bind conflict: %q", got.Message)
+	}
+}
+
+func TestPortListenErrorGeneric(t *testing.T) {
+	underlying := errors.New("network is unreachable")
+	err := fmt.Errorf("probe port 443: %w", underlying)
+	got := portListenError(443, err)
+	if got == nil {
+		t.Fatal("expected ProxyConfigError")
+	}
+	if got.Code != "port_probe_failed" || got.Port != 443 {
+		t.Fatalf("code/port: %+v", got)
+	}
+	if !strings.Contains(got.Message, "network is unreachable") {
+		t.Fatalf("want underlying error string, got %q", got.Message)
+	}
+	if strings.Contains(got.Message, "already in use") {
+		t.Fatalf("generic error must not look like a bind conflict: %q", got.Message)
+	}
+}
+
+func TestProbePortWrapsListenError(t *testing.T) {
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	err = probePort(port)
+	if err == nil {
+		t.Fatal("expected listen conflict")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("probe port %d", port)) {
+		t.Fatalf("want port context, got %q", err)
+	}
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("want wrapped EADDRINUSE, got %v", err)
+	}
+
+	got := portListenError(port, err)
+	if got == nil || got.Code != "port_in_use" {
+		t.Fatalf("wrapped listen error should classify as in use: %+v", got)
 	}
 }
 
