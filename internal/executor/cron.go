@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
@@ -41,7 +40,9 @@ func (e *Executor) RunJob(op client.Operation) (map[string]interface{}, error) {
 
 // runHTTPJob makes an HTTP request from the agent host. Runs on the same
 // network as the user's containers, so internal URLs (e.g.
-// http://my-service:3000/api/cron) work.
+// http://my-service:3000/api/cron) work when httpAllowPrivate is left at
+// its default (true). Loopback and cloud-metadata destinations are
+// rejected unless they pass the policy in http_ssrf.go.
 func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, error) {
 	url := getStringPayload(op.Payload, "httpUrl")
 	if url == "" {
@@ -81,7 +82,12 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 		}
 	}
 
-	httpClient := &http.Client{Timeout: 5 * time.Minute}
+	policy := httpJobPolicyFromPayload(op.Payload)
+	if err := validateHTTPJobURL(url, policy); err != nil {
+		return fail(err)
+	}
+
+	httpClient := newHTTPJobClient(policy)
 	streamer.SetProgress(50)
 
 	resp, err := httpClient.Do(req)
@@ -90,8 +96,7 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 	}
 	defer resp.Body.Close()
 
-	// Read a snippet of the body for logs (cap at 4KB).
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, httpJobMaxResponseBytes))
 	snippet := string(bodyBytes)
 
 	streamer.AddLine(fmt.Sprintf("Response: %d %s", resp.StatusCode, resp.Status))
