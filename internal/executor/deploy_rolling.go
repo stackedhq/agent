@@ -138,8 +138,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		return nil, fail(fmt.Errorf("write .env: %w", err))
 	}
 
-	// Phase 3: ensure the network exists.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	// Phase 3: ensure isolation networks exist (proxy + per-service / links).
 
 	// Phase 4: bring up the new slot. We use `docker run` directly
 	// rather than compose so the slots are independently managed
@@ -155,9 +154,14 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// of the same name behind, remove it before starting fresh.
 	_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
 
-	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, envPath, op, creds.NetworkAliases); err != nil {
+	iso := isolationFromPayload(op.Payload)
+	nets := networkPlanFromPayload(serviceID, op.Payload, creds.NetworkAliases)
+	ensureNetworkPlan(nets)
+
+	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, envPath, op, iso, nets); err != nil {
 		return nil, fail(err)
 	}
+	applyNetworkAttachments(newContainer, nets)
 
 	// Phase 5: health gate. We probe the new container's bridge IP on
 	// the configured port. Failures here abort BEFORE the Caddy flip,
@@ -182,7 +186,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		streamer.SetProgress(85)
 		streamer.AddLine(fmt.Sprintf("Health gate: probing %s:%d (timeout=%ds)...", newContainer, probePort, timeoutSec))
 		streamer.Flush()
-		if err := HealthGate(streamer, newContainer, "stacked", probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
+		if err := HealthGate(streamer, newContainer, nets.Primary, probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
 			// Tear down the failed slot so the next deploy starts clean.
 			_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
 			return nil, fail(fmt.Errorf("health gate: %w", err))
@@ -230,7 +234,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// Phase 8: post-flip probe (informational, matches recreate's
 	// post-deploy probe so the dashboard's port-mismatch banner still
 	// works for rolling deploys).
-	probeRes := e.HealthProbe(streamer, newContainer, probePort)
+	probeRes := e.HealthProbe(streamer, newContainer, nets.Primary, probePort)
 
 	streamer.SetProgress(100)
 	streamer.AddLine("Rolling deploy complete.")
@@ -345,12 +349,14 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 		return nil, fail(err)
 	}
 	startCommand := dockerCommandOverride(op.Payload)
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
+	iso := isolationFromPayload(op.Payload)
+	nets := networkPlanFromPayload(serviceID, op.Payload, creds.NetworkAliases)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), iso, nets, startCommand)
 	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
 
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	ensureNetworkPlan(nets)
 
 	// Stop the old container with the user's grace window, then bring
 	// up the new one. `docker compose up -d` recreates the container
@@ -368,6 +374,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--force-recreate", "--remove-orphans"); err != nil {
 		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
+	applyNetworkAttachments(serviceID, nets)
 
 	// Honor an explicit port (incl. 0 for workers); 3000 only when absent.
 	probePort := 3000
@@ -385,7 +392,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 		streamer.SetProgress(90)
 		streamer.AddLine(fmt.Sprintf("Health gate: probing %s:%d (timeout=%ds)...", serviceID, probePort, timeoutSec))
 		streamer.Flush()
-		if err := HealthGate(streamer, serviceID, "stacked", probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
+		if err := HealthGate(streamer, serviceID, nets.Primary, probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
 			return nil, fail(fmt.Errorf("health gate: %w", err))
 		}
 	}
@@ -398,7 +405,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// though this deploy already swapped <serviceID> underneath it.
 	reconcileUnslotted(streamer, serviceID, getIntPayloadOr(op.Payload, "stopGraceSec", 10))
 
-	probeRes := e.HealthProbe(streamer, serviceID, probePort)
+	probeRes := e.HealthProbe(streamer, serviceID, nets.Primary, probePort)
 	streamer.SetProgress(100)
 	streamer.AddLine("Fast-restart deploy complete.")
 	streamer.Flush()
@@ -459,9 +466,9 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 // them (standard scaled-service behaviour, both are healthy by then);
 // steady state resolves to the single running slot. recreate /
 // fast-restart already get this for free via `container_name`.
-func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation, aliases []string) error {
+func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation, iso isolationSpec, nets networkPlan) error {
 	startCommand := dockerCommandOverride(op.Payload)
-	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload), aliases, startCommand)
+	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload), iso, nets, startCommand)
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -474,23 +481,22 @@ func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot
 // rollingContainerArgs builds the `docker run` argv for a rolling slot
 // container. Pure (no side effects) so the flag contract — notably the
 // stable `--network-alias` — can be unit-tested without invoking docker.
-func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits, aliases []string, startCommand string) []string {
+func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits, iso isolationSpec, nets networkPlan, startCommand string) []string {
 	startCommand = strings.TrimSpace(startCommand)
 	args := []string{
 		"run", "-d",
 		"--name", containerName,
-		"--network=stacked",
+		"--network=" + nets.Primary,
 		"--network-alias=" + serviceID,
 		"--restart=" + limits.restartPolicy,
 	}
 	// Additional friendly internal hostnames (current + retained slugs).
 	// The `<serviceID>` alias above is always present as the floor; these
 	// are additive. Skip anything that isn't a valid DNS label.
-	for _, a := range aliases {
-		if validNetworkAlias(a) {
-			args = append(args, "--network-alias="+a)
-		}
+	for _, a := range validAliases(nets.Aliases) {
+		args = append(args, "--network-alias="+a)
 	}
+	args = append(args, isolationDockerArgs(iso)...)
 	args = append(args,
 		"--env-file="+envPath,
 		"--label", "com.docker.compose.project="+serviceID,

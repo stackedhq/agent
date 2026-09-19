@@ -79,6 +79,8 @@ func (e *Executor) ServiceDestroy(op client.Operation) error {
 		streamer.AddLine("Volume data preserved on disk")
 	}
 
+	removeServiceNetwork(serviceID)
+
 	streamer.AddLine("Service destroyed")
 	streamer.Flush()
 	log.Printf("Service %s destroyed (removeVolumes=%v)", serviceID, removeVolumes)

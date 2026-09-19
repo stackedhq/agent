@@ -156,7 +156,9 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 		return nil, fail(err)
 	}
 	startCommand := dockerCommandOverride(op.Payload)
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
+	iso := isolationFromPayload(op.Payload)
+	nets := networkPlanFromPayload(serviceID, op.Payload, creds.NetworkAliases)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), iso, nets, startCommand)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
@@ -167,17 +169,17 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	streamer.AddLine("Starting container...")
 	streamer.Flush()
 
-	// Ensure the stacked network exists (idempotent, same as setup.go)
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	ensureNetworkPlan(nets)
 
 	log.Printf("Starting container for %s", serviceID)
 	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
 		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
+	applyNetworkAttachments(serviceID, nets)
 
 	// Phase: Health probe (95%)
 	streamer.SetProgress(95)
-	probeRes := e.HealthProbe(streamer, serviceID, probePort)
+	probeRes := e.HealthProbe(streamer, serviceID, nets.Primary, probePort)
 
 	// Reconcile away any leftover blue/green state from a previous
 	// rolling run on this service. Switching a service from `rolling`
@@ -374,7 +376,7 @@ func (l resourceLimits) cpus() string {
 	return s
 }
 
-func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, aliases []string, startCommand string) string {
+func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, iso isolationSpec, nets networkPlan, startCommand string) string {
 	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
 	// managers correctly partition `docker ps` output. The runtimelogs
 	// manager treats label-less containers as services for back-compat
@@ -414,16 +416,12 @@ func generateCompose(serviceID, imageName string, mounts []volumeMount, limits r
   %s:
     container_name: %s
     image: %s
-%s%s    env_file:
+%s%s%s    env_file:
       - .env
 %s%s    labels:
       com.stacked.kind: service
 
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, serviceID, serviceID, imageName, resourceBlock.String(), commandBlock, volumesBlock, renderServiceNetworks(aliases))
+%s`, serviceID, serviceID, imageName, resourceBlock.String(), renderComposeIsolation(iso), commandBlock, volumesBlock, renderComposeServiceNetworks(nets), renderComposeNetworkDefs(nets))
 }
 
 // renderServiceNetworks emits the service-level `networks:` block. With no

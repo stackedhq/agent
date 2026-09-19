@@ -30,8 +30,8 @@ func (e *Executor) Restart(op client.Operation) error {
 		return fmt.Errorf("service %s has no compose file at %s — redeploy required", serviceID, dir)
 	}
 
-	// Ensure the stacked network exists — it vanishes on Docker/machine restart.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	nets := networkPlanFromPayload(serviceID, op.Payload, nil)
+	ensureNetworkPlan(nets)
 
 	log.Printf("Restarting service %s", serviceID)
 	if err := e.runCommand(op.ID, dir, "docker", "compose", "restart"); err != nil {
@@ -43,6 +43,7 @@ func (e *Executor) Restart(op client.Operation) error {
 			return fmt.Errorf("docker compose up: %w", err)
 		}
 	}
+	applyNetworkAttachments(serviceID, nets)
 
 	log.Printf("Service %s restarted", serviceID)
 	return nil

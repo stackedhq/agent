@@ -35,6 +35,16 @@ func New(c *client.Client) *Executor {
 
 // Execute dispatches an operation to the correct handler based on type.
 func (e *Executor) Execute(op client.Operation) {
+	// Fail closed at the machine boundary before any status change or side effect.
+	if _, err := op.ValidatePayload(); err != nil {
+		log.Printf("Operation %s (%s) rejected: %v", op.ID, op.Type, err)
+		_ = e.Client.UpdateStatus(op.ID, &client.StatusUpdate{
+			Status: "failed",
+			Result: map[string]interface{}{"error": err.Error()},
+		})
+		return
+	}
+
 	// Report running
 	if err := e.Client.UpdateStatus(op.ID, &client.StatusUpdate{Status: "running"}); err != nil {
 		log.Printf("Failed to report running status for %s: %v", op.ID, err)

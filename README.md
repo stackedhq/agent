@@ -77,6 +77,34 @@ Until [the helper in the trust-boundary doc](docs/trust-boundary.md) ships, assu
 | `proxy_config` | Regenerate Caddyfile, reload Caddy |
 | `self_update` | Download signed release, verify checksum + signature, replace, restart |
 
+## Container isolation
+
+Every service container now starts with a reduced breakout surface, and each service gets its own Docker network so a compromised app cannot scan sibling workloads.
+
+**Defaults (compose and rolling are equivalent):**
+
+- `no-new-privileges:true`
+- `cap_drop: [ALL]` (add capabilities back with `capAdd`)
+- `pids_limit: 1024` (databases: `4096` plus the `CHOWN`/`SETUID`/`SETGID`/`FOWNER`/`SETPCAP`/`DAC_OVERRIDE`/`SYS_NICE` set official engine images need)
+- Per-service network `stacked-svc-<serviceId>`; Caddy is attached so HTTP still works
+- Managed databases join `stacked-db-<databaseId>`, the shared `stacked-data` plane, and `stacked` (for `networkIsolation: false` services)
+- Services without `linkedDatabaseIds` also join `stacked-data` so existing `DATABASE_URL` hostnames keep working
+
+**Payload escape hatches**
+
+| Field | Effect |
+|---|---|
+| `isolationRelaxed: true` | Historical Docker defaults: no cap drop, no `no-new-privileges`, no PID cap; shared `stacked` network |
+| `networkIsolation: false` | Shared `stacked` network only (keep the capability defaults) |
+| `allowPrivilegeEscalation: true` | Omit `no-new-privileges` |
+| `privileged: true` | `--privileged`; skips cap drop/add |
+| `capAdd` / `capDrop` | Opt-in capabilities; `capDrop` replaces the default `[ALL]` when present |
+| `pidsLimit` | Override the PID cap |
+| `readOnlyRoot: true` | Read-only rootfs plus tmpfs on `/tmp`, `/run`, `/var/run`. Declared volume mounts stay writable unless `:ro` |
+| `tmpfs` | Extra writable tmpfs paths |
+| `linkedServiceIds` | Join those services' networks |
+| `linkedDatabaseIds` | Join only those DB networks (presence of the key, even empty, skips `stacked-data`) |
+
 ## Database access
 
 Managed databases default to **internal** (reachable only on the Docker `stacked` network — no host port). A missing or unknown access mode is treated the same way. Publishing on `0.0.0.0` requires an explicit `public` access mode. The agent does not manage a host firewall; if you use public mode, restrict the port with your cloud security group or an external firewall. Tailnet mode binds only to a validated Tailscale IP.

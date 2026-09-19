@@ -65,7 +65,7 @@ func (e *Executor) SetAccess(op client.Operation) error {
 	streamer.AddLine(fmt.Sprintf("Setting %s access mode to %s", dbType, accessMode))
 	streamer.Flush()
 
-	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost)
+	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost, databaseID)
 	if err != nil {
 		return fail(fmt.Errorf("generate compose: %w", err))
 	}
@@ -80,6 +80,7 @@ func (e *Executor) SetAccess(op client.Operation) error {
 	if err := writeSecretFile(composePath, compose); err != nil {
 		return fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
+	ensureNetworkPlan(databaseNetworkPlan(databaseID))
 
 	// Recreate the container so the new port binding takes effect. compose
 	// leaves it untouched if nothing changed; the named volume survives.

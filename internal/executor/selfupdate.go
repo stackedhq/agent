@@ -43,7 +43,7 @@ func (e *Executor) installUpdate(op client.Operation, currentVersion string) err
 	if target == "" {
 		return fmt.Errorf("self_update requires targetVersion in payload")
 	}
-	allowDowngrade := getBoolPayload(op.Payload, "allowDowngrade")
+	allowDowngrade := getBoolPayload(op.Payload, "allowDowngrade", false)
 
 	ver, err := releaseverify.DecideUpdate(currentVersion, target, allowDowngrade)
 	if err != nil {
@@ -200,11 +200,3 @@ func downloadReleaseFile(dest, rawURL string) error {
 	return nil
 }
 
-func getBoolPayload(payload map[string]interface{}, key string) bool {
-	v, ok := payload[key]
-	if !ok {
-		return false
-	}
-	b, ok := v.(bool)
-	return ok && b
-}
