@@ -704,3 +704,16 @@ func TestGenerateCaddyfileNoGlobalBlockWhenNoOnDemand(t *testing.T) {
 		t.Fatalf("did not expect global on_demand_tls block, got:\n%s", out)
 	}
 }
+
+func TestGenerateCaddyfileAuthGateForwardsClientIP(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "app.example.com", ServiceID: "svc-1", Port: 3000, AuthGateMode: "password"},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	if !strings.Contains(out, "header_up X-Real-IP {remote_host}") {
+		t.Fatalf("expected X-Real-IP from Caddy remote_host, got:\n%s", out)
+	}
+	if !strings.Contains(out, "header_up X-Forwarded-For {remote_host}") {
+		t.Fatalf("expected X-Forwarded-For from Caddy remote_host, got:\n%s", out)
+	}
+}

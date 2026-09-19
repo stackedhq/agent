@@ -14,14 +14,19 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +43,8 @@ const (
 	listenAddr     = ":9876"
 	cookieName     = "__stacked_gate"
 	sessionTTL     = 24 * time.Hour
+	maxLoginBody   = 8 << 10
+	maxLoginKeys   = 4096
 )
 
 // GateConfig is the top-level config file written by the agent.
@@ -57,6 +64,12 @@ var (
 	configMu   sync.RWMutex
 	gateConfig GateConfig
 	signingKey []byte
+
+	nowFn          = time.Now
+	loginIPLimit   = 10
+	loginUserLimit = 5
+	loginWindow    = 15 * time.Minute
+	loginAttempts  = newAttemptLimiter()
 )
 
 func Run() {
@@ -223,12 +236,10 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Redirect to login
-	originalURI := r.Header.Get("X-Original-URI")
-	if originalURI == "" {
-		originalURI = "/"
-	}
-	loginURL := fmt.Sprintf("/__stacked/login?rd=%s", originalURI)
+	// Redirect to login. rd is query-escaped and already constrained
+	// to a local path so the login 302 cannot become an open redirect.
+	rd := safeLocalPath(r.Header.Get("X-Original-URI"))
+	loginURL := "/__stacked/login?rd=" + url.QueryEscape(rd)
 	http.Redirect(w, r, loginURL, http.StatusFound)
 }
 
@@ -242,11 +253,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodGet {
-		rd := r.URL.Query().Get("rd")
-		if rd == "" {
-			rd = "/"
-		}
-		renderLogin(w, gate.ServiceName, rd, "")
+		renderLogin(w, gate.ServiceName, safeLocalPath(r.URL.Query().Get("rd")), "")
 		return
 	}
 
@@ -255,25 +262,47 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// POST: validate credentials
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType != "application/x-www-form-urlencoded" {
+		http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBody)
 	if err := r.ParseForm(); err != nil {
 		renderLogin(w, gate.ServiceName, "/", "Invalid form data")
 		return
 	}
+
 	username := r.FormValue("username")
 	password := r.FormValue("password")
-	rd := r.FormValue("rd")
-	if rd == "" {
-		rd = "/"
+	rd := safeLocalPath(r.FormValue("rd"))
+
+	ip := clientIP(r)
+	userKey := loginUserKey(host, username)
+	now := nowFn()
+	if retry, ok := loginAttempts.blocked(ip, loginIPLimit, now); !ok {
+		renderRetry(w, gate.ServiceName, rd, retry)
+		return
+	}
+	if retry, ok := loginAttempts.blocked(userKey, loginUserLimit, now); !ok {
+		renderRetry(w, gate.ServiceName, rd, retry)
+		return
 	}
 
-	if username != gate.Username || bcrypt.CompareHashAndPassword([]byte(gate.PasswordHash), []byte(password)) != nil {
+	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(gate.Username)) == 1
+	passOK := bcrypt.CompareHashAndPassword([]byte(gate.PasswordHash), []byte(password)) == nil
+	if !userOK || !passOK {
+		loginAttempts.fail(ip, now)
+		loginAttempts.fail(userKey, now)
 		renderLogin(w, gate.ServiceName, rd, "Invalid username or password")
 		return
 	}
 
-	// Set session cookie
-	value := signCookie(host, time.Now())
+	loginAttempts.clear(ip)
+	loginAttempts.clear(userKey)
+
+	value := signCookie(host, now)
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    value,
@@ -297,6 +326,163 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/__stacked/login", http.StatusFound)
 }
 
+// --- Login hardening ---
+
+// safeLocalPath accepts only same-origin relative paths: a single leading
+// slash, no scheme, no host. Protocol-relative (//host), absolute URLs,
+// backslashes, and encoded equivalents collapse to "/".
+func safeLocalPath(rd string) string {
+	if rd == "" {
+		return "/"
+	}
+	if strings.IndexFunc(rd, func(r rune) bool {
+		return r < 0x20 || r == '\\'
+	}) >= 0 {
+		return "/"
+	}
+	if !strings.HasPrefix(rd, "/") || strings.HasPrefix(rd, "//") {
+		return "/"
+	}
+	u, err := url.Parse(rd)
+	if err != nil || u.IsAbs() || u.Scheme != "" || u.Host != "" || u.Opaque != "" || u.User != nil {
+		return "/"
+	}
+	if u.Path == "" || !strings.HasPrefix(u.Path, "/") || strings.HasPrefix(u.Path, "//") {
+		return "/"
+	}
+	if strings.ContainsAny(u.Path, "\\") {
+		return "/"
+	}
+	return u.RequestURI()
+}
+
+// clientIP prefers headers Caddy injects on the gate reverse_proxy hop.
+// X-Real-IP is set from {remote_host}; X-Forwarded-For is the last hop
+// Caddy appended. RemoteAddr is the fallback when the gate is hit directly.
+func clientIP(r *http.Request) string {
+	if ip := normalizeIP(r.Header.Get("X-Real-IP")); ip != "" {
+		return ip
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if ip := normalizeIP(parts[len(parts)-1]); ip != "" {
+			return ip
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func normalizeIP(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+func loginUserKey(host, username string) string {
+	if i := strings.LastIndex(host, ":"); i != -1 {
+		host = host[:i]
+	}
+	return strings.ToLower(host) + "\x00" + strings.ToLower(username)
+}
+
+type attemptBucket struct {
+	n    int
+	from time.Time
+}
+
+type attemptLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*attemptBucket
+}
+
+func newAttemptLimiter() *attemptLimiter {
+	return &attemptLimiter{buckets: make(map[string]*attemptBucket)}
+}
+
+func (l *attemptLimiter) blocked(key string, limit int, now time.Time) (time.Duration, bool) {
+	if key == "" || limit <= 0 {
+		return 0, true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.gcLocked(now)
+	b := l.buckets[key]
+	if b == nil || now.Sub(b.from) >= loginWindow {
+		return 0, true
+	}
+	if b.n >= limit {
+		left := loginWindow - now.Sub(b.from)
+		if left < time.Second {
+			left = time.Second
+		}
+		return left, false
+	}
+	return 0, true
+}
+
+func (l *attemptLimiter) fail(key string, now time.Time) {
+	if key == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.buckets[key]
+	if b == nil || now.Sub(b.from) >= loginWindow {
+		l.buckets[key] = &attemptBucket{n: 1, from: now}
+	} else {
+		b.n++
+	}
+	l.enforceCapLocked(now)
+}
+
+func (l *attemptLimiter) clear(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.buckets, key)
+}
+
+func (l *attemptLimiter) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buckets = make(map[string]*attemptBucket)
+}
+
+func (l *attemptLimiter) gcLocked(now time.Time) {
+	for k, b := range l.buckets {
+		if now.Sub(b.from) >= loginWindow {
+			delete(l.buckets, k)
+		}
+	}
+}
+
+func (l *attemptLimiter) enforceCapLocked(now time.Time) {
+	l.gcLocked(now)
+	for len(l.buckets) > maxLoginKeys {
+		var oldestKey string
+		var oldest time.Time
+		for k, b := range l.buckets {
+			if oldestKey == "" || b.from.Before(oldest) {
+				oldestKey = k
+				oldest = b.from
+			}
+		}
+		delete(l.buckets, oldestKey)
+	}
+}
+
 // --- Login Page ---
 
 var loginTmpl = template.Must(template.New("login").Parse(loginHTML))
@@ -307,9 +493,23 @@ type loginData struct {
 	Error       string
 }
 
+func renderRetry(w http.ResponseWriter, serviceName, rd string, retry time.Duration) {
+	secs := int(retry.Seconds() + 0.5)
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	renderLoginStatus(w, http.StatusTooManyRequests, serviceName, rd, "Too many attempts. Try again later.")
+}
+
 func renderLogin(w http.ResponseWriter, serviceName, rd, errMsg string) {
+	renderLoginStatus(w, http.StatusOK, serviceName, rd, errMsg)
+}
+
+func renderLoginStatus(w http.ResponseWriter, status int, serviceName, rd, errMsg string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
 	loginTmpl.Execute(w, loginData{
 		ServiceName: serviceName,
 		RedirectTo:  rd,
