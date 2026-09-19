@@ -12,12 +12,18 @@ import (
 )
 
 type Config struct {
-	Agent AgentConfig `toml:"agent"`
+	Agent   AgentConfig   `toml:"agent"`
+	Volumes VolumesConfig `toml:"volumes"`
 }
 
 type AgentConfig struct {
 	Token  string `toml:"token"`
 	Server string `toml:"server"`
+}
+
+// VolumesConfig is machine-local only. The dashboard cannot widen it.
+type VolumesConfig struct {
+	AllowedHostRoots []string `toml:"allowed_host_roots"`
 }
 
 const defaultConfigPath = "/opt/stacked/agent.toml"

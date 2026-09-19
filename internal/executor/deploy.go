@@ -143,8 +143,8 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// Materialize managed file mounts only after the image is ready, but before
 	// Compose can start the container. Their plaintext never enters the payload
 	// or logs.
-	volumeMounts := parseVolumes(op.Payload)
-	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
+	volumeMounts, err := prepareHostVolumeMounts(op.Payload, streamer.AddLine)
+	if err != nil {
 		return nil, fail(err)
 	}
 	fileMounts, err := e.prepareFileMounts(op, serviceID)

@@ -69,6 +69,22 @@ Install Tailscale with the [upstream package](https://tailscale.com/kb/1031/inst
 
 Managed databases default to **internal** (reachable only on the Docker `stacked` network — no host port). A missing or unknown access mode is treated the same way. Publishing on `0.0.0.0` requires an explicit `public` access mode. The agent does not manage a host firewall; if you use public mode, restrict the port with your cloud security group or an external firewall. Tailnet mode binds only to a validated Tailscale IP.
 
+## Custom host bind mounts
+
+Managed volumes under `/opt/stacked/data/services/` are always allowed.
+
+Any other `hostPath` is rejected unless this machine explicitly allowlists the host root. Dashboard settings cannot widen that set.
+
+```toml
+# /opt/stacked/agent.toml
+[volumes]
+allowed_host_roots = ["/srv/stacked", "/mnt/data"]
+```
+
+Or set `STACKED_ALLOWED_VOLUME_ROOTS=/srv/stacked:/mnt/data` in the systemd unit. Then restart the agent.
+
+Critical paths (`/`, `/etc`, `/proc`, `/sys`, `/dev`, `/run`, Docker/containerd sockets and state, `/opt/stacked` control files) stay blocked even if you allowlist `/`. Allowlisting `/` is treated as root-equivalent and is logged as a warning.
+
 ## Managing the service
 
 ```bash

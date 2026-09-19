@@ -157,6 +157,36 @@ server = "http://example.com"
 	}
 }
 
+func TestLoad_VolumesAllowlist(t *testing.T) {
+	t.Setenv(AllowInsecureHTTPEnv, "")
+	cfg := loadTOML(t, `
+[agent]
+token = "stk_testtoken"
+server = "https://stacked.example/"
+
+[volumes]
+allowed_host_roots = ["/srv/data", "/mnt/storage"]
+`)
+	if cfg.Agent.Server != "https://stacked.example" {
+		t.Fatalf("server = %q", cfg.Agent.Server)
+	}
+	if len(cfg.Volumes.AllowedHostRoots) != 2 || cfg.Volumes.AllowedHostRoots[0] != "/srv/data" {
+		t.Fatalf("allowlist = %#v", cfg.Volumes.AllowedHostRoots)
+	}
+}
+
+func TestLoad_VolumesOptional(t *testing.T) {
+	t.Setenv(AllowInsecureHTTPEnv, "")
+	cfg := loadTOML(t, `
+[agent]
+token = "stk_testtoken"
+server = "https://stacked.example"
+`)
+	if len(cfg.Volumes.AllowedHostRoots) != 0 {
+		t.Fatalf("expected empty allowlist, got %#v", cfg.Volumes.AllowedHostRoots)
+	}
+}
+
 func loadTOML(t *testing.T, body string) *Config {
 	t.Helper()
 	cfg, err := loadTOMLErr(t, body)

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -47,6 +48,13 @@ func main() {
 	}
 
 	log.Printf("Server: %s", cfg.Agent.Server)
+
+	if err := executor.SetAllowedHostRoots(cfg.Volumes.AllowedHostRoots); err != nil {
+		log.Fatalf("Invalid volumes.allowed_host_roots: %v", err)
+	}
+	if roots := cfg.Volumes.AllowedHostRoots; len(roots) > 0 {
+		log.Printf("Custom volume roots allowlisted: %s", strings.Join(roots, ", "))
+	}
 
 	c := client.New(cfg.Agent.Server, cfg.Agent.Token)
 	// Record the server origin for on-demand TLS `ask` URL rendering
