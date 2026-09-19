@@ -18,6 +18,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/dockerlogs"
+	"github.com/stackedapp/stacked/agent/internal/ids"
 )
 
 const (
@@ -29,12 +30,12 @@ const (
 	// container spamming megabyte log lines. The server independently
 	// truncates as well; this is just a courtesy.
 	maxLineBytes = 8 * 1024
-
-	// Where we persist per-service resume cursors. Surviving a brief agent
-	// restart without replaying the entire log history is the only goal —
-	// best-effort, not authoritative.
-	logsRootDir = "/opt/stacked/logs"
 )
+
+// Where we persist per-service resume cursors. Surviving a brief agent
+// restart without replaying the entire log history is the only goal —
+// best-effort, not authoritative. Overridable in tests.
+var logsRootDir = "/opt/stacked/logs"
 
 // Forwarder runs `docker logs -f --timestamps` for one container and pushes
 // batched lines to the server. Stop via Stop().
@@ -258,14 +259,23 @@ func splitTimestamp(raw string) (ts, rest string) {
 }
 
 // cursorPath returns the on-disk file used to persist the last-seen
-// timestamp for this service.
-func (f *Forwarder) cursorPath() string {
-	return filepath.Join(logsRootDir, f.serviceID, ".cursor")
+// timestamp for this service. ok is false when serviceID is not a confined
+// UUID child of logsRootDir — callers must not create or write that path.
+func (f *Forwarder) cursorPath() (string, bool) {
+	dir, err := ids.Child(logsRootDir, f.serviceID)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Join(dir, ".cursor"), true
 }
 
 // readCursor returns the persisted resume timestamp or empty string if none.
 func (f *Forwarder) readCursor() string {
-	data, err := os.ReadFile(f.cursorPath())
+	path, ok := f.cursorPath()
+	if !ok {
+		return ""
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
@@ -287,12 +297,17 @@ func (f *Forwarder) writeCursor() {
 		return
 	}
 
-	dir := filepath.Dir(f.cursorPath())
+	path, ok := f.cursorPath()
+	if !ok {
+		log.Printf("runtimelogs[%s]: refusing cursor path for invalid serviceId", f.serviceID)
+		return
+	}
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Printf("runtimelogs[%s]: cursor mkdir: %v", f.serviceID, err)
 		return
 	}
-	if err := os.WriteFile(f.cursorPath(), []byte(ts), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(ts), 0o644); err != nil {
 		log.Printf("runtimelogs[%s]: cursor write: %v", f.serviceID, err)
 	}
 }

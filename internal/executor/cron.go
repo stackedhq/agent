@@ -111,9 +111,9 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 }
 
 func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, error) {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return nil, fmt.Errorf("cron_run requires serviceId in payload")
+	serviceID, err := requireServiceID(op.Payload, "cron_run")
+	if err != nil {
+		return nil, err
 	}
 
 	command := getStringPayload(op.Payload, "command")
@@ -150,7 +150,10 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		))
 	}
 
-	dir := serviceDir(serviceID)
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return fail(err)
+	}
 	if err := ensureDir(dir); err != nil {
 		return fail(fmt.Errorf("create service dir: %w", err))
 	}
