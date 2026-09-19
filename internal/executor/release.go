@@ -76,7 +76,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 	if err != nil {
 		return fail(err)
 	}
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return fail(fmt.Errorf("create service dir: %w", err))
 	}
 
@@ -120,7 +120,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return fail(fmt.Errorf("write .env: %w", err))
 	}
 

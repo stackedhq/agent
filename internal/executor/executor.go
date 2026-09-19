@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/ids"
@@ -200,8 +201,18 @@ func (e *Executor) runCommand(operationID, dir, name string, args ...string) err
 // runCommandWithStreamer executes a command using an existing streamer,
 // so all commands in a deploy share the same log stream and progress state.
 func (e *Executor) runCommandWithStreamer(streamer *logs.Streamer, dir, name string, args ...string) error {
+	return e.runCommandWithEnv(streamer, dir, nil, name, args...)
+}
+
+// runCommandWithEnv is runCommandWithStreamer plus extra environment
+// entries. Use this when a secret must reach a child process without
+// appearing in argv (visible in /proc/<pid>/cmdline).
+func (e *Executor) runCommandWithEnv(streamer *logs.Streamer, dir string, extraEnv []string, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
+	if len(extraEnv) > 0 {
+		cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -222,6 +233,36 @@ func (e *Executor) runCommandWithStreamer(streamer *logs.Streamer, dir, name str
 	return nil
 }
 
+// mergeEnv overlays extra KEY=VALUE pairs onto base, last extra wins.
+func mergeEnv(base, extra []string) []string {
+	replace := make(map[string]string, len(extra))
+	order := make([]string, 0, len(extra))
+	for _, kv := range extra {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if _, seen := replace[k]; !seen {
+			order = append(order, k)
+		}
+		replace[k] = v
+	}
+	out := make([]string, 0, len(base)+len(extra))
+	for _, kv := range base {
+		k, _, ok := strings.Cut(kv, "=")
+		if ok {
+			if _, hit := replace[k]; hit {
+				continue
+			}
+		}
+		out = append(out, kv)
+	}
+	for _, k := range order {
+		out = append(out, k+"="+replace[k])
+	}
+	return out
+}
+
 // runCommandSilent executes a command and returns its combined output.
 func runCommandSilent(dir, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
@@ -230,17 +271,51 @@ func runCommandSilent(dir, name string, args ...string) (string, error) {
 	return string(out), err
 }
 
-// ensureDir creates a directory if it doesn't exist.
+const (
+	publicDirMode  os.FileMode = 0o755
+	publicFileMode os.FileMode = 0o644
+	secretDirMode  os.FileMode = 0o700
+	secretFileMode os.FileMode = 0o600
+)
+
+// ensureDir creates a public directory (0755). Existing dirs are left
+// alone so a later public write cannot widen a secret-bearing parent.
 func ensureDir(path string) error {
-	return os.MkdirAll(path, 0755)
+	return os.MkdirAll(path, publicDirMode)
 }
 
-// writeFile writes content to a file, creating parent dirs as needed.
+// ensureSecretDir creates a directory that will hold credentials (0700)
+// and tightens an existing world-readable one.
+func ensureSecretDir(path string) error {
+	if err := os.MkdirAll(path, secretDirMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, secretDirMode)
+}
+
+// writeFile writes public/config content as 0644. Parent dirs are created
+// 0755 only when missing; an existing 0700 secret parent is preserved.
 func writeFile(path, content string) error {
 	if err := ensureDir(filepath.Dir(path)); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(content), 0644)
+	return writeFileMode(path, content, publicFileMode)
+}
+
+// writeSecretFile writes credential-bearing content as 0600 under a 0700 parent.
+func writeSecretFile(path, content string) error {
+	if err := ensureSecretDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	return writeFileMode(path, content, secretFileMode)
+}
+
+func writeFileMode(path, content string, mode os.FileMode) error {
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		return err
+	}
+	// WriteFile honors umask on create and does not chmod an existing file.
+	return os.Chmod(path, mode)
 }
 
 // ensureRegularFile guarantees `path` exists as a regular file. If it's

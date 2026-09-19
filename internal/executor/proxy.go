@@ -949,14 +949,14 @@ func reconcileGate(parsed []cachedDomain) error {
 	needsGate := len(cfg.Domains) > 0
 
 	if needsGate {
-		if err := ensureDir(gateDir); err != nil {
+		if err := ensureSecretDir(gateDir); err != nil {
 			return fmt.Errorf("create gate dir: %w", err)
 		}
 		data, err := json.MarshalIndent(cfg, "", "  ")
 		if err != nil {
 			return err
 		}
-		if err := writeFile(gateConfigPath, string(data)); err != nil {
+		if err := writeSecretFile(gateConfigPath, string(data)); err != nil {
 			return fmt.Errorf("write gate config: %w", err)
 		}
 	}

@@ -69,7 +69,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}
 
@@ -134,7 +134,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return nil, fail(fmt.Errorf("write .env: %w", err))
 	}
 
@@ -294,7 +294,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}
 
@@ -315,7 +315,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return nil, fail(fmt.Errorf("write .env: %w", err))
 	}
 

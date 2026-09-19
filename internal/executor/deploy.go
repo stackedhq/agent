@@ -28,7 +28,7 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}
 
@@ -106,14 +106,14 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	if len(creds.EnvVars) > 0 {
 		envContent := buildEnvFile(creds.EnvVars)
 		envPath := filepath.Join(dir, ".env")
-		if err := writeFile(envPath, envContent); err != nil {
+		if err := writeSecretFile(envPath, envContent); err != nil {
 			return nil, fail(fmt.Errorf("write .env: %w", err))
 		}
 	} else {
 		// Ensure .env exists (docker compose requires it with env_file directive)
 		envPath := filepath.Join(dir, ".env")
 		if _, err := os.Stat(envPath); os.IsNotExist(err) {
-			if err := writeFile(envPath, ""); err != nil {
+			if err := writeSecretFile(envPath, ""); err != nil {
 				return nil, fail(fmt.Errorf("write .env: %w", err))
 			}
 		}
@@ -228,27 +228,37 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 			return "", fmt.Errorf("no git clone URL available")
 		}
 	}
+	remote := parseGitRemote(gitRepo)
+	auth, err := startGitAuth(remote)
+	if err != nil {
+		return "", fmt.Errorf("git auth: %w", err)
+	}
+	defer auth.Close()
 
 	// Phase: Git clone/pull (2%)
 	streamer.SetProgress(2)
 	streamer.AddLine("Cloning repository...")
 	streamer.Flush()
 
-	// Clone or pull
+	// Clone or pull. The URL on argv is always the credential-free form;
+	// GIT_ASKPASS supplies the token for the duration of this call only.
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(err) {
 		log.Printf("Cloning into %s", repoDir)
-		if err := e.runCommandWithStreamer(streamer, dir, "git", "clone", "--branch", gitBranch, "--single-branch", gitRepo, "repo"); err != nil {
+		if err := e.runCommandWithEnv(streamer, dir, auth.env(), "git", "clone", "--branch", gitBranch, "--single-branch", remote.CleanURL, "repo"); err != nil {
 			return "", fmt.Errorf("git clone: %w", err)
 		}
 	} else {
 		log.Printf("Pulling latest for %s", serviceID)
-		_, _ = runCommandSilent(repoDir, "git", "remote", "set-url", "origin", gitRepo)
-		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "fetch", "origin"); err != nil {
+		_ = sanitizeGitRemote(repoDir, remote.CleanURL)
+		if err := e.runCommandWithEnv(streamer, repoDir, auth.env(), "git", "fetch", "origin"); err != nil {
 			return "", fmt.Errorf("git fetch: %w", err)
 		}
 		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "reset", "--hard", "origin/"+gitBranch); err != nil {
 			return "", fmt.Errorf("git reset: %w", err)
 		}
+	}
+	if err := sanitizeGitRemote(repoDir, remote.CleanURL); err != nil {
+		return "", err
 	}
 
 	// Checkout specific commit if requested
@@ -266,22 +276,36 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 	imageName := "stacked-" + serviceID
 	log.Printf("Building image with Nixpacks for %s", serviceID)
 
-	nixpacksArgs := []string{"build", repoDir, "--name", imageName}
-	if buildCommand != "" {
-		nixpacksArgs = append(nixpacksArgs, "--build-cmd", buildCommand)
-	}
-	if startCommand != "" {
-		nixpacksArgs = append(nixpacksArgs, "--start-cmd", startCommand)
-	}
-	for k, v := range creds.EnvVars {
-		nixpacksArgs = append(nixpacksArgs, "--env", k+"="+v)
-	}
-
-	if err := e.runCommandWithStreamer(streamer, dir, "nixpacks", nixpacksArgs...); err != nil {
+	nixpacksArgs, nixpacksEnv := nixpacksBuildArgs(repoDir, imageName, buildCommand, startCommand, creds.EnvVars)
+	if err := e.runCommandWithEnv(streamer, dir, nixpacksEnv, "nixpacks", nixpacksArgs...); err != nil {
 		return "", fmt.Errorf("nixpacks build: %w", err)
 	}
 
 	return imageName, nil
+}
+
+// nixpacksBuildArgs builds the nixpacks CLI. Values are passed via the
+// process environment and referenced as `--env KEY` (no `KEY=value` on
+// argv). Nixpacks pulls the value from the current environment when the
+// equals sign is omitted.
+func nixpacksBuildArgs(repoDir, imageName, buildCommand, startCommand string, vars map[string]string) (args, extraEnv []string) {
+	args = []string{"build", repoDir, "--name", imageName}
+	if buildCommand != "" {
+		args = append(args, "--build-cmd", buildCommand)
+	}
+	if startCommand != "" {
+		args = append(args, "--start-cmd", startCommand)
+	}
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "--env", k)
+		extraEnv = append(extraEnv, k+"="+vars[k])
+	}
+	return args, extraEnv
 }
 
 // buildEnvFile creates a .env file content from a key-value map, consumed
