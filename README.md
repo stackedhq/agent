@@ -57,7 +57,7 @@ Get your token from the Stacked dashboard under **Machines → Add Machine**.
 | `restart` | `docker compose restart`, falls back to `up -d` if containers are missing |
 | `setup` | Verify Docker, create network, start Caddy |
 | `proxy_config` | Regenerate Caddyfile, reload Caddy |
-| `self_update` | Download new binary, replace, restart |
+| `self_update` | Download signed release, verify checksum + signature, replace, restart |
 
 ## Managing the service
 
@@ -77,7 +77,7 @@ systemctl status stacked-agent
 
 ## Releasing
 
-Tag and push — GitHub Actions builds binaries and creates a release:
+Tag and push — GitHub Actions builds binaries, publishes `SHA256SUMS` + an Ed25519 signature + Sigstore provenance, and creates a release. See [docs/releasing.md](docs/releasing.md).
 
 ```bash
 git tag v0.6.5
