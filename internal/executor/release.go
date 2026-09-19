@@ -34,9 +34,9 @@ import (
 // path can resolve image, env, network, etc. exactly the same way as
 // the deploy executor.
 func (e *Executor) ReleaseCommand(op client.Operation) error {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return fmt.Errorf("release_command requires serviceId in payload")
+	serviceID, err := requireServiceID(op.Payload, "release_command")
+	if err != nil {
+		return err
 	}
 
 	releaseCmd := getStringPayload(op.Payload, "releaseCommand")
@@ -72,8 +72,11 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 	// we have to clone + nixpacks-build before we can run the command —
 	// the build is identical to what the deploy op will do, and docker's
 	// layer cache makes the second build (in the deploy op) ~instant.
-	dir := serviceDir(serviceID)
-	if err := ensureDir(dir); err != nil {
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return fail(err)
+	}
+	if err := ensureSecretDir(dir); err != nil {
 		return fail(fmt.Errorf("create service dir: %w", err))
 	}
 
@@ -117,7 +120,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return fail(fmt.Errorf("write .env: %w", err))
 	}
 
@@ -128,26 +131,17 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		return fail(err)
 	}
 
-	// Make sure the stacked network exists — the migration command may
-	// need to reach the user's database container, which sits on it.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	iso := isolationFromPayload(op.Payload)
+	nets := networkPlanFromPayload(serviceID, op.Payload, creds.NetworkAliases)
 
 	streamer.SetProgress(70)
 	streamer.AddLine("Running release command: " + releaseCmd)
 	streamer.Flush()
 
-	// `--rm` so the container doesn't pile up. `--network=stacked` lets
-	// the command reach managed databases. `sh -lc` so users can write
-	// shell pipelines / && chains naturally.
-	args := []string{
-		"run", "--rm",
-		"--network=stacked",
-		"--env-file=" + envPath,
-		"--name", serviceID + "-release",
-	}
-	args = append(args, fileMountDockerArgs(fileMounts)...)
-	args = append(args, imageName, "sh", "-lc", releaseCmd)
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", args...); err != nil {
+	// One-shot on the service's isolation networks so migrations reach
+	// the same databases as the app. `sh -lc` so users can write shell
+	// pipelines / && chains naturally.
+	if err := e.runOneShotContainer(streamer, dir, serviceID+"-release", imageName, envPath, iso, nets, fileMountDockerArgs(fileMounts), []string{"sh", "-lc", releaseCmd}); err != nil {
 		return fail(fmt.Errorf("release command failed: %w", err))
 	}
 

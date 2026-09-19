@@ -1,0 +1,256 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to regenerate release notes for (e.g. v0.6.18)'
+        required: true
+
+# Default deny. Individual jobs grant the minimum they need so release-note
+# generation never sees signing material or contents:write.
+permissions: {}
+
+jobs:
+  build:
+    name: Build & Vet
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25'
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build (linux/amd64)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/stacked-agent-linux-amd64 ./cmd/agent
+
+      - name: Build (linux/arm64)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/stacked-agent-linux-arm64 ./cmd/agent
+
+  artifacts:
+    name: Signed artifacts
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25'
+
+      - name: Determine tag
+        id: tags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CURRENT="${{ github.event.inputs.tag }}"
+          else
+            CURRENT="${GITHUB_REF_NAME}"
+          fi
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        run: make build VERSION=${TAG#v}
+        env:
+          TAG: ${{ steps.tags.outputs.current }}
+
+      - name: Checksums and sign
+        env:
+          AGENT_RELEASE_SIGNING_KEY: ${{ secrets.AGENT_RELEASE_SIGNING_KEY }}
+        run: |
+          chmod +x scripts/sign-release.sh
+          cd dist
+          sha256sum stacked-agent-linux-amd64 stacked-agent-linux-arm64 > SHA256SUMS
+          ../scripts/sign-release.sh SHA256SUMS SHA256SUMS.sig
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/stacked-agent-linux-amd64
+            dist/stacked-agent-linux-arm64
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-binaries
+          path: |
+            dist/stacked-agent-linux-amd64
+            dist/stacked-agent-linux-arm64
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+          if-no-files-found: error
+
+  release-notes:
+    name: Release notes
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Determine tag range
+        id: tags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CURRENT="${{ github.event.inputs.tag }}"
+          else
+            CURRENT="${GITHUB_REF_NAME}"
+          fi
+          PREV=$(git tag --sort=-v:refname | grep -E '^v' | grep -v "^${CURRENT}$" | head -1)
+          if [ -z "$PREV" ]; then
+            PREV=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "previous=${PREV}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync release-notes instructions from main
+        # When dispatched against an old tag, that tag's tree may not contain
+        # the instructions file. Always pull the latest version from main so
+        # the AI step has the up-to-date style guide regardless of which tag
+        # we're regenerating.
+        run: |
+          git fetch origin main --depth=1
+          git checkout origin/main -- .github/release-notes-instructions.md || true
+
+      - name: Generate AI release notes
+        id: ai_notes
+        continue-on-error: true
+        uses: github/copilot-release-notes@29ba181a86b88f3acee62a03369033edfa982ab9 # v1.0.3
+        with:
+          base-ref: ${{ steps.tags.outputs.previous }}
+          head-ref: ${{ steps.tags.outputs.current }}
+          model: gpt-4.1
+          instructions: .github/release-notes-instructions.md
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+
+      - name: Build release notes (with fallback)
+        env:
+          PREV: ${{ steps.tags.outputs.previous }}
+          CURRENT: ${{ steps.tags.outputs.current }}
+          AI_OUTCOME: ${{ steps.ai_notes.outcome }}
+        run: |
+          AI_NOTES=$(cat <<'AINOTES_EOF'
+          ${{ steps.ai_notes.outputs.release-notes }}
+          AINOTES_EOF
+          )
+
+          # Detect REQUIRES-REINSTALL across the commit range so it survives
+          # even if the AI step failed or omitted it. The token only counts
+          # when it sits on its own line in a commit body — same rule the
+          # dashboard uses (see stacked/src/lib/agent-version.ts). A bare
+          # substring match catches negated mentions like
+          # `No REQUIRES-REINSTALL: install.sh unchanged` and produces false
+          # positives, so anchor to line boundaries here too.
+          if git log --format=%B "${PREV}..${CURRENT}" 2>/dev/null | grep -qE '^[[:space:]]*REQUIRES-REINSTALL[[:space:]]*$'; then
+            REINSTALL=1
+          else
+            REINSTALL=0
+          fi
+
+          if [ -n "$(echo "$AI_NOTES" | tr -d '[:space:]')" ] && [ "$AI_OUTCOME" = "success" ]; then
+            echo "Using AI-generated notes"
+            printf '%s\n' "$AI_NOTES" > /tmp/release-notes.md
+          else
+            echo "AI notes unavailable, falling back to commit list"
+            if [ -z "$PREV" ]; then
+              git log --pretty=format:"- %s" HEAD > /tmp/release-notes.md
+            else
+              git log --pretty=format:"- %s" "${PREV}..${CURRENT}" > /tmp/release-notes.md
+            fi
+          fi
+
+          # Ensure REQUIRES-REINSTALL token is present if any commit in range had it.
+          if [ "$REINSTALL" = "1" ] && ! grep -q "REQUIRES-REINSTALL" /tmp/release-notes.md; then
+            printf '\n\nREQUIRES-REINSTALL\n' >> /tmp/release-notes.md
+          fi
+
+          echo "" >> /tmp/release-notes.md
+          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV}...${CURRENT}" >> /tmp/release-notes.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes
+          path: /tmp/release-notes.md
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [artifacts, release-notes]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Determine tag
+        id: tags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CURRENT="${{ github.event.inputs.tag }}"
+          else
+            CURRENT="${GITHUB_REF_NAME}"
+          fi
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+
+      - name: Download signed artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: agent-binaries
+          path: dist
+
+      - name: Download release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-notes
+          path: /tmp/notes
+
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ steps.tags.outputs.current }}
+          name: ${{ steps.tags.outputs.current }}
+          body_path: /tmp/notes/release-notes.md
+          files: |
+            dist/stacked-agent-linux-amd64
+            dist/stacked-agent-linux-arm64
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig

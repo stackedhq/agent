@@ -14,6 +14,7 @@ import (
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/dockerlogs"
+	"github.com/stackedapp/stacked/agent/internal/ids"
 )
 
 const (
@@ -21,11 +22,12 @@ const (
 	maxBatchSize  = 50
 
 	maxLineBytes = 8 * 1024
-
-	// Cursors live alongside the per-database working dir's sibling tree
-	// so they're easy to wipe with the database itself if it's destroyed.
-	logsRootDir = "/opt/stacked/logs/db"
 )
+
+// Cursors live alongside the per-database working dir's sibling tree
+// so they're easy to wipe with the database itself if it's destroyed.
+// Overridable in tests.
+var logsRootDir = "/opt/stacked/logs/db"
 
 // Forwarder runs `docker logs -f --timestamps` for one database container
 // and pushes batched lines to the server. Stop via Stop().
@@ -193,12 +195,20 @@ func splitTimestamp(raw string) (ts, rest string) {
 	return candidate, raw[idx+1:]
 }
 
-func (f *Forwarder) cursorPath() string {
-	return filepath.Join(logsRootDir, f.databaseID, ".cursor")
+func (f *Forwarder) cursorPath() (string, bool) {
+	dir, err := ids.Child(logsRootDir, f.databaseID)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Join(dir, ".cursor"), true
 }
 
 func (f *Forwarder) readCursor() string {
-	data, err := os.ReadFile(f.cursorPath())
+	path, ok := f.cursorPath()
+	if !ok {
+		return ""
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
@@ -217,12 +227,17 @@ func (f *Forwarder) writeCursor() {
 		return
 	}
 
-	dir := filepath.Dir(f.cursorPath())
+	path, ok := f.cursorPath()
+	if !ok {
+		log.Printf("databaselogs[%s]: refusing cursor path for invalid databaseId", f.databaseID)
+		return
+	}
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Printf("databaselogs[%s]: cursor mkdir: %v", f.databaseID, err)
 		return
 	}
-	if err := os.WriteFile(f.cursorPath(), []byte(ts), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(ts), 0o644); err != nil {
 		log.Printf("databaselogs[%s]: cursor write: %v", f.databaseID, err)
 	}
 }

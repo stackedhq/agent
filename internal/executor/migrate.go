@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -121,10 +122,12 @@ func (e *Executor) DBMigrate(op client.Operation) error {
 //
 // Source contents are read-only (mounted ro). Target is recreated on every
 // run for idempotent retries.
+//
+// The source path is never taken from the operation payload alone. Paths
+// come from the migration-target identity (GetMigrationCredentials) and
+// must then be a bind-mount of that Dokploy container or sit under a
+// narrowly configured migration root.
 func (e *Executor) VolumeMigrate(op client.Operation) error {
-	srcPath := getStringPayload(op.Payload, "sourceVolumePath")
-	tgtPath := getStringPayload(op.Payload, "targetVolumePath")
-
 	streamer := logs.NewStreamer(e.Client, op.ID)
 	fail := func(err error) error {
 		streamer.AddLine("ERROR: " + err.Error())
@@ -132,11 +135,32 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 		return err
 	}
 
+	targetID := getStringPayload(op.Payload, "migrationTargetId")
+	if targetID == "" {
+		return fail(fmt.Errorf("volume_migrate requires migrationTargetId"))
+	}
+	creds, err := e.Client.GetMigrationCredentials(targetID)
+	if err != nil {
+		return fail(fmt.Errorf("fetch migration credentials: %w", err))
+	}
+	srcPath, tgtPath, srcContainer, err := resolveVolumeMigrateIdentity(op.Payload, creds)
+	if err != nil {
+		return fail(err)
+	}
+
 	cleanSrcPath, cleanTgtPath, err := validateMigratePaths(srcPath, tgtPath)
 	if err != nil {
 		return fail(err)
 	}
-	srcPath = cleanSrcPath
+
+	bindSources, err := inspectContainerBindMounts(srcContainer)
+	if err != nil {
+		return fail(fmt.Errorf("inspect source container %s mounts: %w", srcContainer, err))
+	}
+	srcPath, err = authorizeMigrateSource(cleanSrcPath, volumeMigrateRoots(), bindSources)
+	if err != nil {
+		return fail(err)
+	}
 	tgtPath = cleanTgtPath
 
 	streamer.SetProgress(0)
@@ -163,6 +187,7 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 		if err := copyFile(srcPath, tgtPath); err != nil {
 			return fail(fmt.Errorf("copy file: %w", err))
 		}
+		lockManagedParentIfAny(tgtPath)
 		streamer.SetProgress(100)
 		streamer.AddLine("Volume file copy complete.")
 		streamer.Flush()
@@ -200,6 +225,8 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 		return fail(fmt.Errorf("alpine cp: %w", err))
 	}
 
+	lockManagedParentIfAny(tgtPath)
+
 	streamer.SetProgress(100)
 	streamer.AddLine("Volume migration complete.")
 	streamer.Flush()
@@ -207,11 +234,12 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 }
 
 // validateMigratePaths returns cleaned source and target paths after
-// enforcing the agent-side security boundary for volume migrations. The
-// source is read-only, so it only needs to be a sane absolute path. The
-// target is destructive (RemoveAll + writable docker mount), so it must stay
-// inside Stacked's managed volume namespace both lexically and after resolving
-// symlinks in the existing path prefix.
+// enforcing the lexical agent-side security boundary for volume migrations.
+// The source is further authorized by authorizeMigrateSource (resolved path
+// must be a proven container bind-mount or under a configured migration root).
+// The target is destructive (RemoveAll + writable docker mount), so it must
+// stay inside Stacked's managed volume namespace both lexically and after
+// resolving symlinks in the existing path prefix.
 func validateMigratePaths(srcPath, tgtPath string) (string, string, error) {
 	return validateMigratePathsWithRoot(srcPath, tgtPath, managedVolumeRoot)
 }
@@ -220,6 +248,9 @@ func validateMigratePathsWithRoot(srcPath, tgtPath, managedRoot string) (string,
 	cleanSrc, err := cleanMigratePath("source", srcPath)
 	if err != nil {
 		return "", "", err
+	}
+	if isDeniedMigrateSource(cleanSrc) {
+		return "", "", fmt.Errorf("volume_migrate source path %s is not an allowed migration source", cleanSrc)
 	}
 	cleanTgt, err := cleanMigratePath("target", tgtPath)
 	if err != nil {
@@ -301,6 +332,244 @@ func resolveExistingPathPrefix(path string) (string, error) {
 		}
 		current = parent
 	}
+}
+
+const volumeMigrateRootsEnv = "STACKED_VOLUME_MIGRATE_ROOTS"
+
+func defaultVolumeMigrateRoots() []string {
+	return []string{"/etc/dokploy", "/var/lib/dokploy"}
+}
+
+func volumeMigrateRoots() []string {
+	raw := strings.TrimSpace(os.Getenv(volumeMigrateRootsEnv))
+	if raw == "" {
+		return defaultVolumeMigrateRoots()
+	}
+	var roots []string
+	for _, part := range strings.Split(raw, ":") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		cleaned, err := cleanMigratePath("source", part)
+		if err != nil || isDeniedMigrateSource(cleaned) {
+			continue
+		}
+		roots = append(roots, cleaned)
+	}
+	return roots
+}
+
+func resolveVolumeMigrateIdentity(payload map[string]interface{}, creds *client.MigrationCredentials) (srcPath, tgtPath, srcContainer string, err error) {
+	if creds == nil {
+		return "", "", "", fmt.Errorf("volume_migrate missing migration credentials")
+	}
+	if creds.Kind != "volume" {
+		return "", "", "", fmt.Errorf("volume_migrate target is not kind=volume (got %q)", creds.Kind)
+	}
+
+	srcPath, err = bindMigrateIdentityPath("source", creds.SourcePath, getStringPayload(payload, "sourceVolumePath"))
+	if err != nil {
+		return "", "", "", err
+	}
+	tgtPath, err = bindMigrateIdentityPath("target", creds.TargetPath, getStringPayload(payload, "targetVolumePath"))
+	if err != nil {
+		return "", "", "", err
+	}
+
+	if creds.Source != nil {
+		srcContainer = strings.TrimSpace(creds.Source.ContainerName)
+	}
+	payloadContainer := strings.TrimSpace(getStringPayload(payload, "sourceContainerName"))
+	if payloadContainer != "" && srcContainer != "" && payloadContainer != srcContainer {
+		return "", "", "", fmt.Errorf("volume_migrate source container does not match migration target identity")
+	}
+	return srcPath, tgtPath, srcContainer, nil
+}
+
+func bindMigrateIdentityPath(kind, credPath, payloadPath string) (string, error) {
+	credPath = strings.TrimSpace(credPath)
+	payloadPath = strings.TrimSpace(payloadPath)
+	if credPath == "" && payloadPath == "" {
+		return "", fmt.Errorf("volume_migrate requires %s path from migration credentials", kind)
+	}
+	if credPath == "" {
+		return payloadPath, nil
+	}
+	if payloadPath == "" {
+		return credPath, nil
+	}
+	cleanCred, err := cleanMigratePath(kind, credPath)
+	if err != nil {
+		return "", err
+	}
+	cleanPayload, err := cleanMigratePath(kind, payloadPath)
+	if err != nil {
+		return "", err
+	}
+	if cleanCred != cleanPayload {
+		return "", fmt.Errorf("volume_migrate %s path does not match migration target identity", kind)
+	}
+	return cleanCred, nil
+}
+
+func authorizeMigrateSource(srcPath string, roots, bindSources []string) (string, error) {
+	cleanSrc, err := cleanMigratePath("source", srcPath)
+	if err != nil {
+		return "", err
+	}
+	if isDeniedMigrateSource(cleanSrc) {
+		return "", fmt.Errorf("volume_migrate source path %s is not an allowed migration source", cleanSrc)
+	}
+
+	info, err := os.Lstat(cleanSrc)
+	if err != nil {
+		return "", fmt.Errorf("stat source %s: %w", cleanSrc, err)
+	}
+	if err := rejectUnsafeSourceFile(cleanSrc, info); err != nil {
+		return "", err
+	}
+
+	resolved, err := filepath.EvalSymlinks(cleanSrc)
+	if err != nil {
+		return "", fmt.Errorf("resolve source path %s: %w", cleanSrc, err)
+	}
+	resolved = filepath.Clean(resolved)
+	if isDeniedMigrateSource(resolved) {
+		return "", fmt.Errorf("volume_migrate source path %s resolves to disallowed path %s", cleanSrc, resolved)
+	}
+	resolvedInfo, err := os.Lstat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat resolved source %s: %w", resolved, err)
+	}
+	if err := rejectUnsafeSourceFile(resolved, resolvedInfo); err != nil {
+		return "", err
+	}
+
+	allowed := append(resolvedAllowedPaths(roots), resolvedAllowedPaths(bindSources)...)
+	if !isPathUnderAny(resolved, allowed) {
+		return "", fmt.Errorf("volume_migrate source path %s is not a mount of the selected container or under an allowed migration root", resolved)
+	}
+	return resolved, nil
+}
+
+func rejectUnsafeSourceFile(path string, info os.FileInfo) error {
+	mode := info.Mode()
+	switch {
+	case mode&os.ModeSocket != 0:
+		return fmt.Errorf("volume_migrate source path %s is a socket", path)
+	case mode&os.ModeDevice != 0, mode&os.ModeCharDevice != 0:
+		return fmt.Errorf("volume_migrate source path %s is a device", path)
+	case mode&os.ModeNamedPipe != 0:
+		return fmt.Errorf("volume_migrate source path %s is a named pipe", path)
+	case mode&os.ModeSymlink != 0:
+		return nil
+	case info.IsDir(), mode.IsRegular():
+		return nil
+	default:
+		return fmt.Errorf("volume_migrate source path %s has unsupported file type", path)
+	}
+}
+
+func resolvedAllowedPaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		clean := filepath.Clean(p)
+		if isDeniedMigrateSource(clean) {
+			continue
+		}
+		if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+			clean = filepath.Clean(resolved)
+		}
+		if isDeniedMigrateSource(clean) {
+			continue
+		}
+		out = append(out, clean)
+	}
+	return out
+}
+
+func isPathUnderAny(path string, roots []string) bool {
+	for _, root := range roots {
+		if isPathWithin(path, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPathWithin(path, root string) bool {
+	cleanPath := filepath.Clean(path)
+	cleanRoot := filepath.Clean(root)
+	if cleanPath == cleanRoot {
+		return true
+	}
+	return strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator))
+}
+
+func isDeniedMigrateSource(path string) bool {
+	clean := filepath.Clean(path)
+	if isPathWithin(clean, "/etc/dokploy") || isPathWithin(clean, "/var/lib/dokploy") {
+		return false
+	}
+	switch clean {
+	case "/", "/etc", "/var", "/opt", "/home", "/tmp", "/mnt", "/media", "/srv":
+		return true
+	}
+	if isPathWithin(clean, "/etc") {
+		return true
+	}
+	for _, prefix := range []string{
+		"/proc", "/sys", "/dev", "/boot", "/root", "/run",
+		"/usr", "/bin", "/sbin", "/lib", "/lib64",
+		"/var/lib/docker", "/var/lib/containerd", "/var/run",
+		"/run/docker", "/run/containerd", "/etc/docker", "/opt/stacked",
+	} {
+		if isPathWithin(clean, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func inspectContainerBindMounts(container string) ([]string, error) {
+	if container == "" {
+		return nil, nil
+	}
+	out, err := exec.Command("docker", "inspect", "--format", "{{json .Mounts}}", container).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("docker inspect %s: %s", container, strings.TrimSpace(string(out)))
+	}
+	return parseDockerBindMountSources(out)
+}
+
+func parseDockerBindMountSources(raw []byte) ([]string, error) {
+	var mounts []struct {
+		Type   string `json:"Type"`
+		Source string `json:"Source"`
+	}
+	if err := json.Unmarshal(raw, &mounts); err != nil {
+		return nil, fmt.Errorf("decode container mounts: %w", err)
+	}
+	var out []string
+	for _, m := range mounts {
+		if !strings.EqualFold(m.Type, "bind") {
+			continue
+		}
+		src := strings.TrimSpace(m.Source)
+		if src == "" {
+			continue
+		}
+		clean := filepath.Clean(src)
+		if isDeniedMigrateSource(clean) {
+			continue
+		}
+		out = append(out, clean)
+	}
+	return out, nil
 }
 
 // dumpToolsForEngine returns (source-side tool, target-side tool) for

@@ -3,20 +3,24 @@ package executor
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/ids"
 	"github.com/stackedapp/stacked/agent/internal/logs"
 )
 
-const databasesDir = "/opt/stacked/databases"
+// Overridable in tests so traversal cases can prove we never write or
+// RemoveAll outside the intended child.
+var databasesDir = "/opt/stacked/databases"
 
 // databaseDir returns the working directory for a given database. Mirrors
 // `serviceDir` in shape so debugging / on-disk inspection feels familiar.
-func databaseDir(databaseID string) string {
-	return filepath.Join(databasesDir, databaseID)
+func databaseDir(databaseID string) (string, error) {
+	return ids.Child(databasesDir, databaseID)
 }
 
 // Provision pulls the database image and brings up its container. Streams
@@ -27,30 +31,29 @@ func databaseDir(databaseID string) string {
 // Idempotent on retry: `compose up -d` is a no-op against an already-running
 // container, and `docker pull` is a fast no-op when the image is cached.
 func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error) {
-	databaseID := getStringPayload(op.Payload, "databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_provision")
+	if err != nil {
+		return nil, err
+	}
 	dbType := getStringPayload(op.Payload, "dbType")
 	port := getIntPayload(op.Payload, "port")
 	containerName := getStringPayload(op.Payload, "containerName")
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
 	credentials := getMapPayload(op.Payload, "credentials")
-	// External exposure. Absent → "public" to preserve historical behavior
-	// for older servers that don't send the field (the new server always
-	// sends "internal" for freshly-provisioned databases). bindHost carries
-	// the machine's Tailscale IP and is only consulted in tailnet mode.
-	accessMode := getStringPayload(op.Payload, "accessMode")
-	if accessMode == "" {
-		accessMode = "public"
-	}
+	// External exposure. Missing or unknown accessMode fails closed to
+	// internal — a host publish on 0.0.0.0 requires an explicit "public".
+	// bindHost is the machine's Tailscale IP and is only used in tailnet mode.
+	accessMode := resolveAccessMode(getStringPayload(op.Payload, "accessMode"))
 	bindHost := getStringPayload(op.Payload, "tailscaleIp")
 
-	if databaseID == "" {
-		return nil, fmt.Errorf("db_provision requires databaseId")
-	}
 	if dbType == "" {
 		return nil, fmt.Errorf("db_provision requires dbType")
 	}
-	if port == 0 {
-		return nil, fmt.Errorf("db_provision requires port")
+	if err := validateDatabasePort(port); err != nil {
+		return nil, fmt.Errorf("db_provision: %w", err)
+	}
+	if err := validateBindHost(bindHost); err != nil {
+		return nil, fmt.Errorf("db_provision: %w", err)
 	}
 	if dockerImage == "" {
 		return nil, fmt.Errorf("db_provision requires dockerImage")
@@ -59,8 +62,11 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 		return nil, fmt.Errorf("db_provision requires containerName")
 	}
 
-	dir := databaseDir(databaseID)
-	if err := ensureDir(dir); err != nil {
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureSecretDir(dir); err != nil {
 		return nil, fmt.Errorf("create database dir: %w", err)
 	}
 
@@ -75,18 +81,16 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	streamer.AddLine(fmt.Sprintf("Provisioning %s database (%s)", dbType, dockerImage))
 	streamer.Flush()
 
-	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost)
+	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost, databaseID)
 	if err != nil {
 		return nil, fail(err)
 	}
 	composePath := filepath.Join(dir, "docker-compose.yml")
-	if err := writeFile(composePath, compose); err != nil {
+	if err := writeSecretFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
 
-	// Ensure the stacked network exists. Same idempotent call services use,
-	// so a fresh-host provision works even if `setup` hasn't been re-run.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	ensureNetworkPlan(databaseNetworkPlan(databaseID))
 
 	streamer.SetProgress(20)
 	streamer.AddLine("Pulling image " + dockerImage + "...")
@@ -122,12 +126,15 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 // that happens normally is a manual `docker rm` between Stop and Start, but
 // it's a recoverable state we shouldn't punish the user for.
 func (e *Executor) StartDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_start requires databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_start")
+	if err != nil {
+		return err
 	}
 
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
 		return fmt.Errorf("database %s has no compose file at %s — re-provision required", databaseID, dir)
 	}
@@ -138,8 +145,7 @@ func (e *Executor) StartDB(op client.Operation) error {
 
 	log.Printf("Starting database %s", databaseID)
 
-	// Ensure the stacked network exists — it vanishes on Docker/machine restart.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	ensureNetworkPlan(databaseNetworkPlan(databaseID))
 
 	// `compose start` errors out if the container doesn't exist yet (e.g.
 	// after a manual `docker rm`); fall back to `up -d` which creates it.
@@ -167,12 +173,15 @@ func (e *Executor) StartDB(op client.Operation) error {
 // metadata stays intact for the next Start. Volumes obviously persist
 // either way; the difference is whether the container shell sticks around.
 func (e *Executor) StopDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_stop requires databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_stop")
+	if err != nil {
+		return err
 	}
 
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
 		// No compose file = nothing to stop. Treat as success; the row is
 		// already in a no-database-running state and a Start will surface
@@ -202,12 +211,15 @@ func (e *Executor) StopDB(op client.Operation) error {
 // Idempotent on a missing dir so a retry after a partial failure still
 // succeeds (e.g. compose down ran but rm -rf raced with another process).
 func (e *Executor) DestroyDB(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
-	if databaseID == "" {
-		return fmt.Errorf("db_destroy requires databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_destroy")
+	if err != nil {
+		return err
 	}
 
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		log.Printf("DestroyDB: dir %s already gone, treating as success", dir)
 		return nil
@@ -249,6 +261,47 @@ func (e *Executor) DestroyDB(op client.Operation) error {
 // databaseNativePort is the port the engine listens on inside its container —
 // the target of the host port mapping and the port siblings reach over the
 // `stacked` network.
+
+// resolveAccessMode fails closed: only explicit public/tailnet/internal are
+// honored. Empty and unknown values become internal so a malformed or legacy
+// payload never publishes a host port.
+func resolveAccessMode(mode string) string {
+	switch mode {
+	case "public", "tailnet", "internal":
+		return mode
+	default:
+		return "internal"
+	}
+}
+
+func validateDatabasePort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port must be in 1..65535, got %d", port)
+	}
+	return nil
+}
+
+func validateBindHost(bindHost string) error {
+	if bindHost == "" {
+		return nil
+	}
+	if net.ParseIP(bindHost) == nil {
+		return fmt.Errorf("invalid bind address %q", bindHost)
+	}
+	return nil
+}
+
+func publishesHostPort(accessMode, bindHost string) bool {
+	switch accessMode {
+	case "public":
+		return true
+	case "tailnet":
+		return bindHost != ""
+	default:
+		return false
+	}
+}
+
 func databaseNativePort(dbType string) int {
 	switch dbType {
 	case "postgres":
@@ -274,8 +327,9 @@ func databaseNativePort(dbType string) int {
 //     reachable only over the tailnet. If bindHost is empty (Tailscale not
 //     ready) we publish nothing rather than fall back to 0.0.0.0 — failing
 //     closed is the safe choice.
-//   - public:   bind 0.0.0.0. Source-IP restriction is enforced separately as
-//     DOCKER-USER firewall rules (see firewall.go), not here.
+//   - public:   bind 0.0.0.0. The agent does not manage a host firewall;
+//     lock this down with the machine's cloud security group / external
+//     firewall. Public requires the explicit accessMode value "public".
 func renderDatabasePorts(accessMode, bindHost string, hostPort, nativePort int) string {
 	switch accessMode {
 	case "tailnet":
@@ -290,8 +344,18 @@ func renderDatabasePorts(accessMode, bindHost string, hostPort, nativePort int) 
 	}
 }
 
-func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string, accessMode, bindHost string) (string, error) {
+func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string, accessMode, bindHost, databaseID string) (string, error) {
+	accessMode = resolveAccessMode(accessMode)
+	if err := validateBindHost(bindHost); err != nil {
+		return "", err
+	}
+	if publishesHostPort(accessMode, bindHost) {
+		if err := validateDatabasePort(port); err != nil {
+			return "", err
+		}
+	}
 	portsBlock := renderDatabasePorts(accessMode, bindHost, port, databaseNativePort(dbType))
+	tail := renderDatabaseComposeTail(databaseID, portsBlock)
 	switch dbType {
 	case "postgres":
 		user := creds["user"]
@@ -311,19 +375,7 @@ func generateDatabaseCompose(dbType string, port int, containerName, image strin
       POSTGRES_DB: %s
     volumes:
       - data:/var/lib/postgresql/data
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), portsBlock), nil
+%s`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), tail), nil
 
 	case "mysql":
 		user := creds["user"]
@@ -345,19 +397,7 @@ networks:
       MYSQL_PASSWORD: %s
     volumes:
       - data:/var/lib/mysql
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(rootPw), yamlEscape(dbName), yamlEscape(user), yamlEscape(password), portsBlock), nil
+%s`, image, containerName, yamlEscape(rootPw), yamlEscape(dbName), yamlEscape(user), yamlEscape(password), tail), nil
 
 	case "mongo":
 		user := creds["user"]
@@ -377,19 +417,7 @@ networks:
       MONGO_INITDB_DATABASE: %s
     volumes:
       - data:/data/db
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), portsBlock), nil
+%s`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), tail), nil
 
 	case "redis":
 		password := creds["password"]
@@ -407,21 +435,23 @@ networks:
     command: ["redis-server", "--requirepass", %s]
     volumes:
       - data:/data
-%s    networks:
-      - stacked
-    labels:
+%s`, image, containerName, yamlQuote(password), tail), nil
+	}
+	return "", fmt.Errorf("unsupported database type: %s", dbType)
+}
+
+func renderDatabaseComposeTail(databaseID, portsBlock string) string {
+	nets := databaseNetworkPlan(databaseID)
+	return portsBlock +
+		renderComposeIsolation(databaseIsolation()) +
+		renderComposeServiceNetworks(nets) +
+		`    labels:
       com.stacked.kind: database
 
 volumes:
   data:
 
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlQuote(password), portsBlock), nil
-	}
-	return "", fmt.Errorf("unsupported database type: %s", dbType)
+` + renderComposeNetworkDefs(nets)
 }
 
 // yamlEscape returns a YAML-safe form for an environment value. Postgres

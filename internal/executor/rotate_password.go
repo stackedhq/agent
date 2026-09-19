@@ -22,7 +22,10 @@ import (
 // (identical to what db_provision/db_set_access produce) and `compose up -d`
 // to reconcile the env vars. The data volume is preserved.
 func (e *Executor) RotatePassword(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_rotate_password")
+	if err != nil {
+		return err
+	}
 	dbType := getStringPayload(op.Payload, "dbType")
 	containerName := getStringPayload(op.Payload, "containerName")
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
@@ -32,9 +35,6 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 	oldCreds := getMapPayload(op.Payload, "oldCredentials")
 	newCreds := getMapPayload(op.Payload, "newCredentials")
 
-	if databaseID == "" {
-		return fmt.Errorf("db_rotate_password requires databaseId")
-	}
 	if dbType == "" {
 		return fmt.Errorf("db_rotate_password requires dbType")
 	}
@@ -47,8 +47,9 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 	if len(oldCreds) == 0 || len(newCreds) == 0 {
 		return fmt.Errorf("db_rotate_password requires oldCredentials and newCredentials")
 	}
-	if accessMode == "" {
-		accessMode = "internal"
+	accessMode = resolveAccessMode(accessMode)
+	if err := validateBindHost(bindHost); err != nil {
+		return fmt.Errorf("db_rotate_password: %w", err)
 	}
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
@@ -68,13 +69,19 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 
 	// Step 2: Rewrite docker-compose.yml with new credentials so a future
 	// container restart picks them up from env.
-	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, newCreds, accessMode, bindHost)
+	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, newCreds, accessMode, bindHost, databaseID)
 	if err != nil {
 		return fail(fmt.Errorf("generate compose: %w", err))
 	}
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return fail(err)
+	}
+	if err := ensureSecretDir(dir); err != nil {
+		return fail(fmt.Errorf("create database dir: %w", err))
+	}
 	composePath := filepath.Join(dir, "docker-compose.yml")
-	if err := writeFile(composePath, compose); err != nil {
+	if err := writeSecretFile(composePath, compose); err != nil {
 		return fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
 

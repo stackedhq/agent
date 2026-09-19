@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
@@ -41,7 +40,9 @@ func (e *Executor) RunJob(op client.Operation) (map[string]interface{}, error) {
 
 // runHTTPJob makes an HTTP request from the agent host. Runs on the same
 // network as the user's containers, so internal URLs (e.g.
-// http://my-service:3000/api/cron) work.
+// http://my-service:3000/api/cron) work when httpAllowPrivate is left at
+// its default (true). Loopback and cloud-metadata destinations are
+// rejected unless they pass the policy in http_ssrf.go.
 func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, error) {
 	url := getStringPayload(op.Payload, "httpUrl")
 	if url == "" {
@@ -81,7 +82,12 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 		}
 	}
 
-	httpClient := &http.Client{Timeout: 5 * time.Minute}
+	policy := httpJobPolicyFromPayload(op.Payload)
+	if err := validateHTTPJobURL(url, policy); err != nil {
+		return fail(err)
+	}
+
+	httpClient := newHTTPJobClient(policy)
 	streamer.SetProgress(50)
 
 	resp, err := httpClient.Do(req)
@@ -90,8 +96,7 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 	}
 	defer resp.Body.Close()
 
-	// Read a snippet of the body for logs (cap at 4KB).
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, httpJobMaxResponseBytes))
 	snippet := string(bodyBytes)
 
 	streamer.AddLine(fmt.Sprintf("Response: %d %s", resp.StatusCode, resp.Status))
@@ -111,9 +116,9 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 }
 
 func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, error) {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return nil, fmt.Errorf("cron_run requires serviceId in payload")
+	serviceID, err := requireServiceID(op.Payload, "cron_run")
+	if err != nil {
+		return nil, err
 	}
 
 	command := getStringPayload(op.Payload, "command")
@@ -150,8 +155,11 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		))
 	}
 
-	dir := serviceDir(serviceID)
-	if err := ensureDir(dir); err != nil {
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return fail(err)
+	}
+	if err := ensureSecretDir(dir); err != nil {
 		return fail(fmt.Errorf("create service dir: %w", err))
 	}
 
@@ -171,13 +179,12 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return fail(fmt.Errorf("write .env: %w", err))
 	}
 
-	// Make sure the stacked network exists — the job may need to reach the
-	// user's database container, which sits on it.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	iso := isolationFromPayload(op.Payload)
+	nets := networkPlanFromPayload(serviceID, op.Payload, creds.NetworkAliases)
 
 	streamer.SetProgress(50)
 	streamer.AddLine("Running job: " + command)
@@ -195,15 +202,7 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		containerName = serviceID + "-cron-" + suffix
 	}
 
-	args := []string{
-		"run", "--rm",
-		"--network=stacked",
-		"--env-file=" + envPath,
-		"--name", containerName,
-		imageName,
-		"sh", "-lc", command,
-	}
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", args...); err != nil {
+	if err := e.runOneShotContainer(streamer, dir, containerName, imageName, envPath, iso, nets, nil, []string{"sh", "-lc", command}); err != nil {
 		return fail(fmt.Errorf("job command failed: %w", err))
 	}
 

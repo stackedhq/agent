@@ -17,18 +17,21 @@ import (
 // cases are a pre-fix agent that used `compose down` for pause, or a
 // manual `docker rm`. Mirrors StartDB's recovery path.
 func (e *Executor) Restart(op client.Operation) error {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return fmt.Errorf("restart requires serviceId in payload")
+	serviceID, err := requireServiceID(op.Payload, "restart")
+	if err != nil {
+		return err
 	}
 
-	dir := serviceDir(serviceID)
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
 		return fmt.Errorf("service %s has no compose file at %s — redeploy required", serviceID, dir)
 	}
 
-	// Ensure the stacked network exists — it vanishes on Docker/machine restart.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	nets := networkPlanFromPayload(serviceID, op.Payload, nil)
+	ensureNetworkPlan(nets)
 
 	log.Printf("Restarting service %s", serviceID)
 	if err := e.runCommand(op.ID, dir, "docker", "compose", "restart"); err != nil {
@@ -40,6 +43,7 @@ func (e *Executor) Restart(op client.Operation) error {
 			return fmt.Errorf("docker compose up: %w", err)
 		}
 	}
+	applyNetworkAttachments(serviceID, nets)
 
 	log.Printf("Service %s restarted", serviceID)
 	return nil

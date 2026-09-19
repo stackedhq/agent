@@ -9,19 +9,23 @@ import (
 )
 
 // SetAccess reconciles a database's external exposure to match the server's
-// desired access mode + allowlist. It rewrites the compose port binding and
-// recreates the container, then reconciles the DOCKER-USER firewall:
+// desired access mode. It rewrites the compose port binding and recreates
+// the container:
 //
-//   - internal: no host port published; firewall rules (if any) removed.
-//   - tailnet:  port bound to the machine's Tailscale IP; firewall removed.
-//   - public:   port bound to 0.0.0.0; DOCKER-USER allowlist reconciled to the
-//     supplied CIDRs.
+//   - internal: no host port published.
+//   - tailnet:  port bound to the machine's Tailscale IP.
+//   - public:   port bound to 0.0.0.0. The agent does not manage a host
+//     firewall — restrict this with a cloud security group / external firewall.
 //
-// The container is recreated with `docker compose up -d`; compose only
-// replaces it when the port mapping actually changes, so a no-op reconcile is
-// cheap and the data volume is always preserved.
+// Missing or unknown accessMode is rejected (public requires an explicit
+// "public"). The container is recreated with `docker compose up -d`; compose
+// only replaces it when the port mapping actually changes, so a no-op
+// reconcile is cheap and the data volume is always preserved.
 func (e *Executor) SetAccess(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_set_access")
+	if err != nil {
+		return err
+	}
 	dbType := getStringPayload(op.Payload, "dbType")
 	containerName := getStringPayload(op.Payload, "containerName")
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
@@ -30,22 +34,22 @@ func (e *Executor) SetAccess(op client.Operation) error {
 	bindHost := getStringPayload(op.Payload, "tailscaleIp")
 	credentials := getMapPayload(op.Payload, "credentials")
 
-	if databaseID == "" {
-		return fmt.Errorf("db_set_access requires databaseId")
-	}
 	if dbType == "" {
 		return fmt.Errorf("db_set_access requires dbType")
 	}
 	if containerName == "" {
 		return fmt.Errorf("db_set_access requires containerName")
 	}
-	if port == 0 {
-		return fmt.Errorf("db_set_access requires port")
+	if err := validateDatabasePort(port); err != nil {
+		return fmt.Errorf("db_set_access: %w", err)
 	}
 	switch accessMode {
 	case "internal", "tailnet", "public":
 	default:
 		return fmt.Errorf("db_set_access: invalid accessMode %q", accessMode)
+	}
+	if err := validateBindHost(bindHost); err != nil {
+		return fmt.Errorf("db_set_access: %w", err)
 	}
 	if accessMode == "tailnet" && bindHost == "" {
 		return fmt.Errorf("db_set_access: tailnet mode requires a tailscale IP")
@@ -61,18 +65,22 @@ func (e *Executor) SetAccess(op client.Operation) error {
 	streamer.AddLine(fmt.Sprintf("Setting %s access mode to %s", dbType, accessMode))
 	streamer.Flush()
 
-	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost)
+	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost, databaseID)
 	if err != nil {
 		return fail(fmt.Errorf("generate compose: %w", err))
 	}
-	dir := databaseDir(databaseID)
-	if err := ensureDir(dir); err != nil {
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return fail(err)
+	}
+	if err := ensureSecretDir(dir); err != nil {
 		return fail(fmt.Errorf("create database dir: %w", err))
 	}
 	composePath := filepath.Join(dir, "docker-compose.yml")
-	if err := writeFile(composePath, compose); err != nil {
+	if err := writeSecretFile(composePath, compose); err != nil {
 		return fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
+	ensureNetworkPlan(databaseNetworkPlan(databaseID))
 
 	// Recreate the container so the new port binding takes effect. compose
 	// leaves it untouched if nothing changed; the named volume survives.

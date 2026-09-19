@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/gatehost"
 	"github.com/stackedapp/stacked/agent/internal/slots"
 )
 
@@ -272,6 +273,9 @@ func ensureProxy() error {
 		return fmt.Errorf("start caddy: %s: %w", out, err)
 	}
 
+	// Compose recreate drops extra network attachments. Re-join every
+	// per-service network so Caddy can still reach isolated backends.
+	reconnectProxyServiceNetworks()
 	return nil
 }
 
@@ -713,7 +717,10 @@ func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot
 			// sidecar (login page, form POST, logout), then forward_auth
 			// everything else through the gate's /check endpoint.
 			b.WriteString("    handle /__stacked/* {\n")
-			b.WriteString("        reverse_proxy gate:9876\n")
+			b.WriteString("        reverse_proxy gate:9876 {\n")
+			b.WriteString("            header_up X-Real-IP {remote_host}\n")
+			b.WriteString("            header_up X-Forwarded-For {remote_host}\n")
+			b.WriteString("        }\n")
 			b.WriteString("    }\n")
 			b.WriteString("    handle {\n")
 			b.WriteString("        forward_auth gate:9876 {\n")
@@ -913,38 +920,49 @@ type gateDomainEntry struct {
 	ServiceName  string `json:"serviceName"`
 }
 
-// reconcileGate writes the gate config.json and ensures the gate
-// container is running when at least one domain has an auth gate,
-// or stopped when none do.
-func reconcileGate(parsed []cachedDomain) error {
+// buildGateConfig maps gated domains onto canonical host keys so the
+// sidecar's lookups match Caddy's case-insensitive {host} forwarding.
+func buildGateConfig(parsed []cachedDomain) gateConfig {
 	cfg := gateConfig{Domains: make(map[string]gateDomainEntry)}
 	for _, d := range parsed {
 		if d.AuthGateMode == "" {
 			continue
 		}
+		key := gatehost.CanonicalHost(d.Domain)
+		if key == "" {
+			continue
+		}
 		name := d.ServiceName
 		if name == "" {
-			name = d.Domain
+			name = key
 		}
-		cfg.Domains[d.Domain] = gateDomainEntry{
+		cfg.Domains[key] = gateDomainEntry{
 			Mode:         d.AuthGateMode,
 			Username:     d.AuthGateUsername,
 			PasswordHash: d.AuthGatePasswordHash,
 			ServiceName:  name,
 		}
 	}
+	return cfg
+}
+
+// reconcileGate writes the gate config.json and ensures the gate
+// container is running when at least one domain has an auth gate,
+// or stopped when none do.
+func reconcileGate(parsed []cachedDomain) error {
+	cfg := buildGateConfig(parsed)
 
 	needsGate := len(cfg.Domains) > 0
 
 	if needsGate {
-		if err := ensureDir(gateDir); err != nil {
+		if err := ensureSecretDir(gateDir); err != nil {
 			return fmt.Errorf("create gate dir: %w", err)
 		}
 		data, err := json.MarshalIndent(cfg, "", "  ")
 		if err != nil {
 			return err
 		}
-		if err := writeFile(gateConfigPath, string(data)); err != nil {
+		if err := writeSecretFile(gateConfigPath, string(data)); err != nil {
 			return fmt.Errorf("write gate config: %w", err)
 		}
 	}
