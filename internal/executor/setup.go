@@ -29,6 +29,11 @@ func (e *Executor) Setup(op client.Operation) error {
 		return err
 	}
 
+	// Lock down leftover 0755 service-volume parents from older agents.
+	if err := ReconcileManagedVolumeParents(); err != nil {
+		log.Printf("volume-perms: service parent reconcile: %v", err)
+	}
+
 	log.Println("Setup complete")
 	return nil
 }

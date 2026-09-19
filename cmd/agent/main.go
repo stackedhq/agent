@@ -79,6 +79,9 @@ func main() {
 	if err := executor.ReconcileSecretPermissions(); err != nil {
 		log.Printf("Startup secret permission reconcile skipped: %v", err)
 	}
+	if err := executor.ReconcileManagedVolumeParents(); err != nil {
+		log.Printf("Startup volume parent reconcile skipped: %v", err)
+	}
 
 	stop := make(chan struct{})
 

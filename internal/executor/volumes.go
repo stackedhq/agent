@@ -7,8 +7,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // managedVolumeRoot is the host-side namespace that the dashboard
@@ -18,7 +20,19 @@ import (
 // paths are deliberately left untouched.
 //
 // keep in sync with packages/web/src/lib/volume-paths.ts MANAGED_VOLUME_ROOT
-const managedVolumeRoot = "/opt/stacked/data/services/"
+const (
+	managedServiceDataRoot = "/opt/stacked/data/services"
+	managedVolumeRoot      = managedServiceDataRoot + "/"
+)
+
+// stackedUUIDPattern is the dashboard's service / file-mount ID shape.
+// Healing and parent lockdown only run when this component is present so a
+// look-alike path cannot talk us into chmoding arbitrary host dirs.
+var stackedUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func isStackedUUID(s string) bool {
+	return stackedUUIDPattern.MatchString(s)
+}
 
 // permsHealSentinel is the empty file dropped at the root of a healed
 // managed volume so subsequent deploys skip the recursive walk. The
@@ -157,26 +171,151 @@ func renderComposeVolumes(mounts []volumeMount) string {
 // alone — that's the user's filesystem and their perms story to own.
 func ensureVolumeHostDirs(mounts []volumeMount) error {
 	for _, m := range mounts {
+		parent, managed := managedServiceParent(m.HostPath)
+		if managed {
+			if err := rejectSymlinkPathComponents(managedServiceDataRoot, filepath.Clean(m.HostPath)); err != nil {
+				return fmt.Errorf("managed volume path %s: %w", m.HostPath, err)
+			}
+		}
 		if err := os.MkdirAll(m.HostPath, 0o755); err != nil {
 			return fmt.Errorf("create host volume dir %s: %w", m.HostPath, err)
 		}
-		if !isManagedHostPath(m.HostPath) {
+		if !managed {
 			continue
 		}
-		if err := healManagedVolumePerms(m.HostPath); err != nil {
-			return fmt.Errorf("heal managed volume perms %s: %w", m.HostPath, err)
+		if err := protectManagedVolumeLayout(m.HostPath, parent); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// protectManagedVolumeLayout locks the per-service parent to 0700 so
+// unrelated local UIDs cannot traverse into 0777 leaves, then heals the
+// bind-mount leaf for arbitrary container UIDs. Docker resolves bind
+// sources as root, so the private parent does not block the mount.
+func protectManagedVolumeLayout(hostPath, parent string) error {
+	if err := chmodDirNoFollow(parent, 0o700); err != nil {
+		return fmt.Errorf("lock service parent %s: %w", parent, err)
+	}
+	leaf := filepath.Clean(hostPath)
+	if leaf == parent {
+		return nil
+	}
+	if err := healManagedVolumePerms(leaf); err != nil {
+		return fmt.Errorf("heal managed volume perms %s: %w", leaf, err)
+	}
+	return nil
+}
+
+// ReconcileManagedVolumeParents tightens existing
+// /opt/stacked/data/services/<uuid> directories to 0700. Called from
+// agent startup and Setup so hosts that already have 0755 parents pick
+// up the lockdown without waiting for a redeploy. Missing root is a
+// no-op (fresh box before the first managed volume).
+func ReconcileManagedVolumeParents() error {
+	return reconcileManagedServiceParentsAt(managedServiceDataRoot)
+}
+
+func reconcileManagedServiceParentsAt(root string) error {
+	info, err := os.Lstat(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("managed volume root %s is not a directory", root)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !isStackedUUID(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if entry.Type()&os.ModeSymlink != 0 {
+			log.Printf("volume-perms: skip symlink service parent %s", path)
+			continue
+		}
+		if !entry.IsDir() {
+			continue
+		}
+		if err := chmodDirNoFollow(path, 0o700); err != nil {
+			log.Printf("volume-perms: lock service parent %s: %v (continuing)", path, err)
+		}
+	}
+	return nil
+}
+
+// chmodDirNoFollow sets mode on a real directory. Lstat + O_NOFOLLOW so
+// a symlink planted as a service parent cannot redirect the chmod onto
+// its target.
+func chmodDirNoFollow(path string, mode os.FileMode) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to chmod symlink %s", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Chmod(mode)
+}
+
+func lockManagedParentIfAny(hostPath string) {
+	parent, ok := managedServiceParent(hostPath)
+	if !ok {
+		return
+	}
+	if err := chmodDirNoFollow(parent, 0o700); err != nil {
+		log.Printf("volume-perms: lock service parent %s: %v", parent, err)
+	}
+}
+
 // isManagedHostPath reports whether a host path lives inside the
-// agent-managed namespace. Anchored on the trailing slash to avoid
-// matching a sibling-named directory like
-// `/opt/stacked/data/services-backup/...` that a user might create
-// manually on disk.
+// agent-managed namespace under a canonical UUID service component.
+// Anchored on the services root so a sibling like
+// `/opt/stacked/data/services-backup/...` cannot match. Paths are
+// Clean'd before the UUID check so `..` segments cannot sneak a chmod
+// outside the expected silo.
 func isManagedHostPath(hostPath string) bool {
-	return strings.HasPrefix(hostPath, managedVolumeRoot)
+	_, ok := managedServiceParent(hostPath)
+	return ok
+}
+
+// managedServiceParent returns the /opt/stacked/data/services/<uuid>
+// directory for a host path, if the cleaned path is inside the managed
+// root and the first component is a UUID. Does not resolve symlinks —
+// callers that will chmod must use Lstat / O_NOFOLLOW separately.
+func managedServiceParent(hostPath string) (string, bool) {
+	if hostPath == "" || strings.ContainsRune(hostPath, 0) {
+		return "", false
+	}
+	if !filepath.IsAbs(hostPath) {
+		return "", false
+	}
+	cleaned := filepath.Clean(hostPath)
+	root := filepath.Clean(managedServiceDataRoot)
+	rel, err := filepath.Rel(root, cleaned)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	serviceID, _, _ := strings.Cut(rel, string(filepath.Separator))
+	if !isStackedUUID(serviceID) {
+		return "", false
+	}
+	return filepath.Join(root, serviceID), true
 }
 
 // healManagedVolumePerms makes a managed-volume host dir writable by
@@ -204,7 +343,7 @@ func isManagedHostPath(hostPath string) bool {
 // the leaf-dir chmod still runs because that's the part that fixes
 // newly-created volumes.
 func healManagedVolumePerms(root string) error {
-	if err := os.Chmod(root, 0o777); err != nil {
+	if err := chmodDirNoFollow(root, 0o777); err != nil {
 		return fmt.Errorf("chmod leaf %s: %w", root, err)
 	}
 

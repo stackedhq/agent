@@ -14,10 +14,9 @@ import (
 )
 
 const (
-	managedServiceDataRoot = "/opt/stacked/data/services"
-	maxFileMountContent    = 64 * 1024
-	maxFileMountTotal      = 512 * 1024
-	maxManagedFileMounts   = 20
+	maxFileMountContent  = 64 * 1024
+	maxFileMountTotal    = 512 * 1024
+	maxManagedFileMounts = 20
 )
 
 type managedFileMount struct {
@@ -66,7 +65,15 @@ func materializeFileMounts(serviceID string, mounts []client.FileMount) ([]volum
 	if err := rejectSymlinkPathComponents(managedServiceDataRoot, root); err != nil {
 		return nil, err
 	}
-	return materializeFileMountsAt(root, mounts)
+	result, err := materializeFileMountsAt(root, mounts)
+	if err != nil {
+		return nil, err
+	}
+	parent := filepath.Join(managedServiceDataRoot, serviceID)
+	if err := chmodDirNoFollow(parent, 0o700); err != nil {
+		return nil, fmt.Errorf("lock service parent %s: %w", parent, err)
+	}
+	return result, nil
 }
 
 // materializeFileMountsAt validates every response before writing it, then
