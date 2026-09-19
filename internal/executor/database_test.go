@@ -30,6 +30,52 @@ func TestRenderDatabasePorts(t *testing.T) {
 	}
 }
 
+func TestResolveAccessMode(t *testing.T) {
+	if got := resolveAccessMode("public"); got != "public" {
+		t.Errorf("public must stay public, got %q", got)
+	}
+	if got := resolveAccessMode("tailnet"); got != "tailnet" {
+		t.Errorf("tailnet must stay tailnet, got %q", got)
+	}
+	if got := resolveAccessMode("internal"); got != "internal" {
+		t.Errorf("internal must stay internal, got %q", got)
+	}
+	for _, mode := range []string{"", "Public", "PUBLIC", "nonsense", "legacy"} {
+		if got := resolveAccessMode(mode); got != "internal" {
+			t.Errorf("resolveAccessMode(%q) = %q, want internal", mode, got)
+		}
+	}
+}
+
+func TestValidateDatabasePort(t *testing.T) {
+	for _, port := range []int{1, 80, 5432, 65535} {
+		if err := validateDatabasePort(port); err != nil {
+			t.Errorf("port %d should be valid: %v", port, err)
+		}
+	}
+	for _, port := range []int{0, -1, 65536, 70000} {
+		if err := validateDatabasePort(port); err == nil {
+			t.Errorf("port %d should be rejected", port)
+		}
+	}
+}
+
+func TestValidateBindHost(t *testing.T) {
+	if err := validateBindHost(""); err != nil {
+		t.Errorf("empty bind host is allowed (fail closed later): %v", err)
+	}
+	for _, ip := range []string{"100.64.0.5", "127.0.0.1", "2001:db8::1"} {
+		if err := validateBindHost(ip); err != nil {
+			t.Errorf("valid IP %q rejected: %v", ip, err)
+		}
+	}
+	for _, bad := range []string{"not-an-ip", "100.64.0", "localhost", "0.0.0.0/0"} {
+		if err := validateBindHost(bad); err == nil {
+			t.Errorf("invalid bind host %q accepted", bad)
+		}
+	}
+}
+
 func TestGenerateDatabaseComposeAccessModes(t *testing.T) {
 	creds := map[string]string{
 		"user":     "stk_user",
@@ -66,5 +112,51 @@ func TestGenerateDatabaseComposeAccessModes(t *testing.T) {
 	}
 	if !strings.Contains(tailnet, `- "100.64.0.5:15432:5432"`) {
 		t.Errorf("tailnet database must bind tailscale IP:\n%s", tailnet)
+	}
+}
+
+func TestGenerateDatabaseComposeMissingOrUnknownMode(t *testing.T) {
+	creds := map[string]string{
+		"user":     "stk_user",
+		"password": "secretpw",
+		"dbName":   "stk_db",
+	}
+
+	// Legacy/malformed payloads must not grow a host port mapping.
+	for _, mode := range []string{"", "nonsense", "PUBLIC"} {
+		got, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, mode, "")
+		if err != nil {
+			t.Fatalf("mode %q: %v", mode, err)
+		}
+		if strings.Contains(got, "ports:") || strings.Contains(got, "15432:5432") {
+			t.Errorf("mode %q must publish no host port:\n%s", mode, got)
+		}
+	}
+}
+
+func TestGenerateDatabaseComposeRejectsBadPublishConfig(t *testing.T) {
+	creds := map[string]string{
+		"user":     "stk_user",
+		"password": "secretpw",
+		"dbName":   "stk_db",
+	}
+
+	if _, err := generateDatabaseCompose("postgres", 0, "postgres-x", "postgres:16", creds, "public", ""); err == nil {
+		t.Fatal("public with port 0 must be rejected")
+	}
+	if _, err := generateDatabaseCompose("postgres", 70000, "postgres-x", "postgres:16", creds, "public", ""); err == nil {
+		t.Fatal("public with port 70000 must be rejected")
+	}
+	if _, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, "tailnet", "not-an-ip"); err == nil {
+		t.Fatal("tailnet with invalid bind IP must be rejected")
+	}
+
+	// tailnet without an IP still fails closed (no publish), no error.
+	got, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, "tailnet", "")
+	if err != nil {
+		t.Fatalf("tailnet without IP: %v", err)
+	}
+	if strings.Contains(got, "ports:") {
+		t.Errorf("tailnet without IP must publish no host port:\n%s", got)
 	}
 }

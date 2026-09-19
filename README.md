@@ -65,6 +65,10 @@ Install Tailscale with the [upstream package](https://tailscale.com/kb/1031/inst
 | `proxy_config` | Regenerate Caddyfile, reload Caddy |
 | `self_update` | Download signed release, verify checksum + signature, replace, restart |
 
+## Database access
+
+Managed databases default to **internal** (reachable only on the Docker `stacked` network — no host port). A missing or unknown access mode is treated the same way. Publishing on `0.0.0.0` requires an explicit `public` access mode. The agent does not manage a host firewall; if you use public mode, restrict the port with your cloud security group or an external firewall. Tailnet mode binds only to a validated Tailscale IP.
+
 ## Managing the service
 
 ```bash
