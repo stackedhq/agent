@@ -26,6 +26,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/stackedapp/stacked/agent/internal/gatehost"
+
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -45,7 +47,7 @@ type GateConfig struct {
 
 // DomainGate holds auth config for one domain.
 type DomainGate struct {
-	Mode         string `json:"mode"`         // "password" | future: "stacked"
+	Mode         string `json:"mode"` // "password" | future: "stacked"
 	Username     string `json:"username"`
 	PasswordHash string `json:"passwordHash"` // bcrypt
 	ServiceName  string `json:"serviceName"`
@@ -110,6 +112,7 @@ func loadConfig() {
 		log.Printf("gate: bad config: %v", err)
 		return
 	}
+	cfg.Domains = canonicalizeDomainMap(cfg.Domains)
 	configMu.Lock()
 	gateConfig = cfg
 	configMu.Unlock()
@@ -121,10 +124,22 @@ func reloadConfig() {
 	loadConfig()
 }
 
+func canonicalizeDomainMap(in map[string]DomainGate) map[string]DomainGate {
+	out := make(map[string]DomainGate, len(in))
+	for host, d := range in {
+		key := gatehost.CanonicalHost(host)
+		if key == "" {
+			continue
+		}
+		out[key] = d
+	}
+	return out
+}
+
 func getDomainGate(host string) (DomainGate, bool) {
-	// Strip port if present
-	if i := strings.LastIndex(host, ":"); i != -1 {
-		host = host[:i]
+	host = gatehost.CanonicalHost(host)
+	if host == "" {
+		return DomainGate{}, false
 	}
 	configMu.RLock()
 	defer configMu.RUnlock()
@@ -135,6 +150,7 @@ func getDomainGate(host string) (DomainGate, bool) {
 // --- Cookie ---
 
 func signCookie(domain string, issuedAt time.Time) string {
+	domain = gatehost.CanonicalHost(domain)
 	payload := fmt.Sprintf("%s|%d", domain, issuedAt.Unix())
 	mac := hmac.New(sha256.New, signingKey)
 	mac.Write([]byte(payload))
@@ -154,15 +170,12 @@ func validateCookie(value, host string) bool {
 	}
 	domain, tsStr, sig := parts[0], parts[1], parts[2]
 
-	// Strip port from host
-	if i := strings.LastIndex(host, ":"); i != -1 {
-		host = host[:i]
-	}
-	if domain != host {
+	host = gatehost.CanonicalHost(host)
+	if host == "" || gatehost.CanonicalHost(domain) != host {
 		return false
 	}
 
-	// Verify signature
+	// Verify signature over the original payload bytes.
 	payload := fmt.Sprintf("%s|%s", domain, tsStr)
 	mac := hmac.New(sha256.New, signingKey)
 	mac.Write([]byte(payload))
@@ -184,16 +197,23 @@ func validateCookie(value, host string) bool {
 
 // --- Handlers ---
 
-func handleCheck(w http.ResponseWriter, r *http.Request) {
+func requestHost(r *http.Request) string {
 	host := r.Header.Get("X-Forwarded-Host")
 	if host == "" {
 		host = r.Host
 	}
+	return gatehost.CanonicalHost(host)
+}
+
+func handleCheck(w http.ResponseWriter, r *http.Request) {
+	host := requestHost(r)
 
 	gate, ok := getDomainGate(host)
 	if !ok || gate.Mode == "" {
-		// No gate for this domain — pass through
-		w.WriteHeader(http.StatusOK)
+		// Fail closed: Caddy only invokes /check for hosts that should
+		// be gated. An unknown host is a config mismatch, not a public
+		// site — returning 200 here used to bypass the password gate.
+		http.Error(w, "unknown host", http.StatusForbidden)
 		return
 	}
 
@@ -213,10 +233,7 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLogin(w http.ResponseWriter, r *http.Request) {
-	host := r.Header.Get("X-Forwarded-Host")
-	if host == "" {
-		host = r.Host
-	}
+	host := requestHost(r)
 
 	gate, ok := getDomainGate(host)
 	if !ok {
