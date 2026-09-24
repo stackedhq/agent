@@ -206,6 +206,36 @@ func TestDecode_MalformedEveryOpType(t *testing.T) {
 	}
 }
 
+func TestDecode_VolumePathsAllowSpacesAndCommas(t *testing.T) {
+	p, err := Decode("deploy", map[string]interface{}{
+		"serviceId": svc,
+		"volumes": []interface{}{
+			map[string]interface{}{
+				"hostPath":      "/mnt/customer data,archive",
+				"containerPath": "/etc/customer data,archive/config",
+				"mode":          "custom",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := p.(ServiceDeploy)
+	if d.Volumes[0].HostPath != "/mnt/customer data,archive" {
+		t.Fatalf("%+v", d.Volumes[0])
+	}
+}
+
+func TestDecode_TmpfsRejectsBindSpec(t *testing.T) {
+	_, err := Decode("deploy", map[string]interface{}{
+		"serviceId": svc,
+		"tmpfs":     []interface{}{"/var/run/docker.sock:/var/run/docker.sock"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "tmpfs") {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestDecode_ProxyPortBoundAndPath(t *testing.T) {
 	p, err := Decode("proxy_config", map[string]interface{}{
 		"domains": []interface{}{

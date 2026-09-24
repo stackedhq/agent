@@ -177,15 +177,22 @@ func validAbsPath(path string) bool {
 	if !strings.HasPrefix(path, "/") {
 		return false
 	}
-	if strings.ContainsAny(path, ":,\n\r\t ") {
-		return false
-	}
 	for _, part := range strings.Split(path, "/") {
 		if part == ".." {
 			return false
 		}
 	}
 	return utf8.ValidString(path)
+}
+
+// validTmpfsPath is stricter than validAbsPath: compose tmpfs entries
+// must not contain whitespace, commas, or colons so a payload cannot
+// smuggle bind-spec / extra YAML keys. Volume hostPaths keep validAbsPath.
+func validTmpfsPath(path string) bool {
+	if !validAbsPath(path) {
+		return false
+	}
+	return !strings.ContainsAny(path, ":,\n\r\t ")
 }
 
 func validBounded(s string, max int) bool {

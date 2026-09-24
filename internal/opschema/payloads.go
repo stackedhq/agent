@@ -1101,7 +1101,7 @@ func validateIsolationFields(raw map[string]interface{}) error {
 		return err
 	}
 	for i, p := range tmpfs {
-		if !validAbsPath(p) {
+		if !validTmpfsPath(p) {
 			return fmt.Errorf("tmpfs[%d] is invalid", i)
 		}
 	}
