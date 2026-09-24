@@ -18,15 +18,17 @@ import (
 )
 
 func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
-	serviceID := getStringPayload(op.Payload, "serviceId")
+	serviceID, err := requireServiceID(op.Payload, "deploy")
+	if err != nil {
+		return nil, err
+	}
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
 
-	if serviceID == "" {
-		return nil, fmt.Errorf("deploy requires serviceId in payload")
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return nil, err
 	}
-
-	dir := serviceDir(serviceID)
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}
 
@@ -104,14 +106,14 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	if len(creds.EnvVars) > 0 {
 		envContent := buildEnvFile(creds.EnvVars)
 		envPath := filepath.Join(dir, ".env")
-		if err := writeFile(envPath, envContent); err != nil {
+		if err := writeSecretFile(envPath, envContent); err != nil {
 			return nil, fail(fmt.Errorf("write .env: %w", err))
 		}
 	} else {
 		// Ensure .env exists (docker compose requires it with env_file directive)
 		envPath := filepath.Join(dir, ".env")
 		if _, err := os.Stat(envPath); os.IsNotExist(err) {
-			if err := writeFile(envPath, ""); err != nil {
+			if err := writeSecretFile(envPath, ""); err != nil {
 				return nil, fail(fmt.Errorf("write .env: %w", err))
 			}
 		}
@@ -141,8 +143,8 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// Materialize managed file mounts only after the image is ready, but before
 	// Compose can start the container. Their plaintext never enters the payload
 	// or logs.
-	volumeMounts := parseVolumes(op.Payload)
-	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
+	volumeMounts, err := prepareHostVolumeMounts(op.Payload, streamer.AddLine)
+	if err != nil {
 		return nil, fail(err)
 	}
 	fileMounts, err := e.prepareFileMounts(op, serviceID)
@@ -154,7 +156,9 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 		return nil, fail(err)
 	}
 	startCommand := dockerCommandOverride(op.Payload)
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
+	iso := isolationFromPayload(op.Payload)
+	nets := networkPlanFromPayload(serviceID, op.Payload, creds.NetworkAliases)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), iso, nets, startCommand)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
@@ -165,17 +169,17 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	streamer.AddLine("Starting container...")
 	streamer.Flush()
 
-	// Ensure the stacked network exists (idempotent, same as setup.go)
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	ensureNetworkPlan(nets)
 
 	log.Printf("Starting container for %s", serviceID)
 	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
 		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
+	applyNetworkAttachments(serviceID, nets)
 
 	// Phase: Health probe (95%)
 	streamer.SetProgress(95)
-	probeRes := e.HealthProbe(streamer, serviceID, probePort)
+	probeRes := e.HealthProbe(streamer, serviceID, nets.Primary, probePort)
 
 	// Reconcile away any leftover blue/green state from a previous
 	// rolling run on this service. Switching a service from `rolling`
@@ -226,27 +230,37 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 			return "", fmt.Errorf("no git clone URL available")
 		}
 	}
+	remote := parseGitRemote(gitRepo)
+	auth, err := startGitAuth(remote)
+	if err != nil {
+		return "", fmt.Errorf("git auth: %w", err)
+	}
+	defer auth.Close()
 
 	// Phase: Git clone/pull (2%)
 	streamer.SetProgress(2)
 	streamer.AddLine("Cloning repository...")
 	streamer.Flush()
 
-	// Clone or pull
+	// Clone or pull. The URL on argv is always the credential-free form;
+	// GIT_ASKPASS supplies the token for the duration of this call only.
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(err) {
 		log.Printf("Cloning into %s", repoDir)
-		if err := e.runCommandWithStreamer(streamer, dir, "git", "clone", "--branch", gitBranch, "--single-branch", gitRepo, "repo"); err != nil {
+		if err := e.runCommandWithEnv(streamer, dir, auth.env(), "git", "clone", "--branch", gitBranch, "--single-branch", remote.CleanURL, "repo"); err != nil {
 			return "", fmt.Errorf("git clone: %w", err)
 		}
 	} else {
 		log.Printf("Pulling latest for %s", serviceID)
-		_, _ = runCommandSilent(repoDir, "git", "remote", "set-url", "origin", gitRepo)
-		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "fetch", "origin"); err != nil {
+		_ = sanitizeGitRemote(repoDir, remote.CleanURL)
+		if err := e.runCommandWithEnv(streamer, repoDir, auth.env(), "git", "fetch", "origin"); err != nil {
 			return "", fmt.Errorf("git fetch: %w", err)
 		}
 		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "reset", "--hard", "origin/"+gitBranch); err != nil {
 			return "", fmt.Errorf("git reset: %w", err)
 		}
+	}
+	if err := sanitizeGitRemote(repoDir, remote.CleanURL); err != nil {
+		return "", err
 	}
 
 	// Checkout specific commit if requested
@@ -264,22 +278,36 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 	imageName := "stacked-" + serviceID
 	log.Printf("Building image with Nixpacks for %s", serviceID)
 
-	nixpacksArgs := []string{"build", repoDir, "--name", imageName}
-	if buildCommand != "" {
-		nixpacksArgs = append(nixpacksArgs, "--build-cmd", buildCommand)
-	}
-	if startCommand != "" {
-		nixpacksArgs = append(nixpacksArgs, "--start-cmd", startCommand)
-	}
-	for k, v := range creds.EnvVars {
-		nixpacksArgs = append(nixpacksArgs, "--env", k+"="+v)
-	}
-
-	if err := e.runCommandWithStreamer(streamer, dir, "nixpacks", nixpacksArgs...); err != nil {
+	nixpacksArgs, nixpacksEnv := nixpacksBuildArgs(repoDir, imageName, buildCommand, startCommand, creds.EnvVars)
+	if err := e.runCommandWithEnv(streamer, dir, nixpacksEnv, "nixpacks", nixpacksArgs...); err != nil {
 		return "", fmt.Errorf("nixpacks build: %w", err)
 	}
 
 	return imageName, nil
+}
+
+// nixpacksBuildArgs builds the nixpacks CLI. Values are passed via the
+// process environment and referenced as `--env KEY` (no `KEY=value` on
+// argv). Nixpacks pulls the value from the current environment when the
+// equals sign is omitted.
+func nixpacksBuildArgs(repoDir, imageName, buildCommand, startCommand string, vars map[string]string) (args, extraEnv []string) {
+	args = []string{"build", repoDir, "--name", imageName}
+	if buildCommand != "" {
+		args = append(args, "--build-cmd", buildCommand)
+	}
+	if startCommand != "" {
+		args = append(args, "--start-cmd", startCommand)
+	}
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "--env", k)
+		extraEnv = append(extraEnv, k+"="+vars[k])
+	}
+	return args, extraEnv
 }
 
 // buildEnvFile creates a .env file content from a key-value map, consumed
@@ -348,7 +376,7 @@ func (l resourceLimits) cpus() string {
 	return s
 }
 
-func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, aliases []string, startCommand string) string {
+func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, iso isolationSpec, nets networkPlan, startCommand string) string {
 	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
 	// managers correctly partition `docker ps` output. The runtimelogs
 	// manager treats label-less containers as services for back-compat
@@ -388,16 +416,12 @@ func generateCompose(serviceID, imageName string, mounts []volumeMount, limits r
   %s:
     container_name: %s
     image: %s
-%s%s    env_file:
+%s%s%s    env_file:
       - .env
 %s%s    labels:
       com.stacked.kind: service
 
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, serviceID, serviceID, imageName, resourceBlock.String(), commandBlock, volumesBlock, renderServiceNetworks(aliases))
+%s`, serviceID, serviceID, imageName, resourceBlock.String(), renderComposeIsolation(iso), commandBlock, volumesBlock, renderComposeServiceNetworks(nets), renderComposeNetworkDefs(nets))
 }
 
 // renderServiceNetworks emits the service-level `networks:` block. With no

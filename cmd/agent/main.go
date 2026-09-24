@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,6 +37,9 @@ func main() {
 	}
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	// Defense in depth alongside systemd UMask=0077: files created without
+	// an explicit chmod stay owner-only. Helpers still chmod public files.
+	syscall.Umask(0o077)
 	log.Printf("Starting Stacked agent v%s", heartbeat.Version)
 
 	cfg, err := config.Load()
@@ -44,6 +48,13 @@ func main() {
 	}
 
 	log.Printf("Server: %s", cfg.Agent.Server)
+
+	if err := executor.SetAllowedHostRoots(cfg.Volumes.AllowedHostRoots); err != nil {
+		log.Fatalf("Invalid volumes.allowed_host_roots: %v", err)
+	}
+	if roots := cfg.Volumes.AllowedHostRoots; len(roots) > 0 {
+		log.Printf("Custom volume roots allowlisted: %s", strings.Join(roots, ", "))
+	}
 
 	c := client.New(cfg.Agent.Server, cfg.Agent.Token)
 	// Record the server origin for on-demand TLS `ask` URL rendering
@@ -64,6 +75,12 @@ func main() {
 	// recover via subsequent ops.
 	if err := executor.ReconcileProxy(); err != nil {
 		log.Printf("Startup proxy reconcile skipped: %v", err)
+	}
+	if err := executor.ReconcileSecretPermissions(); err != nil {
+		log.Printf("Startup secret permission reconcile skipped: %v", err)
+	}
+	if err := executor.ReconcileManagedVolumeParents(); err != nil {
+		log.Printf("Startup volume parent reconcile skipped: %v", err)
 	}
 
 	stop := make(chan struct{})

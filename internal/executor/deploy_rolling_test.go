@@ -11,7 +11,7 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 		serviceID+"-blue", serviceID, "blue",
 		"registry/app:tag", "/opt/stacked/services/svc-123/.env",
 		resourceLimits{restartPolicy: "unless-stopped"},
-		nil, "",
+		isolationFromPayload(nil), networkPlanFromPayload(serviceID, map[string]interface{}{"networkIsolation": true}, nil), "",
 	)
 
 	// The slot container is named per-slot but must alias the bare
@@ -20,8 +20,11 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 	if !containsFlag(args, "--network-alias="+serviceID) {
 		t.Fatalf("expected stable --network-alias=%s, got: %v", serviceID, args)
 	}
-	if !containsFlag(args, "--network=stacked") {
-		t.Fatalf("expected --network=stacked, got: %v", args)
+	if !containsFlag(args, "--network="+serviceNetworkName(serviceID)) {
+		t.Fatalf("expected isolated --network, got: %v", args)
+	}
+	if !containsFlag(args, "--security-opt=no-new-privileges:true") || !containsFlag(args, "--cap-drop=ALL") {
+		t.Fatalf("expected default isolation flags, got: %v", args)
 	}
 	if !containsFlag(args, "--name") {
 		t.Fatalf("expected --name flag, got: %v", args)
@@ -37,7 +40,7 @@ func TestRollingContainerArgsFriendlyAliases(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-blue", "svc-1", "blue", "img", "/env",
 		resourceLimits{restartPolicy: "unless-stopped"},
-		[]string{"api", "old-name", "BAD ALIAS", ""}, "",
+		isolationFromPayload(nil), networkPlanFromPayload("svc-1", map[string]interface{}{"networkIsolation": true}, []string{"api", "old-name", "BAD ALIAS", ""}), "",
 	)
 	// Permanent UUID alias plus the two valid friendly aliases.
 	for _, want := range []string{
@@ -64,7 +67,7 @@ func TestRollingContainerArgsAppliesLimits(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-green", "svc-1", "green", "img", "/env",
 		resourceLimits{cpuMillicores: 1500, memoryMB: 512, restartPolicy: "on-failure"},
-		nil, "",
+		isolationFromPayload(nil), networkPlanFromPayload("svc-1", map[string]interface{}{"networkIsolation": true}, nil), "",
 	)
 	if !containsFlag(args, "--memory=512m") {
 		t.Errorf("expected --memory=512m, got: %v", args)
@@ -81,7 +84,7 @@ func TestRollingContainerArgsOmitsUnsetLimits(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-blue", "svc-1", "blue", "img", "/env",
 		resourceLimits{restartPolicy: "unless-stopped"},
-		nil, "",
+		isolationFromPayload(nil), networkPlanFromPayload("svc-1", nil, nil), "",
 	)
 	for _, a := range args {
 		if strings.HasPrefix(a, "--memory=") || strings.HasPrefix(a, "--cpus=") {
@@ -147,7 +150,7 @@ func TestRequiresFastRestartForAnyAttachedStorage(t *testing.T) {
 
 func TestRollingContainerArgsAppliesDockerImageCommand(t *testing.T) {
 	args := rollingContainerArgs("svc-blue", "svc", "blue", "image", "/env",
-		resourceLimits{restartPolicy: "unless-stopped"}, nil, "node server.js && echo ready")
+		resourceLimits{restartPolicy: "unless-stopped"}, isolationFromPayload(nil), networkPlanFromPayload("svc", nil, nil), "node server.js && echo ready")
 	want := []string{"image", "sh", "-lc", "node server.js && echo ready"}
 	if len(args) < len(want) {
 		t.Fatalf("missing command args: %v", args)

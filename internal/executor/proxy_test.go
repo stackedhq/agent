@@ -642,6 +642,55 @@ func TestGenerateCaddyfileNoOnDemandWithoutServerURL(t *testing.T) {
 	}
 }
 
+func TestBuildGateConfigCanonicalizesHosts(t *testing.T) {
+	parsed := []cachedDomain{
+		{
+			Domain:               "ExAmPlE.com.",
+			ServiceID:            "svc-1",
+			Port:                 3000,
+			AuthGateMode:         "password",
+			AuthGateUsername:     "alice",
+			AuthGatePasswordHash: "hash",
+			ServiceName:          "App",
+		},
+		{
+			Domain:       "open.example.com",
+			ServiceID:    "svc-2",
+			Port:         3000,
+			AuthGateMode: "",
+		},
+		{
+			Domain:               "Other.COM:443",
+			ServiceID:            "svc-3",
+			Port:                 3000,
+			AuthGateMode:         "password",
+			AuthGateUsername:     "bob",
+			AuthGatePasswordHash: "hash2",
+		},
+	}
+	cfg := buildGateConfig(parsed)
+	if len(cfg.Domains) != 2 {
+		t.Fatalf("gated domains = %d, want 2: %#v", len(cfg.Domains), cfg.Domains)
+	}
+	example, ok := cfg.Domains["example.com"]
+	if !ok {
+		t.Fatalf("expected canonical key example.com, got %#v", cfg.Domains)
+	}
+	if example.Username != "alice" || example.ServiceName != "App" {
+		t.Fatalf("example.com entry = %#v", example)
+	}
+	other, ok := cfg.Domains["other.com"]
+	if !ok {
+		t.Fatalf("expected canonical key other.com, got %#v", cfg.Domains)
+	}
+	if other.Username != "bob" || other.ServiceName != "other.com" {
+		t.Fatalf("other.com entry = %#v", other)
+	}
+	if _, ok := cfg.Domains["ExAmPlE.com."]; ok {
+		t.Fatal("mixed-case domain must not be used as a config key")
+	}
+}
+
 func TestGenerateCaddyfileNoGlobalBlockWhenNoOnDemand(t *testing.T) {
 	// A normal (no on-demand) config must not gain a global options
 	// block — keeps the rendered file byte-identical to pre-feature
@@ -653,5 +702,18 @@ func TestGenerateCaddyfileNoGlobalBlockWhenNoOnDemand(t *testing.T) {
 	out := generateCaddyfile(parsed, map[string]slots.Slot{})
 	if strings.Contains(out, "on_demand_tls") {
 		t.Fatalf("did not expect global on_demand_tls block, got:\n%s", out)
+	}
+}
+
+func TestGenerateCaddyfileAuthGateForwardsClientIP(t *testing.T) {
+	parsed := []cachedDomain{
+		{Domain: "app.example.com", ServiceID: "svc-1", Port: 3000, AuthGateMode: "password"},
+	}
+	out := generateCaddyfile(parsed, map[string]slots.Slot{})
+	if !strings.Contains(out, "header_up X-Real-IP {remote_host}") {
+		t.Fatalf("expected X-Real-IP from Caddy remote_host, got:\n%s", out)
+	}
+	if !strings.Contains(out, "header_up X-Forwarded-For {remote_host}") {
+		t.Fatalf("expected X-Forwarded-For from Caddy remote_host, got:\n%s", out)
 	}
 }

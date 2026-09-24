@@ -5,22 +5,19 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/ids"
 )
 
 const (
-	managedServiceDataRoot = "/opt/stacked/data/services"
-	maxFileMountContent    = 64 * 1024
-	maxFileMountTotal      = 512 * 1024
-	maxManagedFileMounts   = 20
+	maxFileMountContent  = 64 * 1024
+	maxFileMountTotal    = 512 * 1024
+	maxManagedFileMounts = 20
 )
-
-var fileMountIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type managedFileMount struct {
 	ID            string
@@ -60,14 +57,23 @@ func (e *Executor) prepareFileMounts(op client.Operation, serviceID string) ([]v
 }
 
 func materializeFileMounts(serviceID string, mounts []client.FileMount) ([]volumeMount, error) {
-	if !fileMountIDPattern.MatchString(serviceID) {
-		return nil, fmt.Errorf("invalid service ID for managed file mounts")
+	svcRoot, err := ids.Child(managedServiceDataRoot, serviceID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid service ID for managed file mounts: %w", err)
 	}
-	root := filepath.Join(managedServiceDataRoot, serviceID, "files")
+	root := filepath.Join(svcRoot, "files")
 	if err := rejectSymlinkPathComponents(managedServiceDataRoot, root); err != nil {
 		return nil, err
 	}
-	return materializeFileMountsAt(root, mounts)
+	result, err := materializeFileMountsAt(root, mounts)
+	if err != nil {
+		return nil, err
+	}
+	parent := filepath.Join(managedServiceDataRoot, serviceID)
+	if err := chmodDirNoFollow(parent, 0o700); err != nil {
+		return nil, fmt.Errorf("lock service parent %s: %w", parent, err)
+	}
+	return result, nil
 }
 
 // materializeFileMountsAt validates every response before writing it, then
@@ -103,11 +109,11 @@ func validateFileMounts(mounts []client.FileMount) ([]managedFileMount, error) {
 		return nil, fmt.Errorf("too many managed file mounts")
 	}
 	validated := make([]managedFileMount, 0, len(mounts))
-	ids := make(map[string]struct{}, len(mounts))
+	seenIDs := make(map[string]struct{}, len(mounts))
 	paths := make(map[string]struct{}, len(mounts))
 	totalBytes := 0
 	for _, mount := range mounts {
-		if !fileMountIDPattern.MatchString(mount.ID) {
+		if err := ids.Validate(mount.ID); err != nil {
 			return nil, fmt.Errorf("managed file mount has invalid ID")
 		}
 		if !validContainerFilePath(mount.ContainerPath) {
@@ -121,7 +127,7 @@ func validateFileMounts(mounts []client.FileMount) ([]managedFileMount, error) {
 		if totalBytes > maxFileMountTotal {
 			return nil, fmt.Errorf("managed file mounts exceed total content limit")
 		}
-		if _, exists := ids[mount.ID]; exists {
+		if _, exists := seenIDs[mount.ID]; exists {
 			return nil, fmt.Errorf("managed file mounts contain duplicate ID")
 		}
 		for existingPath := range paths {
@@ -129,7 +135,7 @@ func validateFileMounts(mounts []client.FileMount) ([]managedFileMount, error) {
 				return nil, fmt.Errorf("managed file mounts contain conflicting container paths")
 			}
 		}
-		ids[mount.ID] = struct{}{}
+		seenIDs[mount.ID] = struct{}{}
 		paths[containerPath] = struct{}{}
 		validated = append(validated, managedFileMount{
 			ID:            mount.ID,

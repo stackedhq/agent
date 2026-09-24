@@ -66,7 +66,7 @@ func TestGenerateCompose_AppliesLimits(t *testing.T) {
 		cpuMillicores: 1500,
 		memoryMB:      512,
 		restartPolicy: "always",
-	}, nil, "")
+	}, isolationFromPayload(nil), networkPlanFromPayload("svc-1", nil, nil), "")
 	for _, want := range []string{
 		"restart: always",
 		"mem_limit: 512m",
@@ -79,22 +79,22 @@ func TestGenerateCompose_AppliesLimits(t *testing.T) {
 }
 
 func TestGenerateCompose_NetworkAliases(t *testing.T) {
-	// No aliases → historical list form, no aliases key.
+	// Legacy payload (no link schema) stays on the shared stacked network.
 	plain := generateCompose("svc-1", "img:latest", nil,
-		resourceLimits{restartPolicy: "unless-stopped"}, nil, "")
+		resourceLimits{restartPolicy: "unless-stopped"}, isolationFromPayload(nil), networkPlanFromPayload("svc-1", nil, nil), "")
 	if !strings.Contains(plain, "    networks:\n      - stacked\n") {
-		t.Errorf("expected list-form networks block without aliases:\n%s", plain)
+		t.Errorf("expected shared stacked network:\n%s", plain)
 	}
 	if strings.Contains(plain, "aliases:") {
 		t.Errorf("did not expect aliases key without aliases:\n%s", plain)
 	}
 
-	// With aliases → map form carrying the valid labels; invalid dropped.
+	// Isolated + aliases → map form on the per-service net; invalid dropped.
 	withAliases := generateCompose("svc-1", "img:latest", nil,
 		resourceLimits{restartPolicy: "unless-stopped"},
-		[]string{"api", "old-name", "BAD ALIAS"}, "")
+		isolationFromPayload(nil), networkPlanFromPayload("svc-1", map[string]interface{}{"networkIsolation": true}, []string{"api", "old-name", "BAD ALIAS"}), "")
 	for _, want := range []string{
-		"stacked:",
+		"stacked-svc-svc-1:",
 		"aliases:",
 		"- api",
 		"- old-name",
@@ -110,7 +110,7 @@ func TestGenerateCompose_NetworkAliases(t *testing.T) {
 
 func TestGenerateCompose_EscapesDockerImageCommand(t *testing.T) {
 	command := "node server.js\nlabels: [injected]"
-	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"}, nil, command)
+	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"}, isolationFromPayload(nil), networkPlanFromPayload("svc-1", nil, nil), command)
 	if !strings.Contains(out, "    command: [\"sh\",\"-lc\",\"node server.js\\nlabels: [injected]\"]\n") {
 		t.Fatalf("command must be a JSON-quoted YAML argv array:\n%s", out)
 	}
@@ -136,7 +136,7 @@ func TestDockerCommandOverrideTrimsAndRequiresDockerImage(t *testing.T) {
 func TestGenerateCompose_OmitsUnsetLimits(t *testing.T) {
 	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{
 		restartPolicy: "unless-stopped",
-	}, nil, "")
+	}, isolationFromPayload(nil), networkPlanFromPayload("svc-1", nil, nil), "")
 	if strings.Contains(out, "mem_limit") {
 		t.Errorf("expected no mem_limit when unset:\n%s", out)
 	}
