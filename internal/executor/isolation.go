@@ -82,9 +82,9 @@ func isolationFromPayload(payload map[string]interface{}) isolationSpec {
 		spec.CapAdd = nil
 	}
 	if payloadHasKey(payload, "capDrop") {
-		spec.CapDrop = parseStringList(payload, "capDrop")
+		spec.CapDrop = filterLinuxCaps(parseStringList(payload, "capDrop"))
 	}
-	if adds := parseStringList(payload, "capAdd"); len(adds) > 0 && !spec.Privileged {
+	if adds := filterLinuxCaps(parseStringList(payload, "capAdd")); len(adds) > 0 && !spec.Privileged {
 		spec.CapAdd = uniqueSorted(adds)
 	}
 	if n := getIntPayload(payload, "pidsLimit"); n > 0 {
@@ -94,7 +94,7 @@ func isolationFromPayload(payload map[string]interface{}) isolationSpec {
 		spec.ReadOnly = true
 		spec.Tmpfs = []string{"/run", "/tmp", "/var/run"}
 	}
-	if extra := parseStringList(payload, "tmpfs"); len(extra) > 0 {
+	if extra := filterAbsPaths(parseStringList(payload, "tmpfs")); len(extra) > 0 {
 		spec.Tmpfs = uniqueSorted(append(spec.Tmpfs, extra...))
 	} else if len(spec.Tmpfs) > 0 {
 		spec.Tmpfs = uniqueSorted(spec.Tmpfs)
@@ -120,13 +120,13 @@ func renderComposeIsolation(spec isolationSpec) string {
 	if len(spec.CapDrop) > 0 {
 		b.WriteString("    cap_drop:\n")
 		for _, c := range spec.CapDrop {
-			fmt.Fprintf(&b, "      - %s\n", c)
+			fmt.Fprintf(&b, "      - %s\n", yamlQuote(c))
 		}
 	}
 	if len(spec.CapAdd) > 0 {
 		b.WriteString("    cap_add:\n")
 		for _, c := range spec.CapAdd {
-			fmt.Fprintf(&b, "      - %s\n", c)
+			fmt.Fprintf(&b, "      - %s\n", yamlQuote(c))
 		}
 	}
 	if spec.PidsLimit > 0 {
@@ -138,7 +138,7 @@ func renderComposeIsolation(spec isolationSpec) string {
 	if len(spec.Tmpfs) > 0 {
 		b.WriteString("    tmpfs:\n")
 		for _, t := range spec.Tmpfs {
-			fmt.Fprintf(&b, "      - %s\n", t)
+			fmt.Fprintf(&b, "      - %s\n", yamlQuote(t))
 		}
 	}
 	return b.String()
@@ -168,6 +168,51 @@ func isolationDockerArgs(spec isolationSpec) []string {
 		args = append(args, "--tmpfs="+t)
 	}
 	return args
+}
+
+func filterLinuxCaps(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, c := range in {
+		if c == "" {
+			continue
+		}
+		ok := true
+		for _, r := range c {
+			if (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func filterAbsPaths(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		if p == "" || !strings.HasPrefix(p, "/") || strings.ContainsRune(p, 0) {
+			continue
+		}
+		// tmpfs destinations are paths, not bind specs. A colon lets a
+		// payload smuggle `host:container` into compose.
+		if strings.ContainsAny(p, ":,\n\r\t ") {
+			continue
+		}
+		skip := false
+		for _, part := range strings.Split(p, "/") {
+			if part == ".." {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func payloadHasKey(payload map[string]interface{}, key string) bool {

@@ -17,9 +17,14 @@ const (
 )
 
 // networkPlan is the set of Docker networks a service (or one-shot
-// cron/release container) joins. Isolation default: the service sits on
-// its own `stacked-svc-<id>` network (Caddy is attached after start) and
-// can reach databases only via `stacked-data` or explicit
+// cron/release container) joins.
+//
+// Isolation is opt-in. A payload with no `networkIsolation` /
+// `linkedServiceIds` / `linkedDatabaseIds` stays on the historical
+// shared `stacked` network so already-running siblings still resolve
+// after upgrade. When isolation is on, the service sits on its own
+// `stacked-svc-<id>` network (Caddy is attached after start) and can
+// reach databases only via `stacked-data` or explicit
 // `linkedDatabaseIds`. Sibling apps are unreachable unless listed in
 // `linkedServiceIds`.
 //
@@ -54,10 +59,15 @@ func networkPlanFromPayload(serviceID string, payload map[string]interface{}, al
 	if serviceID == "" {
 		return sharedNetworkPlan(aliases)
 	}
-	isolated := true
+	// Isolation is opt-in via the modern link schema. A payload that omits
+	// networkIsolation / linked* keeps the historical shared `stacked`
+	// network so already-running siblings still resolve after upgrade.
+	isolated := false
 	if payload != nil {
 		if v, ok := payload["networkIsolation"].(bool); ok {
 			isolated = v
+		} else if payloadHasKey(payload, "linkedServiceIds") || payloadHasKey(payload, "linkedDatabaseIds") {
+			isolated = true
 		}
 	}
 	if getBoolPayload(payload, "isolationRelaxed", false) {

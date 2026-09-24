@@ -59,12 +59,12 @@ func TestIsolationOptIns(t *testing.T) {
 	yml := renderComposeIsolation(got)
 	for _, want := range []string{
 		"cap_drop:",
-		"- ALL",
+		`- "ALL"`,
 		"cap_add:",
-		"- NET_BIND_SERVICE",
+		`- "NET_BIND_SERVICE"`,
 		"pids_limit: 256",
 		"read_only: true",
-		"- /tmp",
+		`- "/tmp"`,
 	} {
 		if !strings.Contains(yml, want) {
 			t.Errorf("compose missing %q:\n%s", want, yml)
@@ -82,6 +82,17 @@ func TestIsolationOptIns(t *testing.T) {
 	}
 	if containsFlag(args, "--security-opt=no-new-privileges:true") {
 		t.Errorf("nnp flag must be omitted: %v", args)
+	}
+}
+
+func TestIsolationDropsYAMLInjectedCapsAndTmpfs(t *testing.T) {
+	got := isolationFromPayload(map[string]interface{}{
+		"capAdd": []interface{}{"SYS_ADMIN\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock"},
+		"tmpfs":  []interface{}{"/var/run/docker.sock:/var/run/docker.sock"},
+	})
+	yml := renderComposeIsolation(got)
+	if strings.Contains(yml, "docker.sock") || strings.Contains(yml, "volumes:") {
+		t.Fatalf("injected compose escaped isolation:\n%s", yml)
 	}
 }
 
@@ -107,7 +118,7 @@ func TestGenerateCompose_DefaultIsolation(t *testing.T) {
 		"security_opt:",
 		"no-new-privileges:true",
 		"cap_drop:",
-		"- ALL",
+		`- "ALL"`,
 		"pids_limit: 1024",
 	} {
 		if !strings.Contains(out, want) {
@@ -137,9 +148,9 @@ func TestDatabaseIsolation_OfficialImages(t *testing.T) {
 		for _, want := range []string{
 			"no-new-privileges:true",
 			"cap_drop:",
-			"- ALL",
+			`- "ALL"`,
 			"cap_add:",
-			"- SETUID",
+			`- "SETUID"`,
 			"pids_limit: 4096",
 			"stacked-data",
 			"stacked-db-db-" + dbType,

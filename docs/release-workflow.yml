@@ -69,11 +69,15 @@ jobs:
 
       - name: Determine tag
         id: tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            CURRENT="${{ github.event.inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            CURRENT="$DISPATCH_TAG"
           else
-            CURRENT="${GITHUB_REF_NAME}"
+            CURRENT="$REF_NAME"
           fi
           echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
 
@@ -127,11 +131,15 @@ jobs:
 
       - name: Determine tag range
         id: tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            CURRENT="${{ github.event.inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            CURRENT="$DISPATCH_TAG"
           else
-            CURRENT="${GITHUB_REF_NAME}"
+            CURRENT="$REF_NAME"
           fi
           PREV=$(git tag --sort=-v:refname | grep -E '^v' | grep -v "^${CURRENT}$" | head -1)
           if [ -z "$PREV" ]; then
@@ -223,11 +231,15 @@ jobs:
     steps:
       - name: Determine tag
         id: tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            CURRENT="${{ github.event.inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            CURRENT="$DISPATCH_TAG"
           else
-            CURRENT="${GITHUB_REF_NAME}"
+            CURRENT="$REF_NAME"
           fi
           echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
 

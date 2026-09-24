@@ -79,16 +79,17 @@ Until [the helper in the trust-boundary doc](docs/trust-boundary.md) ships, assu
 
 ## Container isolation
 
-Every service container now starts with a reduced breakout surface, and each service gets its own Docker network so a compromised app cannot scan sibling workloads.
+Every service container now starts with a reduced breakout surface. Network segmentation is opt-in so a fleet upgrade does not strand services that still talk over the historical shared `stacked` network.
 
 **Defaults (compose and rolling are equivalent):**
 
 - `no-new-privileges:true`
 - `cap_drop: [ALL]` (add capabilities back with `capAdd`)
 - `pids_limit: 1024` (databases: `4096` plus the `CHOWN`/`SETUID`/`SETGID`/`FOWNER`/`SETPCAP`/`DAC_OVERRIDE`/`SYS_NICE` set official engine images need)
-- Per-service network `stacked-svc-<serviceId>`; Caddy is attached so HTTP still works
-- Managed databases join `stacked-db-<databaseId>`, the shared `stacked-data` plane, and `stacked` (for `networkIsolation: false` services)
-- Services without `linkedDatabaseIds` also join `stacked-data` so existing `DATABASE_URL` hostnames keep working
+- Shared `stacked` network unless the payload sets `networkIsolation: true` or sends `linkedServiceIds` / `linkedDatabaseIds`
+- Isolated services use `stacked-svc-<serviceId>`; Caddy is attached so HTTP still works
+- Managed databases join `stacked-db-<databaseId>`, the shared `stacked-data` plane, and `stacked`
+- Isolated services without `linkedDatabaseIds` also join `stacked-data` so existing `DATABASE_URL` hostnames keep working
 
 **Payload escape hatches**
 

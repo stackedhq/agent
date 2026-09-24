@@ -294,6 +294,9 @@ func decodeServiceDeploy(opType string, raw map[string]interface{}, release bool
 			p.FileMounts = append(p.FileMounts, FileMountMeta{ID: id, ContainerPath: cp})
 		}
 	}
+	if err := validateIsolationFields(raw); err != nil {
+		return nil, err
+	}
 	return p, nil
 }
 
@@ -342,6 +345,7 @@ func decodeCronRun(raw map[string]interface{}) (Payload, error) {
 	if err := rejectUnknown(raw, withSchema(
 		"mode", "serviceId", "command", "dockerImage", "runId",
 		"httpUrl", "httpMethod", "httpBody", "httpHeaders",
+		"httpAllowPrivate", "httpAllowLoopback",
 		"isolationRelaxed", "allowPrivilegeEscalation", "privileged", "readOnlyRoot",
 		"capAdd", "capDrop", "pidsLimit", "tmpfs",
 		"networkIsolation", "linkedServiceIds", "linkedDatabaseIds",
@@ -418,6 +422,15 @@ func decodeCronRun(raw map[string]interface{}) (Payload, error) {
 		if err := optionalUUID("runId", p.RunID); err != nil {
 			return nil, err
 		}
+	}
+	if _, err := asBool(raw["httpAllowPrivate"], "httpAllowPrivate"); err != nil {
+		return nil, err
+	}
+	if _, err := asBool(raw["httpAllowLoopback"], "httpAllowLoopback"); err != nil {
+		return nil, err
+	}
+	if err := validateIsolationFields(raw); err != nil {
+		return nil, err
 	}
 	return p, nil
 }
@@ -647,7 +660,7 @@ type SelfUpdate struct {
 func (SelfUpdate) OpType() string { return "self_update" }
 
 func decodeSelfUpdate(raw map[string]interface{}) (Payload, error) {
-	if err := rejectUnknown(raw, withSchema("targetVersion", "downloadUrl"), "self_update"); err != nil {
+	if err := rejectUnknown(raw, withSchema("targetVersion", "downloadUrl", "allowDowngrade"), "self_update"); err != nil {
 		return nil, err
 	}
 	ver, err := asString(raw["targetVersion"], "targetVersion")
@@ -663,6 +676,9 @@ func decodeSelfUpdate(raw map[string]interface{}) (Payload, error) {
 	}
 	if u != "" && !validHTTPSURL(u) {
 		return nil, fmt.Errorf("downloadUrl is invalid")
+	}
+	if _, err := asBool(raw["allowDowngrade"], "allowDowngrade"); err != nil {
+		return nil, err
 	}
 	return SelfUpdate{TargetVersion: ver, DownloadURL: u}, nil
 }
@@ -746,7 +762,7 @@ func decodeDBProvision(raw map[string]interface{}) (Payload, error) {
 		return nil, err
 	}
 	if p.AccessMode == "" {
-		p.AccessMode = "public"
+		p.AccessMode = "internal"
 	}
 	if !validAccessMode(p.AccessMode) {
 		return nil, fmt.Errorf("accessMode is invalid")
@@ -1001,14 +1017,23 @@ func decodeDBMigrate(raw map[string]interface{}) (Payload, error) {
 
 // VolumeMigrate copies a host path into the managed volume namespace.
 type VolumeMigrate struct {
-	SourceVolumePath string
-	TargetVolumePath string
+	MigrationTargetID   string
+	SourceVolumePath    string
+	TargetVolumePath    string
+	SourceContainerName string
 }
 
 func (VolumeMigrate) OpType() string { return "volume_migrate" }
 
 func decodeVolumeMigrate(raw map[string]interface{}) (Payload, error) {
-	if err := rejectUnknown(raw, withSchema("sourceVolumePath", "targetVolumePath"), "volume_migrate"); err != nil {
+	if err := rejectUnknown(raw, withSchema("migrationTargetId", "sourceVolumePath", "targetVolumePath", "sourceContainerName"), "volume_migrate"); err != nil {
+		return nil, err
+	}
+	id, err := asString(raw["migrationTargetId"], "migrationTargetId")
+	if err != nil {
+		return nil, err
+	}
+	if err := requireUUID("migrationTargetId", id); err != nil {
 		return nil, err
 	}
 	src, err := asString(raw["sourceVolumePath"], "sourceVolumePath")
@@ -1019,13 +1044,79 @@ func decodeVolumeMigrate(raw map[string]interface{}) (Payload, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !validAbsPath(src) {
+	if src != "" && !validAbsPath(src) {
 		return nil, fmt.Errorf("sourceVolumePath is invalid")
 	}
-	if !validAbsPath(tgt) {
+	if tgt != "" && !validAbsPath(tgt) {
 		return nil, fmt.Errorf("targetVolumePath is invalid")
 	}
-	return VolumeMigrate{SourceVolumePath: src, TargetVolumePath: tgt}, nil
+	container, err := asString(raw["sourceContainerName"], "sourceContainerName")
+	if err != nil {
+		return nil, err
+	}
+	if container != "" {
+		if err := requireDockerName("sourceContainerName", container); err != nil {
+			return nil, err
+		}
+	}
+	return VolumeMigrate{
+		MigrationTargetID:   id,
+		SourceVolumePath:    src,
+		TargetVolumePath:    tgt,
+		SourceContainerName: container,
+	}, nil
+}
+
+func validateIsolationFields(raw map[string]interface{}) error {
+	for _, key := range []string{"isolationRelaxed", "allowPrivilegeEscalation", "privileged", "readOnlyRoot", "networkIsolation"} {
+		if _, err := asBool(raw[key], key); err != nil {
+			return err
+		}
+	}
+	if n, err := asInt(raw["pidsLimit"], "pidsLimit"); err != nil {
+		return err
+	} else if n < 0 || n > 1_000_000 {
+		return fmt.Errorf("pidsLimit is out of range")
+	}
+	caps, err := asStringSlice(raw["capAdd"], "capAdd", 32)
+	if err != nil {
+		return err
+	}
+	for i, c := range caps {
+		if !validLinuxCapability(c) {
+			return fmt.Errorf("capAdd[%d] is invalid", i)
+		}
+	}
+	drops, err := asStringSlice(raw["capDrop"], "capDrop", 32)
+	if err != nil {
+		return err
+	}
+	for i, c := range drops {
+		if !validLinuxCapability(c) {
+			return fmt.Errorf("capDrop[%d] is invalid", i)
+		}
+	}
+	tmpfs, err := asStringSlice(raw["tmpfs"], "tmpfs", 16)
+	if err != nil {
+		return err
+	}
+	for i, p := range tmpfs {
+		if !validAbsPath(p) {
+			return fmt.Errorf("tmpfs[%d] is invalid", i)
+		}
+	}
+	for _, key := range []string{"linkedServiceIds", "linkedDatabaseIds"} {
+		ids, err := asStringSlice(raw[key], key, 64)
+		if err != nil {
+			return err
+		}
+		for i, id := range ids {
+			if err := requireUUID(fmt.Sprintf("%s[%d]", key, i), id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // DBBackup dumps a database to object storage.

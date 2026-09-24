@@ -7,14 +7,24 @@ import (
 
 func TestNetworkPlanDefaultIsolation(t *testing.T) {
 	plan := networkPlanFromPayload("svc-1", nil, []string{"api"})
+	if plan.Isolation || plan.Primary != stackedNetwork {
+		t.Fatalf("legacy payload must stay on shared stacked, got %+v", plan)
+	}
+	if len(plan.Attach) != 0 {
+		t.Fatalf("shared plan attach = %v", plan.Attach)
+	}
+	if len(plan.Aliases) != 1 || plan.Aliases[0] != "api" {
+		t.Fatalf("aliases = %v", plan.Aliases)
+	}
+}
+
+func TestNetworkPlanOptInIsolation(t *testing.T) {
+	plan := networkPlanFromPayload("svc-1", map[string]interface{}{"networkIsolation": true}, []string{"api"})
 	if !plan.Isolation || plan.Primary != "stacked-svc-svc-1" {
 		t.Fatalf("plan = %+v", plan)
 	}
 	if len(plan.Attach) != 1 || plan.Attach[0] != stackedDataNetwork {
 		t.Fatalf("compat data attach = %v", plan.Attach)
-	}
-	if len(plan.Aliases) != 1 || plan.Aliases[0] != "api" {
-		t.Fatalf("aliases = %v", plan.Aliases)
 	}
 }
 
@@ -94,13 +104,16 @@ func TestRollingAndComposeNetworkEquivalent(t *testing.T) {
 	if !strings.Contains(compose, "stacked-svc-svc-1") || !containsFlag(args, "--network=stacked-svc-svc-1") {
 		t.Fatalf("primary network mismatch\ncompose:\n%s\nargs: %v", compose, args)
 	}
-	if !strings.Contains(compose, "- api") || !containsFlag(args, "--network-alias=api") {
+	if !strings.Contains(compose, "- api") && !strings.Contains(compose, `- "api"`) {
+		t.Fatalf("alias missing in compose:\n%s", compose)
+	}
+	if !containsFlag(args, "--network-alias=api") {
 		t.Fatalf("alias mismatch\ncompose:\n%s\nargs: %v", compose, args)
 	}
 	if !strings.Contains(compose, "no-new-privileges:true") || !containsFlag(args, "--security-opt=no-new-privileges:true") {
 		t.Fatalf("nnp mismatch")
 	}
-	if !strings.Contains(compose, "- NET_BIND_SERVICE") || !containsFlag(args, "--cap-add=NET_BIND_SERVICE") {
+	if !strings.Contains(compose, `- "NET_BIND_SERVICE"`) || !containsFlag(args, "--cap-add=NET_BIND_SERVICE") {
 		t.Fatalf("capAdd mismatch\ncompose:\n%s\nargs: %v", compose, args)
 	}
 	if !strings.Contains(compose, "stacked-svc-other") || !strings.Contains(compose, "stacked-db-db-1") {

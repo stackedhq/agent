@@ -11,7 +11,7 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 		serviceID+"-blue", serviceID, "blue",
 		"registry/app:tag", "/opt/stacked/services/svc-123/.env",
 		resourceLimits{restartPolicy: "unless-stopped"},
-		isolationFromPayload(nil), networkPlanFromPayload(serviceID, nil, nil), "",
+		isolationFromPayload(nil), networkPlanFromPayload(serviceID, map[string]interface{}{"networkIsolation": true}, nil), "",
 	)
 
 	// The slot container is named per-slot but must alias the bare
@@ -40,7 +40,7 @@ func TestRollingContainerArgsFriendlyAliases(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-blue", "svc-1", "blue", "img", "/env",
 		resourceLimits{restartPolicy: "unless-stopped"},
-		isolationFromPayload(nil), networkPlanFromPayload("svc-1", nil, []string{"api", "old-name", "BAD ALIAS", ""}), "",
+		isolationFromPayload(nil), networkPlanFromPayload("svc-1", map[string]interface{}{"networkIsolation": true}, []string{"api", "old-name", "BAD ALIAS", ""}), "",
 	)
 	// Permanent UUID alias plus the two valid friendly aliases.
 	for _, want := range []string{
@@ -67,7 +67,7 @@ func TestRollingContainerArgsAppliesLimits(t *testing.T) {
 	args := rollingContainerArgs(
 		"svc-1-green", "svc-1", "green", "img", "/env",
 		resourceLimits{cpuMillicores: 1500, memoryMB: 512, restartPolicy: "on-failure"},
-		isolationFromPayload(nil), networkPlanFromPayload("svc-1", nil, nil), "",
+		isolationFromPayload(nil), networkPlanFromPayload("svc-1", map[string]interface{}{"networkIsolation": true}, nil), "",
 	)
 	if !containsFlag(args, "--memory=512m") {
 		t.Errorf("expected --memory=512m, got: %v", args)

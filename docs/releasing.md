@@ -38,7 +38,7 @@ Payload:
 | `allowDowngrade` | no | `true` to install an older signed release |
 | `downloadUrl` | ignored unless it is exactly the official `https://github.com/stackedhq/agent/releases/download/v<ver>/stacked-agent-linux-<arch>` URL |
 
-The agent always pulls the binary, `SHA256SUMS`, and `SHA256SUMS.sig` from that origin. It rejects non-HTTPS, redirects off GitHub, oversized assets (>64MiB), invalid SemVer, and downgrades. Verification failure leaves `/opt/stacked/agent` untouched.
+The agent always pulls the binary, `SHA256SUMS`, and `SHA256SUMS.sig` from that origin. The first hop must be `github.com/stackedhq/agent/releases/download`; GitHub's 302 onto `release-assets.githubusercontent.com` / `objects.githubusercontent.com` is allowed. It rejects non-HTTPS, other redirect hosts, oversized assets (>64MiB), invalid SemVer, and downgrades. Verification failure leaves `/opt/stacked/agent` untouched.
 
 ## install.sh (server repo)
 

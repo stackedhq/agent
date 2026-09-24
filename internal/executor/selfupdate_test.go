@@ -300,3 +300,70 @@ func TestCheckRedirectRejectsHTTPSDowngrade(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestDownloadReleaseFileFollowsGitHubAssetRedirect(t *testing.T) {
+	dir := t.TempDir()
+	body := []byte("signed-agent-bytes")
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	}))
+	t.Cleanup(cdn.Close)
+	cdnURL, err := url.Parse(cdn.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cdn.URL+r.URL.Path, http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prevScheme, prevHost, prevPrefix, prevAssets := releaseScheme, releaseHost, releasePrefix, releaseAssetHosts
+	releaseScheme = "http"
+	releaseHost = originURL.Host
+	releasePrefix = "/stackedhq/agent/releases/download"
+	releaseAssetHosts = map[string]struct{}{cdnURL.Host: {}}
+	t.Cleanup(func() {
+		releaseScheme, releaseHost, releasePrefix, releaseAssetHosts = prevScheme, prevHost, prevPrefix, prevAssets
+	})
+
+	dest := filepath.Join(dir, "out")
+	if err := downloadReleaseFile(dest, origin.URL+releasePrefix+"/v1.0.0/stacked-agent-linux-amd64"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestDownloadReleaseFileRejectsUnknownRedirectHost(t *testing.T) {
+	dir := t.TempDir()
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("nope"))
+	}))
+	t.Cleanup(evil.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evil.URL+"/pwn", http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, _ := url.Parse(origin.URL)
+
+	prevScheme, prevHost, prevPrefix := releaseScheme, releaseHost, releasePrefix
+	releaseScheme, releaseHost, releasePrefix = "http", originURL.Host, "/stackedhq/agent/releases/download"
+	t.Cleanup(func() {
+		releaseScheme, releaseHost, releasePrefix = prevScheme, prevHost, prevPrefix
+	})
+
+	err := downloadReleaseFile(filepath.Join(dir, "out"), origin.URL+releasePrefix+"/v1.0.0/x")
+	if err == nil || !strings.Contains(err.Error(), "refusing redirect off release host") {
+		t.Fatalf("got %v", err)
+	}
+}

@@ -67,9 +67,13 @@ func TestDecode_EveryOpTypeHappyPath(t *testing.T) {
 		}},
 		{"db_migrate", map[string]interface{}{"migrationTargetId": id3, "dbType": "mysql"}},
 		{"volume_migrate", map[string]interface{}{
-			"sourceVolumePath": "/var/lib/dokploy/data",
-			"targetVolumePath": "/opt/stacked/data/services/" + svc + "/data",
+			"migrationTargetId": id3,
+			"sourceVolumePath":  "/var/lib/dokploy/data",
+			"targetVolumePath":  "/opt/stacked/data/services/" + svc + "/data",
 		}},
+		{"volume_migrate", map[string]interface{}{"migrationTargetId": id3}},
+		{"cron_run", map[string]interface{}{"mode": "http", "httpUrl": "https://example.com/cron", "httpAllowPrivate": false, "httpAllowLoopback": true}},
+		{"self_update", map[string]interface{}{"targetVersion": "0.9.0", "allowDowngrade": true}},
 		{"db_backup", map[string]interface{}{"databaseId": db, "backupId": id3}},
 		{"db_restore", map[string]interface{}{"databaseId": db, "restoreBackupId": id3, "safetyBackupId": svc}},
 		{"db_query", map[string]interface{}{}},
@@ -162,8 +166,20 @@ func TestDecode_MalformedEveryOpType(t *testing.T) {
 		}, "container"},
 		{"migrate bad type", "db_migrate", map[string]interface{}{"migrationTargetId": id3, "dbType": "cassandra"}, "dbType"},
 		{"volume_migrate relative", "volume_migrate", map[string]interface{}{
-			"sourceVolumePath": "etc/passwd", "targetVolumePath": "/opt/stacked/data/services/x",
+			"migrationTargetId": id3, "sourceVolumePath": "etc/passwd",
 		}, "invalid"},
+		{"volume_migrate missing id", "volume_migrate", map[string]interface{}{
+			"sourceVolumePath": "/var/lib/dokploy/data", "targetVolumePath": "/opt/stacked/data/services/x",
+		}, "UUID"},
+		{"cron unknown http flag", "cron_run", map[string]interface{}{
+			"mode": "http", "httpUrl": "https://example.com", "httpAllowLan": true,
+		}, "unknown"},
+		{"self_update allowDowngrade type", "self_update", map[string]interface{}{
+			"targetVersion": "0.9.0", "allowDowngrade": "yes",
+		}, "boolean"},
+		{"deploy yaml capAdd", "deploy", map[string]interface{}{
+			"serviceId": svc, "capAdd": []interface{}{"SYS_ADMIN\n    volumes:"},
+		}, "capAdd"},
 		{"backup bad ids", "db_backup", map[string]interface{}{"databaseId": "x", "backupId": "y"}, "UUID"},
 		{"restore missing restore id", "db_restore", map[string]interface{}{"databaseId": db}, "UUID"},
 		{"db_query extra", "db_query", map[string]interface{}{"sql": "select 1"}, "unknown"},

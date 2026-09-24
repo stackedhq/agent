@@ -24,6 +24,15 @@ var (
 	exitFunc        = os.Exit
 )
 
+// GitHub never serves release bytes from github.com. The first hop 302s to
+// Azure Blob behind one of these hosts, with a short-lived SAS+JWT. The
+// initial GET stays pinned to github.com/stackedhq/agent/releases/download;
+// only these hosts may appear on later hops.
+var releaseAssetHosts = map[string]struct{}{
+	"release-assets.githubusercontent.com": {},
+	"objects.githubusercontent.com":        {},
+}
+
 const downloadTimeout = 2 * time.Minute
 
 // SelfUpdate downloads a signed GitHub release, verifies it, replaces
@@ -149,11 +158,17 @@ func releaseHTTPClient() *http.Client {
 			if req.URL.Scheme != releaseScheme {
 				return fmt.Errorf("refusing HTTPS downgrade to %s", req.URL)
 			}
-			if req.URL.Host != releaseHost {
-				return fmt.Errorf("refusing redirect off release host to %s", req.URL.Host)
+			if req.URL.User != nil {
+				return fmt.Errorf("refusing redirect with userinfo to %s", req.URL.Host)
 			}
-			if !strings.HasPrefix(req.URL.Path, releasePrefix) {
-				return fmt.Errorf("refusing redirect off release path to %s", req.URL.Path)
+			if req.URL.Host == releaseHost {
+				if !strings.HasPrefix(req.URL.Path, releasePrefix) {
+					return fmt.Errorf("refusing redirect off release path to %s", req.URL.Path)
+				}
+				return nil
+			}
+			if _, ok := releaseAssetHosts[req.URL.Host]; !ok {
+				return fmt.Errorf("refusing redirect off release host to %s", req.URL.Host)
 			}
 			return nil
 		},
@@ -199,4 +214,3 @@ func downloadReleaseFile(dest, rawURL string) error {
 	}
 	return nil
 }
-

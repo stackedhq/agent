@@ -27,7 +27,8 @@ const (
 )
 
 var (
-	uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	uuidRe     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	linuxCapRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
 	// Docker image reference (registry/name:tag@digest). Rejects shell/YAML metacharacters.
 	imageRefRe      = regexp.MustCompile(`^(?:(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*(?::[0-9]+)?/)?[a-zA-Z0-9]+(?:[._-][a-zA-Z0-9]+)*(?:/[a-zA-Z0-9]+(?:[._-][a-zA-Z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(?:@sha256:[a-f0-9]{64})?$`)
 	dockerNameRe    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
@@ -165,11 +166,18 @@ func validRoutePath(path string) bool {
 	return routePathRe.MatchString(path)
 }
 
+func validLinuxCapability(s string) bool {
+	return s != "" && len(s) <= 64 && linuxCapRe.MatchString(s)
+}
+
 func validAbsPath(path string) bool {
 	if path == "" || len(path) > 4096 || strings.ContainsRune(path, 0) {
 		return false
 	}
 	if !strings.HasPrefix(path, "/") {
+		return false
+	}
+	if strings.ContainsAny(path, ":,\n\r\t ") {
 		return false
 	}
 	for _, part := range strings.Split(path, "/") {
