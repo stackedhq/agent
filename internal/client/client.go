@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -15,15 +17,92 @@ type Client struct {
 	server     string
 	token      string
 	httpClient *http.Client
+	// serverErr is set when the server URL fails ValidateServerURL.
+	// Every request then fails with it instead of sending the token
+	// over an insecure transport. config.Load rejects such URLs at
+	// startup; this is the second line of defence.
+	serverErr error
 }
 
 func New(server, token string) *Client {
 	return &Client{
-		server: server,
-		token:  token,
+		server:    server,
+		token:     token,
+		serverErr: ValidateServerURL(server),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+			// Never follow redirects on API calls: a redirect could
+			// downgrade to http or bounce the bearer token's request
+			// (and its body) to another origin. The server never
+			// redirects agent endpoints, so a 3xx is treated as an error.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
+	}
+}
+
+// ValidateServerURL requires an https:// server URL. Plain http:// is
+// allowed only for loopback hosts (localhost, 127.0.0.1, [::1]) so local
+// development against `bun dev` keeps working.
+func ValidateServerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid server URL %q: %w", raw, err)
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("invalid server URL %q: missing host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("invalid server URL %q: credentials in the URL are not allowed", u.Redacted())
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid server URL %q: query strings and fragments are not allowed", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("server URL %q must use https:// (http:// is only allowed for localhost, 127.0.0.1 and [::1])", raw)
+	default:
+		return fmt.Errorf("server URL %q must use https://", raw)
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.Equal(net.IPv4(127, 0, 0, 1)) || ip.Equal(net.IPv6loopback))
+}
+
+// Response body caps. The ops poll can carry several operations with
+// compose/proxy payloads, so it gets the largest budget; endpoints that
+// return secrets or file contents (env vars, managed files capped at
+// 512 KB total, query text) get a middle one; everything else returns
+// small JSON envelopes.
+const (
+	maxOpsResponseBytes     = 16 << 20
+	maxSecretsResponseBytes = 4 << 20
+	maxDefaultResponseBytes = 1 << 20
+)
+
+func responseLimit(path string) int64 {
+	switch {
+	case path == "/api/agent/operations":
+		return maxOpsResponseBytes
+	case strings.HasPrefix(path, "/api/agent/credentials/"),
+		strings.HasPrefix(path, "/api/agent/migration-credentials/"),
+		strings.HasPrefix(path, "/api/agent/database-query/"),
+		strings.HasPrefix(path, "/api/agent/backup-credentials/"),
+		strings.HasPrefix(path, "/api/agent/operations/") && strings.HasSuffix(path, "/file-mounts"):
+		return maxSecretsResponseBytes
+	default:
+		return maxDefaultResponseBytes
 	}
 }
 
@@ -602,6 +681,9 @@ func (c *Client) doJSON(method, path string, payload interface{}) ([]byte, error
 }
 
 func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, error) {
+	if c.serverErr != nil {
+		return nil, c.serverErr
+	}
 	req, err := http.NewRequest(method, c.server+path, body)
 	if err != nil {
 		return nil, err
@@ -616,9 +698,17 @@ func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, error) 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	limit := responseLimit(path)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if int64(len(respBody)) > limit {
+		return nil, fmt.Errorf("response from %s exceeds %d bytes", path, limit)
+	}
+
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("server answered %s with redirect HTTP %d to %q; agent API calls do not follow redirects, check agent.server in the config", path, resp.StatusCode, resp.Header.Get("Location"))
 	}
 
 	if resp.StatusCode >= 400 {
