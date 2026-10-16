@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -45,8 +46,16 @@ func Load() (*Config, error) {
 	// Strip trailing slash
 	cfg.Agent.Server = strings.TrimRight(cfg.Agent.Server, "/")
 
-	// Fail fast on insecure server URLs: the token rides on every
-	// request and ops are executed as root-equivalent.
+	// The token rides on every request and ops are executed as
+	// root-equivalent, so plain http is never used for a remote server.
+	// A legacy http:// URL on a non-loopback host is upgraded to https
+	// instead of failing: exiting here would put the agent in a systemd
+	// restart loop with no way to receive further updates.
+	if upgraded, changed := client.NormalizeServerURL(cfg.Agent.Server); changed {
+		log.Printf("WARNING: agent.server in %s is %q, which would send the agent token over plain http. "+
+			"Using %q instead. Update agent.server to https:// to silence this warning.", path, cfg.Agent.Server, upgraded)
+		cfg.Agent.Server = upgraded
+	}
 	if err := client.ValidateServerURL(cfg.Agent.Server); err != nil {
 		return nil, fmt.Errorf("agent.server in %s: %w", path, err)
 	}

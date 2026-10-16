@@ -1,8 +1,10 @@
 package client
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -65,6 +67,86 @@ func TestClientDoesNotFollowRedirects(t *testing.T) {
 	}
 	if leaked {
 		t.Fatal("client followed the redirect")
+	}
+}
+
+// newTLSClient returns a client for srv that trusts its test certificate.
+func newTLSClient(srv *httptest.Server, server string) *Client {
+	c := New(server, "stk_x")
+	c.httpClient.Transport = srv.Client().Transport
+	return c
+}
+
+func TestClientFollowsSameOriginHTTPSRedirects(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/operations":
+			http.Redirect(w, r, "/v2/api/agent/operations", http.StatusPermanentRedirect)
+		case "/v2/api/agent/operations":
+			gotAuth = r.Header.Get("Authorization")
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	body, err := newTLSClient(srv, srv.URL).doRequest("GET", "/api/agent/operations", nil)
+	if err != nil {
+		t.Fatalf("same-origin redirect: %v", err)
+	}
+	if string(body) != "[]" || gotAuth != "Bearer stk_x" {
+		t.Fatalf("body %q auth %q", body, gotAuth)
+	}
+}
+
+func TestClientStopsAfterThreeRedirects(t *testing.T) {
+	hops := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hops++
+		http.Redirect(w, r, fmt.Sprintf("/hop%d", hops), http.StatusFound)
+	}))
+	defer srv.Close()
+	_, err := newTLSClient(srv, srv.URL).doRequest("GET", "/api/agent/operations", nil)
+	if err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("err = %v, want redirect error", err)
+	}
+	if hops != 4 {
+		t.Fatalf("server saw %d requests, want 4 (original + 3 followed redirects)", hops)
+	}
+}
+
+func TestClientRefusesCrossOriginOrHTTPRedirects(t *testing.T) {
+	var leaked bool
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = true
+	}))
+	defer other.Close()
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = true
+	}))
+	defer plain.Close()
+
+	var target string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	for _, tc := range []struct{ name, target string }{
+		{"other port", other.URL + "/x"},
+		{"other host name", "https://localhost:" + u.Port() + "/x"},
+		{"downgrade to http", "http://" + u.Host + "/x"},
+		{"plain http server", plain.URL + "/x"},
+	} {
+		target = tc.target
+		_, err := newTLSClient(srv, srv.URL).doRequest("GET", "/api/agent/operations", nil)
+		if err == nil || !strings.Contains(err.Error(), "redirect") {
+			t.Fatalf("%s: err = %v, want redirect error", tc.name, err)
+		}
+	}
+	if leaked {
+		t.Fatal("client followed a cross-origin or http redirect")
 	}
 }
 

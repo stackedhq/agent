@@ -1,11 +1,11 @@
 package executor
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,9 +15,12 @@ import (
 // Git plumbing for source deploys.
 //
 //   - The clone URL is stored and passed tokenless. Credentials reach git
-//     through a GIT_ASKPASS helper that reads them from git's env, so the
-//     token is never in argv (visible to every local user via ps) and never
-//     in .git/config.
+//     as an `http.<origin>/.extraheader` Authorization header set through
+//     git's environment config (GIT_CONFIG_COUNT/KEY/VALUE), so the token
+//     is never in argv (visible to every local user via ps), never in
+//     .git/config, and no helper script has to be written or executed
+//     (/tmp is noexec on some hosts). The header is scoped to the clone
+//     origin, so a redirect to another host doesn't carry it.
 //   - GIT_ALLOW_PROTOCOL=https on every git command: no ssh://, git://,
 //     ext::, or local/file clones, including via redirects or submodules.
 //   - `--` / `--end-of-options` before positional args; branch and commit
@@ -62,54 +65,67 @@ func parseGitSource(raw string) (gitSource, error) {
 	return src, nil
 }
 
-// gitAskpassScript answers git's username/password prompts from env vars
-// set only on the git process. It contains no secret itself.
-const gitAskpassScript = `#!/bin/sh
-case "$1" in
-  Username*|username*) printf '%s\n' "$STACKED_GIT_USERNAME" ;;
-  *) printf '%s\n' "$STACKED_GIT_PASSWORD" ;;
-esac
-`
-
-// gitSession holds the env (and askpass helper) for one deploy's git calls.
+// gitSession holds the env for one deploy's git calls.
 type gitSession struct {
-	env     []string
-	tempDir string
+	env []string
 }
 
-// newGitSession prepares the git env. Call Close to remove the helper.
+// gitConfigCountSupported reports whether the host git reads config from
+// GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n (git 2.31+). Older
+// git gets the same setting through GIT_CONFIG_PARAMETERS, which git has
+// read since 1.7 (it's what `git -c` uses to pass config to
+// subprocesses). Never both: http.extraheader is multi-valued, so a git
+// that read both would send the header twice. Package var for tests.
+var gitConfigCountSupported = func() bool { return gitVersionAtLeastHost(2, 31) }
+
+// newGitSession prepares the git env. Call Close when done.
 func newGitSession(src gitSource) (*gitSession, error) {
-	s := &gitSession{}
 	extra := []string{
 		"GIT_ALLOW_PROTOCOL=https",
 		"GIT_TERMINAL_PROMPT=0",
 	}
 	if src.hasCredentials() {
-		dir, err := os.MkdirTemp("", "stacked-git-")
+		key, value, err := gitAuthHeaderConfig(src)
 		if err != nil {
-			return nil, fmt.Errorf("create askpass dir: %w", err)
+			return nil, err
 		}
-		s.tempDir = dir
-		script := filepath.Join(dir, "askpass.sh")
-		if err := os.WriteFile(script, []byte(gitAskpassScript), 0o700); err != nil {
-			s.Close()
-			return nil, fmt.Errorf("write askpass helper: %w", err)
+		if gitConfigCountSupported() {
+			extra = append(extra,
+				"GIT_CONFIG_COUNT=1",
+				"GIT_CONFIG_KEY_0="+key,
+				"GIT_CONFIG_VALUE_0="+value,
+			)
+		} else {
+			extra = append(extra, "GIT_CONFIG_PARAMETERS="+gitConfigParam(key, value))
 		}
-		extra = append(extra,
-			"GIT_ASKPASS="+script,
-			"STACKED_GIT_USERNAME="+src.Username,
-			"STACKED_GIT_PASSWORD="+src.Password,
-		)
 	}
-	s.env = mergeEnv(os.Environ(), extra)
-	return s, nil
+	return &gitSession{env: mergeEnv(os.Environ(), extra)}, nil
 }
 
-func (s *gitSession) Close() {
-	if s != nil && s.tempDir != "" {
-		_ = os.RemoveAll(s.tempDir)
+// gitAuthHeaderConfig returns the config key/value that makes git send
+// `Authorization: Basic base64(user:password)` to the clone origin only.
+func gitAuthHeaderConfig(src gitSource) (string, string, error) {
+	u, err := url.Parse(src.URL)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return "", "", fmt.Errorf("unsupported git URL")
 	}
+	if strings.ContainsAny(src.Username+src.Password, "\r\n\x00") {
+		return "", "", fmt.Errorf("git credentials contain control characters")
+	}
+	key := "http.https://" + u.Host + "/.extraheader"
+	auth := base64.StdEncoding.EncodeToString([]byte(src.Username + ":" + src.Password))
+	return key, "Authorization: Basic " + auth, nil
 }
+
+// gitConfigParam encodes one entry in GIT_CONFIG_PARAMETERS format
+// ('key'='value', single quotes escaped shell-style).
+func gitConfigParam(key, value string) string {
+	q := func(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+	return q(key) + "=" + q(value)
+}
+
+// Close is kept for call-site symmetry; the session owns no resources.
+func (s *gitSession) Close() {}
 
 // mergeEnv returns base with every name in extra replaced by extra's value.
 func mergeEnv(base, extra []string) []string {
@@ -130,8 +146,8 @@ func mergeEnv(base, extra []string) []string {
 }
 
 // gitNoCredentialHelper disables any configured credential helper for the
-// call, so the askpass answer is never persisted (e.g. by `store`) and a
-// stale stored token is never used instead of the fresh one.
+// call, so a stale stored token is never used instead of the fresh one
+// and nothing is ever persisted (e.g. by `store`).
 var gitNoCredentialHelper = []string{"-c", "credential.helper="}
 
 func gitCloneArgs(branch, url, dest string) []string {
@@ -182,13 +198,26 @@ var (
 // `--end-of-options` (added in git 2.24).
 func gitSupportsEndOfOptions() bool {
 	gitVersionOnce.Do(func() {
-		out, err := exec.Command("git", "version").Output()
-		if err != nil {
-			return
-		}
-		gitHasEndOfOption = gitVersionAtLeast(string(out), 2, 24)
+		gitHasEndOfOption = gitVersionAtLeastHost(2, 24)
 	})
 	return gitHasEndOfOption
+}
+
+var (
+	hostGitVersionOnce sync.Once
+	hostGitVersion     string
+)
+
+// gitVersionAtLeastHost reports whether the host git is at least
+// major.minor (false when git is missing or unparseable).
+func gitVersionAtLeastHost(major, minor int) bool {
+	hostGitVersionOnce.Do(func() {
+		out, err := exec.Command("git", "version").Output()
+		if err == nil {
+			hostGitVersion = string(out)
+		}
+	})
+	return gitVersionAtLeast(hostGitVersion, major, minor)
 }
 
 func gitVersionAtLeast(versionOutput string, major, minor int) bool {

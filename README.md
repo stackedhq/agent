@@ -61,18 +61,21 @@ Get your token from the Stacked dashboard under **Machines → Add Machine**.
 
 ## Verifying releases
 
-Every release publishes four files:
+Every release publishes five files:
 
 | File | What it is |
 |---|---|
 | `stacked-agent-linux-amd64`, `stacked-agent-linux-arm64` | The agent binaries |
-| `SHA256SUMS` | `sha256sum` output for both binaries |
+| `VERSION` | Exactly `<version>` and a newline (e.g. `0.9.0`), so the signed checksums are bound to one release |
+| `SHA256SUMS` | `sha256sum` output for both binaries and `VERSION` |
 | `SHA256SUMS.sig` | Raw 64-byte ed25519 signature over the exact bytes of `SHA256SUMS` |
 
 The signing key is held in a protected GitHub Environment and only used by a
 release job that needs a manual approval. `install.sh` and the agent's
 `self_update` both check the signature and the checksum before installing a
-binary, and self-update refuses to downgrade. The update download location is
+binary. Self-update also checks that the signed `VERSION` is exactly the version
+it was asked to install (so an older signed release can't be served under a
+newer tag) and refuses to downgrade. The update download location is
 fixed to this repository's GitHub releases; the Stacked server only chooses the
 version.
 
@@ -94,6 +97,7 @@ ARCH=amd64      # or arm64
 BASE=https://github.com/stackedhq/agent/releases/download/v$VERSION
 
 curl -fsSLO "$BASE/stacked-agent-linux-$ARCH"
+curl -fsSLO "$BASE/VERSION"
 curl -fsSLO "$BASE/SHA256SUMS"
 curl -fsSLO "$BASE/SHA256SUMS.sig"
 
@@ -108,9 +112,13 @@ openssl pkeyutl -verify -pubin -inkey stacked-release.pub -rawin \
   -in SHA256SUMS -sigfile SHA256SUMS.sig
 # -> Signature Verified Successfully
 
-# 2. The binary matches its signed checksum
+# 2. The binary and VERSION match their signed checksums
 sha256sum --check --ignore-missing SHA256SUMS
 # -> stacked-agent-linux-amd64: OK
+# -> VERSION: OK
+
+# 3. The signed VERSION is the release you asked for
+test "$(cat VERSION)" = "$VERSION" && echo "VERSION matches"
 ```
 
 ### Check build provenance

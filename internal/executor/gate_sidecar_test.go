@@ -51,13 +51,30 @@ func gatedRow(domain, path, user, hash string) cachedDomain {
 	}
 }
 
-func TestBuildGateConfigRejectsDifferingCredsOnOneHost(t *testing.T) {
+// A host whose rows carry different gate credentials is left out of the
+// gate config (so the gate denies it) without affecting other domains,
+// and the Caddyfile still routes it through forward_auth.
+func TestBuildGateConfigExcludesHostWithDifferingCreds(t *testing.T) {
 	rows := []cachedDomain{
 		gatedRow("app.example.com", "/", "admin", "$2a$10$aaaa"),
 		gatedRow("app.example.com", "/admin", "root", "$2a$10$bbbb"),
+		gatedRow("app.example.com", "/api", "admin", "$2a$10$aaaa"),
+		gatedRow("other.example.com", "/", "admin", "$2a$10$cccc"),
 	}
-	if _, err := buildGateConfig(rows); err == nil || !strings.Contains(err.Error(), "app.example.com") {
-		t.Fatalf("expected conflict error naming the domain, got %v", err)
+	cfg := buildGateConfig(rows)
+	if _, ok := cfg.Domains["app.example.com"]; ok {
+		t.Fatalf("conflicting host must be excluded from the gate config: %+v", cfg)
+	}
+	if cfg.Domains["other.example.com"].PasswordHash != "$2a$10$cccc" {
+		t.Fatalf("unrelated gated host must stay configured: %+v", cfg)
+	}
+	out, err := generateCaddyfileChecked(rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := out[strings.Index(out, "app.example.com {"):strings.Index(out, "other.example.com {")]
+	if !strings.Contains(block, "forward_auth "+gateUpstream) {
+		t.Fatalf("conflicting host must still go through the gate (fail closed):\n%s", block)
 	}
 }
 
@@ -68,10 +85,7 @@ func TestBuildGateConfigSameCredsAndUngatedRows(t *testing.T) {
 		{Domain: "app.example.com", ServiceID: "svc-docs", Port: 3000, Path: "/docs"},
 		{Domain: "open.example.com", ServiceID: "svc-open", Port: 3000},
 	}
-	cfg, err := buildGateConfig(rows)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := buildGateConfig(rows)
 	if len(cfg.Domains) != 1 || cfg.Domains["app.example.com"].Username != "admin" {
 		t.Fatalf("cfg = %+v", cfg)
 	}
@@ -81,7 +95,7 @@ func TestApplyGateConfigWaitsForGateToLoad(t *testing.T) {
 	path, started, signaled := withGateFakes(t, func(written []byte) (gateStatus, error) {
 		return gateStatus{Loaded: true, ConfigHash: hashOf(written)}, nil
 	})
-	cfg, _ := buildGateConfig([]cachedDomain{gatedRow("app.example.com", "/", "admin", "$2a$10$aaaa")})
+	cfg := buildGateConfig([]cachedDomain{gatedRow("app.example.com", "/", "admin", "$2a$10$aaaa")})
 	if err := applyGateConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +124,7 @@ func TestApplyGateConfigFailsWhenGateDoesNotLoad(t *testing.T) {
 	withGateFakes(t, func([]byte) (gateStatus, error) {
 		return gateStatus{Loaded: true, ConfigHash: "stale"}, nil
 	})
-	cfg, _ := buildGateConfig([]cachedDomain{gatedRow("app.example.com", "/", "admin", "$2a$10$aaaa")})
+	cfg := buildGateConfig([]cachedDomain{gatedRow("app.example.com", "/", "admin", "$2a$10$aaaa")})
 	if err := applyGateConfig(cfg); err == nil {
 		t.Fatal("expected error when the gate never reports the new config")
 	}
@@ -121,7 +135,7 @@ func TestApplyGateConfigFailsWhenGateCannotStart(t *testing.T) {
 		return gateStatus{Loaded: true, ConfigHash: hashOf(written)}, nil
 	})
 	gateStartFn = func() error { return errors.New("no binary") }
-	cfg, _ := buildGateConfig([]cachedDomain{gatedRow("app.example.com", "/", "admin", "$2a$10$aaaa")})
+	cfg := buildGateConfig([]cachedDomain{gatedRow("app.example.com", "/", "admin", "$2a$10$aaaa")})
 	if err := applyGateConfig(cfg); err == nil || !strings.Contains(err.Error(), "no binary") {
 		t.Fatalf("expected start error, got %v", err)
 	}
@@ -137,7 +151,7 @@ func TestApplyGateConfigClearsConfigWhenNoGates(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"domains":{"old.example.com":{}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := buildGateConfig([]cachedDomain{{Domain: "open.example.com", ServiceID: "s", Port: 3000}})
+	cfg := buildGateConfig([]cachedDomain{{Domain: "open.example.com", ServiceID: "s", Port: 3000}})
 	// Gate being down must not fail an op that gates nothing.
 	if err := applyGateConfig(cfg); err != nil {
 		t.Fatal(err)

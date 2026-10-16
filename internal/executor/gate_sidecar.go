@@ -71,15 +71,20 @@ type gateStatus struct {
 // The gate (and the Caddy site block) is per host, while the server's
 // auth gate is per service, and multi-path routing can put several
 // services on one host. Rather than key the gate on host+path (which
-// would need per-path cookies and login routing), the agent refuses a
-// config where two rows on the same host carry different gate
-// credentials: one host, one set of credentials. Rows on a gated host
-// without a gate of their own stay behind the host's gate (fail closed,
-// unchanged behaviour).
-func buildGateConfig(parsed []cachedDomain) (gateConfig, error) {
+// would need per-path cookies and login routing), one host has one set
+// of credentials. When two rows on the same host carry different gate
+// credentials the host is left out of the gate config entirely and an
+// error naming it is logged: the Caddyfile still sends that host through
+// forward_auth, so the gate answers 403 for it (fail closed), while
+// every other domain on the machine keeps working. Failing the whole op
+// instead would brick proxy_config (and blue/green flips) for every
+// site, including from an old domains.json. Rows on a gated host
+// without a gate of their own stay behind the host's gate.
+func buildGateConfig(parsed []cachedDomain) gateConfig {
 	cfg := gateConfig{Domains: make(map[string]gateDomainEntry)}
+	conflicted := make(map[string]bool)
 	for _, d := range parsed {
-		if d.AuthGateMode == "" {
+		if d.AuthGateMode == "" || conflicted[d.Domain] {
 			continue
 		}
 		name := d.ServiceName
@@ -94,16 +99,17 @@ func buildGateConfig(parsed []cachedDomain) (gateConfig, error) {
 		}
 		if prev, ok := cfg.Domains[d.Domain]; ok {
 			if prev.Mode != entry.Mode || prev.Username != entry.Username || prev.PasswordHash != entry.PasswordHash {
-				return gateConfig{}, fmt.Errorf(
-					"domain %s routes paths to services with different auth gate credentials; "+
-						"use the same credentials for every gated service on this domain or move one to its own domain",
-					d.Domain)
+				delete(cfg.Domains, d.Domain)
+				conflicted[d.Domain] = true
+				log.Printf("proxy: auth gate disabled for %s (every request gets 403): it routes paths to services "+
+					"with different auth gate credentials; use the same credentials for every gated service on "+
+					"this domain or move one to its own domain", d.Domain)
 			}
 			continue
 		}
 		cfg.Domains[d.Domain] = entry
 	}
-	return cfg, nil
+	return cfg
 }
 
 // applyGateConfig writes config.json atomically (0600, readable by the

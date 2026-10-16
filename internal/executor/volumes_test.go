@@ -577,3 +577,40 @@ func TestHealManagedVolumePerms_RejectsSymlinkRoot(t *testing.T) {
 		t.Fatal("symlink target chmodded")
 	}
 }
+
+func TestHostPathPolicyExtendedDenylist(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	for _, p := range []string{
+		"/var/spool", "/var/spool/cron", "/var/lib/containerd", "/var/lib/containerd/io.containerd.x",
+		"/var/snap", "/var/snap/docker/common", "/snap", "/snap/bin", "/var/lib/kubelet", "/var/lib/kubelet/pods",
+	} {
+		if got, err := checkHostPathPolicy(id, p); err == nil {
+			t.Errorf("checkHostPathPolicy(%q) = %q, want error", p, got)
+		}
+	}
+	for _, p := range []string{"/var/spoolx", "/snapshots", "/var/lib/containerd-data", "/srv/snap"} {
+		if _, err := checkHostPathPolicy(id, p); err != nil {
+			t.Errorf("checkHostPathPolicy(%q) = %v, want ok", p, err)
+		}
+	}
+}
+
+// Rejections name the volume, the rule and where to put it instead: the
+// message goes straight to the deploy log.
+func TestHostPathPolicyErrorMessages(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	cases := map[string]string{
+		"/home/x":                      "volume host path /home/x (mounted at /data) is not allowed (system path, inside /home). Choose a path under /srv, /mnt or /data.",
+		"/":                            "volume host path / (mounted at /data) is not allowed (the filesystem root). Choose a path under /srv, /mnt or /data.",
+		"/opt/stacked/proxy":           "volume host path /opt/stacked/proxy (mounted at /data) is not allowed (Stacked's own directory /opt/stacked). Choose a path under /srv, /mnt or /data.",
+		"/srv/../etc":                  `volume host path "/srv/../etc" (mounted at /data) is not allowed (contains a '..' segment). Choose a path under /srv, /mnt or /data.`,
+		"/opt/stacked/data/services/x": "Stacked-managed storage",
+		"relative":                     "must be an absolute path",
+	}
+	for in, want := range cases {
+		_, err := validateVolumes(id, []volumeMount{{HostPath: in, ContainerPath: "/data"}})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("validateVolumes(%q) error = %v, want %q", in, err, want)
+		}
+	}
+}

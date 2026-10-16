@@ -1,6 +1,10 @@
 package executor
 
 import (
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,12 +94,21 @@ func envValue(env []string, key string) (string, bool) {
 	return "", false
 }
 
+func withGitConfigCount(t *testing.T, supported bool) {
+	t.Helper()
+	orig := gitConfigCountSupported
+	gitConfigCountSupported = func() bool { return supported }
+	t.Cleanup(func() { gitConfigCountSupported = orig })
+}
+
 func TestGitSessionEnv(t *testing.T) {
 	t.Setenv("GIT_ALLOW_PROTOCOL", "ext:file:https")
+	withGitConfigCount(t, true)
 	s, err := newGitSession(gitSource{URL: "https://github.com/a/b.git", Username: "x-access-token", Password: "ghs_secret"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Close()
 	if v, _ := envValue(s.env, "GIT_ALLOW_PROTOCOL"); v != "https" {
 		t.Fatalf("GIT_ALLOW_PROTOCOL = %q", v)
 	}
@@ -111,57 +124,138 @@ func TestGitSessionEnv(t *testing.T) {
 	if v, _ := envValue(s.env, "GIT_TERMINAL_PROMPT"); v != "0" {
 		t.Fatalf("GIT_TERMINAL_PROMPT = %q", v)
 	}
-	askpass, ok := envValue(s.env, "GIT_ASKPASS")
-	if !ok {
-		t.Fatal("GIT_ASKPASS not set")
+	if _, ok := envValue(s.env, "GIT_ASKPASS"); ok {
+		t.Fatal("GIT_ASKPASS must not be set: the askpass helper is gone")
 	}
-	info, err := os.Stat(askpass)
+	want := map[string]string{
+		"GIT_CONFIG_COUNT":   "1",
+		"GIT_CONFIG_KEY_0":   "http.https://github.com/.extraheader",
+		"GIT_CONFIG_VALUE_0": "Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghs_secret")),
+	}
+	for k, v := range want {
+		if got, _ := envValue(s.env, k); got != v {
+			t.Fatalf("%s = %q, want %q", k, got, v)
+		}
+	}
+	if _, ok := envValue(s.env, "GIT_CONFIG_PARAMETERS"); ok {
+		t.Fatal("GIT_CONFIG_PARAMETERS must not be set alongside GIT_CONFIG_COUNT")
+	}
+
+	// Old git (< 2.31): same header via GIT_CONFIG_PARAMETERS only.
+	withGitConfigCount(t, false)
+	old, err := newGitSession(gitSource{URL: "https://git.example.com:8443/a/b", Username: "oauth2", Password: "glpat-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o700 {
-		t.Fatalf("askpass mode = %o", info.Mode().Perm())
+	wantParam := "'http.https://git.example.com:8443/.extraheader'='Authorization: Basic " +
+		base64.StdEncoding.EncodeToString([]byte("oauth2:glpat-1")) + "'"
+	if got, _ := envValue(old.env, "GIT_CONFIG_PARAMETERS"); got != wantParam {
+		t.Fatalf("GIT_CONFIG_PARAMETERS = %q, want %q", got, wantParam)
 	}
-	if dirInfo, _ := os.Stat(filepath.Dir(askpass)); dirInfo.Mode().Perm() != 0o700 {
-		t.Fatalf("askpass dir mode = %o", dirInfo.Mode().Perm())
-	}
-	script, _ := os.ReadFile(askpass)
-	if strings.Contains(string(script), "ghs_secret") {
-		t.Fatal("askpass script contains the token")
+	if _, ok := envValue(old.env, "GIT_CONFIG_COUNT"); ok {
+		t.Fatal("GIT_CONFIG_COUNT set on old git")
 	}
 
-	// The helper answers git's prompts from the session env.
-	for prompt, want := range map[string]string{
-		"Username for 'https://github.com': ":                "x-access-token",
-		"Password for 'https://x-access-token@github.com': ": "ghs_secret",
-	} {
-		cmd := exec.Command(askpass, prompt)
-		cmd.Env = s.env
-		out, err := cmd.Output()
-		if err != nil {
-			t.Fatalf("askpass: %v", err)
-		}
-		if strings.TrimSpace(string(out)) != want {
-			t.Fatalf("askpass(%q) = %q, want %q", prompt, out, want)
-		}
-	}
-
-	s.Close()
-	if _, err := os.Stat(askpass); !os.IsNotExist(err) {
-		t.Fatalf("askpass helper not removed: %v", err)
-	}
-
-	// Public repo: no askpass, still https-only.
+	// Public repo: no credentials, still https-only.
 	pub, err := newGitSession(gitSource{URL: "https://github.com/a/b.git"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pub.Close()
-	if _, ok := envValue(pub.env, "GIT_ASKPASS"); ok {
-		t.Fatal("GIT_ASKPASS set without credentials")
+	for _, k := range []string{"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_ASKPASS"} {
+		if _, ok := envValue(pub.env, k); ok {
+			t.Fatalf("%s set without credentials", k)
+		}
 	}
 	if v, _ := envValue(pub.env, "GIT_ALLOW_PROTOCOL"); v != "https" {
 		t.Fatalf("GIT_ALLOW_PROTOCOL = %q", v)
+	}
+}
+
+// TestGitCloneSendsAuthHeaderFromEnv clones over (dumb) HTTPS from a
+// test server that requires the Authorization header, in both the
+// GIT_CONFIG_COUNT and GIT_CONFIG_PARAMETERS modes, and checks the token
+// is neither in argv nor persisted in .git/config.
+func TestGitCloneSendsAuthHeaderFromEnv(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	gitEnv := append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t",
+		"GIT_COMMITTER_EMAIL=t@t", "GIT_CONFIG_NOSYSTEM=1", "HOME="+root)
+	run := func(dir string, env []string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	work := filepath.Join(root, "work")
+	_ = os.Mkdir(work, 0o755)
+	run(work, gitEnv, "init", "-q", "-b", "main")
+	run(work, gitEnv, "commit", "-q", "--allow-empty", "-m", "init")
+	bare := filepath.Join(root, "bare.git")
+	run(root, gitEnv, "clone", "-q", "--bare", work, bare)
+	run(bare, gitEnv, "update-server-info")
+
+	const token = "ghs_supersecret"
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+	files := http.StripPrefix("/acme/app.git", http.FileServer(http.Dir(bare)))
+	var authed int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != wantAuth {
+			w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+			http.Error(w, "auth required", http.StatusUnauthorized)
+			return
+		}
+		authed++
+		files.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	for _, countMode := range []bool{true, false} {
+		withGitConfigCount(t, countMode)
+		src, err := parseGitSource("https://x-access-token:" + token + "@" + strings.TrimPrefix(srv.URL, "https://") + "/acme/app.git")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sess, err := newGitSession(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := append(mergeEnv(sess.env, []string{"GIT_CONFIG_NOSYSTEM=1", "HOME=" + root}), "GIT_SSL_NO_VERIFY=true")
+		dest := fmt.Sprintf("clone-%v", countMode)
+		args := gitCloneArgs("main", src.URL, dest)
+		for _, a := range args {
+			if strings.Contains(a, token) {
+				t.Fatalf("token in argv: %v", args)
+			}
+		}
+		authed = 0
+		run(root, env, args...)
+		if authed == 0 {
+			t.Fatalf("countMode=%v: server never saw the auth header", countMode)
+		}
+		cfg, err := os.ReadFile(filepath.Join(root, dest, ".git", "config"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(cfg), token) || strings.Contains(string(cfg), "extraheader") ||
+			strings.Contains(string(cfg), strings.TrimPrefix(wantAuth, "Basic ")) {
+			t.Fatalf("credentials persisted in .git/config:\n%s", cfg)
+		}
+	}
+
+	// Without the session env the server refuses the clone.
+	plain, _ := parseGitSource(srv.URL + "/acme/app.git")
+	cmd := exec.Command("git", gitCloneArgs("main", plain.URL, "anon")...)
+	cmd.Dir = root
+	cmd.Env = append(mergeEnv(os.Environ(), []string{"GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "HOME=" + root}), "GIT_SSL_NO_VERIFY=true")
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("anonymous clone succeeded: %s", out)
 	}
 }
 

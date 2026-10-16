@@ -112,10 +112,16 @@ jobs:
           # Makefile sets CGO_ENABLED=0 -trimpath -buildvcs=false.
           make build VERSION="$VERSION"
 
-      - name: Write SHA256SUMS
+      - name: Write VERSION and SHA256SUMS
         working-directory: dist
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          sha256sum stacked-agent-linux-amd64 stacked-agent-linux-arm64 > SHA256SUMS
+          set -euo pipefail
+          # VERSION binds the signed SHA256SUMS to this release: the agent
+          # refuses an update whose signed VERSION isn't exactly the target.
+          printf '%s\n' "$VERSION" > VERSION
+          sha256sum stacked-agent-linux-amd64 stacked-agent-linux-arm64 VERSION > SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload binaries
@@ -125,6 +131,7 @@ jobs:
           path: |
             dist/stacked-agent-linux-amd64
             dist/stacked-agent-linux-arm64
+            dist/VERSION
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
@@ -151,9 +158,16 @@ jobs:
           name: release-binaries
           path: dist
 
-      - name: Check SHA256SUMS matches the binaries
+      - name: Check SHA256SUMS matches the binaries and VERSION
         working-directory: dist
-        run: sha256sum --check --strict SHA256SUMS
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict SHA256SUMS
+          grep -qE '^[0-9a-f]{64}  VERSION$' SHA256SUMS
+          test "$(cat VERSION)" = "$VERSION"
+          test "$(wc -c < VERSION)" -eq "$(( ${#VERSION} + 1 ))"
 
       - name: Sign
         env:
@@ -327,7 +341,7 @@ jobs:
           name: release-signature
           path: dist
 
-      - name: Check SHA256SUMS matches the binaries
+      - name: Check SHA256SUMS matches the binaries and VERSION
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
 
@@ -353,6 +367,7 @@ jobs:
           FILES=(
             dist/stacked-agent-linux-amd64
             dist/stacked-agent-linux-arm64
+            dist/VERSION
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
           )

@@ -341,3 +341,34 @@ func TestDockerRedisPasswordNotInArgv(t *testing.T) {
 		}
 	}
 }
+
+// TestDockerLegacyComposeSeesSyncedEnv: a service still on the old
+// compose template (env_file: .env) that is deployed blue/green gets its
+// `.env` rewritten, so the real Compose parser resolves the new values.
+func TestDockerLegacyComposeSeesSyncedEnv(t *testing.T) {
+	requireDocker(t)
+	ensureStackedNetwork(t)
+	dir := filepath.Join(t.TempDir(), "stk-legacyenv-"+randSuffix(t))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := os.ReadFile(filepath.Join("testdata", "compose_legacy", "service-min.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("API_KEY=old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncLegacyEnvFile(dir, map[string]string{"API_KEY": "new", "HOST": "0.0.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	doc := composeConfigJSON(t, dir, composeArgs(dir))
+	svc := doc["services"].(map[string]interface{})[goldenServiceID].(map[string]interface{})
+	env := svc["environment"].(map[string]interface{})
+	if env["API_KEY"] != "new" || env["HOST"] != "0.0.0.0" {
+		t.Fatalf("compose resolved env %v, want the synced values", env)
+	}
+}

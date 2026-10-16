@@ -30,6 +30,12 @@ const (
 	maxSumsBytes        = 64 << 10
 	sumsFile            = "SHA256SUMS"
 	sumsSigFile         = "SHA256SUMS.sig"
+	// versionFile is a release asset containing exactly "<version>\n",
+	// listed in SHA256SUMS. It binds the signed SHA256SUMS to one
+	// version, so a validly signed older release can't be replayed
+	// under a newer tag's download path.
+	versionFile    = "VERSION"
+	maxVersionSize = 256
 )
 
 // Package vars (not consts) so tests can point self-update at an httptest
@@ -53,9 +59,10 @@ var semverRe = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0
 // swaps the binary in place and exits so systemd restarts the new one.
 //
 // Verification chain: SHA256SUMS.sig must be a valid ed25519 signature
-// over SHA256SUMS by one of the embedded release keys; the binary's
-// sha256 must match its SHA256SUMS entry. Nothing is written over the
-// running binary unless every check passes.
+// over SHA256SUMS by one of the embedded release keys; the VERSION asset
+// must match its SHA256SUMS entry and contain exactly the target version;
+// the binary's sha256 must match its SHA256SUMS entry. Nothing is written
+// over the running binary unless every check passes.
 func (e *Executor) SelfUpdate(op client.Operation) error {
 	targetVersion := strings.TrimPrefix(strings.TrimSpace(getStringPayload(op.Payload, "targetVersion")), "v")
 	if targetVersion == "" {
@@ -129,6 +136,10 @@ func installVerifiedRelease(version, arch, dest string) error {
 		return fmt.Errorf("self_update: signature check failed for v%s: %s is not signed by a trusted Stacked release key; binary not installed", version, sumsFile)
 	}
 
+	if err := verifyReleaseVersion(base, sums, version); err != nil {
+		return fmt.Errorf("self_update: v%s: %w; binary not installed", version, err)
+	}
+
 	want, err := lookupChecksum(sums, assetName)
 	if err != nil {
 		return fmt.Errorf("self_update: v%s: %w", version, err)
@@ -145,6 +156,29 @@ func installVerifiedRelease(version, arch, dest string) error {
 	if err := os.Rename(tmpPath, dest); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("self_update: replace binary: %w", err)
+	}
+	return nil
+}
+
+// verifyReleaseVersion downloads the VERSION asset, checks its hash
+// against the (already signature-verified) SHA256SUMS and that it names
+// exactly version. Without this, SHA256SUMS + signature + binary from an
+// older signed release could be served under the v<version>/ path and
+// would verify.
+func verifyReleaseVersion(base string, sums []byte, version string) error {
+	want, err := lookupChecksum(sums, versionFile)
+	if err != nil {
+		return fmt.Errorf("release is not bound to a version: %w", err)
+	}
+	data, err := fetchSmall(base+versionFile, maxVersionSize)
+	if err != nil {
+		return fmt.Errorf("download %s: %w", versionFile, err)
+	}
+	if got := sha256.Sum256(data); !bytes.Equal(got[:], want) {
+		return fmt.Errorf("%s checksum mismatch", versionFile)
+	}
+	if string(data) != version+"\n" {
+		return fmt.Errorf("signed %s says %q, not %q", versionFile, strings.TrimSpace(string(data)), version)
 	}
 	return nil
 }
