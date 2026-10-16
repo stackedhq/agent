@@ -64,8 +64,9 @@ func main() {
 	// needing a manual reinstall or waiting for the next proxy_config op.
 	// A no-op on machines that haven't run Setup yet. Errors are logged
 	// and swallowed — the agent must always come up so the poller can
-	// recover via subsequent ops.
-	if err := executor.ReconcileProxy(); err != nil {
+	// recover via subsequent ops. Bounded so a hung docker daemon can't
+	// keep the poller from starting.
+	if err := executor.ReconcileProxyWithTimeout(executor.StartupProxyReconcileTimeout); err != nil {
 		log.Printf("Startup proxy reconcile skipped: %v", err)
 	}
 

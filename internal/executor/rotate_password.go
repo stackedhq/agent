@@ -43,6 +43,9 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 	if containerName == "" {
 		return fmt.Errorf("db_rotate_password requires containerName")
 	}
+	if err := checkContainerName("database", containerName); err != nil {
+		return err
+	}
 	if dockerImage == "" {
 		return fmt.Errorf("db_rotate_password requires dockerImage")
 	}
@@ -107,7 +110,7 @@ func alterPassword(containerName, dbType string, oldCreds, newCreds map[string]s
 	out, err := cmd.CombinedOutput()
 	trimmed := strings.TrimSpace(string(out))
 	if trimmed != "" {
-		for _, line := range strings.Split(trimmed, "\n") {
+		for _, line := range sanitizeAlterPasswordOutput(trimmed, oldCreds, newCreds) {
 			streamer.AddLine(line)
 		}
 		streamer.Flush()
@@ -120,6 +123,42 @@ func alterPassword(containerName, dbType string, oldCreds, newCreds map[string]s
 		return fmt.Errorf("%s did not confirm the change (expected %q)", dbType, step.expectOutput)
 	}
 	return nil
+}
+
+// sanitizeAlterPasswordOutput splits the engine's output into log lines
+// with anything that could carry a password removed. psql echoes the
+// failing statement on error (`LINE 2: ALTER USER "u" WITH PASSWORD '...'`)
+// even with -q, so those lines are dropped along with their `^` marker,
+// and any literal credential value left in a line is masked.
+func sanitizeAlterPasswordOutput(out string, credSets ...map[string]string) []string {
+	var secrets []string
+	for _, creds := range credSets {
+		for k, v := range creds {
+			if v != "" && strings.Contains(strings.ToLower(k), "password") {
+				secrets = append(secrets, v)
+			}
+		}
+	}
+	var lines []string
+	dropCaret := false
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if dropCaret && strings.Trim(trimmed, "^ ") == "" {
+			dropCaret = false
+			continue
+		}
+		dropCaret = false
+		if strings.HasPrefix(trimmed, "LINE ") && strings.Contains(strings.ToUpper(line), "PASSWORD") {
+			lines = append(lines, "LINE (statement omitted: contains a password)")
+			dropCaret = true
+			continue
+		}
+		for _, secret := range secrets {
+			line = strings.ReplaceAll(line, secret, "***")
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // alterPasswordStep is one engine-level password change. Neither the old

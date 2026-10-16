@@ -3,7 +3,6 @@ package executor
 import (
 	"fmt"
 	"log"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -157,7 +156,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 
 	// Defensive: if a previous failed deploy left a stopped container
 	// of the same name behind, remove it before starting fresh.
-	_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+	_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", newContainer)
 
 	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, runEnv, envPath, op, creds.NetworkAliases); err != nil {
 		return nil, fail(err)
@@ -188,7 +187,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		streamer.Flush()
 		if err := HealthGate(streamer, newContainer, "stacked", probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
 			// Tear down the failed slot so the next deploy starts clean.
-			_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+			_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", newContainer)
 			return nil, fail(fmt.Errorf("health gate: %w", err))
 		}
 	}
@@ -203,7 +202,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	streamer.Flush()
 	prevSlot := currentSlot
 	if err := slots.SetActive(serviceID, newSlot); err != nil {
-		_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+		_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", newContainer)
 		return nil, fail(fmt.Errorf("persist slot state: %w", err))
 	}
 	if err := RegenerateCaddyfile(); err != nil {
@@ -211,7 +210,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		// prevSlot is always non-empty here (Legacy on first rolling
 		// deploy, Blue/Green afterwards) so SetActive is enough.
 		_ = slots.SetActive(serviceID, prevSlot)
-		_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+		_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", newContainer)
 		return nil, fail(fmt.Errorf("caddy reload: %w", err))
 	}
 	streamer.AddLine("Caddy reloaded; traffic now on " + newContainer + ".")
@@ -228,8 +227,12 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// fine for the first rolling deploy of a service that never had a
 	// recreate-mode container running, or for retries where the old
 	// slot was already removed.
-	_, _ = runCommandSilent("", "docker", "stop", "--time="+strconv.Itoa(graceSec), oldContainer)
-	_, _ = runCommandSilent("", "docker", "rm", "-f", oldContainer)
+	//
+	// Traffic is already on the new slot, so draining the old one is
+	// cleanup: it runs on its own deadline even if the op deadline
+	// expired during the flip.
+	_, _ = cleanupCommand(stopCleanupTimeout(graceSec), "docker", "stop", "--time="+strconv.Itoa(graceSec), oldContainer)
+	_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", oldContainer)
 
 	// Phase 8: post-flip probe (informational, matches recreate's
 	// post-deploy probe so the dashboard's port-mismatch banner still
@@ -434,7 +437,7 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 		streamer.Flush()
 
 		if creds.RegistryToken != "" {
-			cmd := exec.Command("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
+			cmd := opCommand("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
 			cmd.Stdin = strings.NewReader(creds.RegistryToken)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				log.Printf("ghcr login failed (non-fatal): %s", string(out))
@@ -468,7 +471,7 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName string, runEnv dockerRunEnv, envPath string, op client.Operation, aliases []string) error {
 	startCommand := dockerCommandOverride(op.Payload)
 	args := rollingContainerArgs(containerName, serviceID, slot, imageName, runEnv.Args(envPath), resourceLimitsFromPayload(op.Payload), aliases, startCommand)
-	cmd := exec.Command("docker", args...)
+	cmd := opCommand("docker", args...)
 	cmd.Env = runEnv.CommandEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -571,8 +574,8 @@ func reconcileUnslotted(streamer *logs.Streamer, serviceID string, graceSec int)
 	// and remove them. `docker stop`/`rm` return nonzero when the target
 	// is absent — expected for whichever slot isn't present; ignored.
 	for _, name := range []string{blueContainer, greenContainer} {
-		_, _ = runCommandSilent("", "docker", "stop", "--time="+strconv.Itoa(graceSec), name)
-		_, _ = runCommandSilent("", "docker", "rm", "-f", name)
+		_, _ = cleanupCommand(stopCleanupTimeout(graceSec), "docker", "stop", "--time="+strconv.Itoa(graceSec), name)
+		_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", name)
 	}
 }
 

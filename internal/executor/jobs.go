@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -22,8 +21,12 @@ import (
 //     forwarders and heartbeat use those to map containers to services and
 //     build on-disk paths, so job containers are stamped
 //     `com.stacked.kind=job` and the compose/slot labels are cleared;
-//   - resources: the service's CPU/memory caps, or a default so a runaway
-//     job can't starve the host;
+//   - resources: the service's CPU/memory caps from the payload
+//     (`cpuLimit` millicores, `memoryLimitMb`; the deploy payload for
+//     release commands, the `cron_run` payload for cron jobs). Each unset
+//     cap falls back to a default (1 CPU; 512 MB for cron, 1 GB for
+//     release commands, which often run migrations or asset builds) so a
+//     runaway job can't starve the host;
 //   - time: a deadline, after which the container is `docker kill`ed
 //     (killing the docker CLI alone would leave the container running).
 
@@ -35,10 +38,9 @@ const (
 	defaultCronJobTimeout = time.Hour
 	maxCronJobTimeout     = 24 * time.Hour
 
-	defaultJobMemoryMB      = 512
+	defaultCronMemoryMB     = 512
+	defaultReleaseMemoryMB  = 1024
 	defaultJobCPUMillicores = 1000
-
-	jobKillTimeout = 30 * time.Second
 )
 
 // CronJobTimeout returns how long a cron_run command may run: the payload's
@@ -69,12 +71,13 @@ func jobLabelArgs(job string) []string {
 }
 
 // jobResourceArgs applies the service's limits from the payload
-// (`cpuLimit` millicores, `memoryLimitMb`), defaulting each unset one to
-// 1 CPU / 512 MB.
-func jobResourceArgs(payload map[string]interface{}) []string {
+// (`cpuLimit` millicores, `memoryLimitMb`; only values > 0 count),
+// defaulting an unset CPU cap to 1 CPU and an unset memory cap to
+// defaultMemoryMB.
+func jobResourceArgs(payload map[string]interface{}, defaultMemoryMB int) []string {
 	limits := resourceLimitsFromPayload(payload)
 	if limits.memoryMB <= 0 {
-		limits.memoryMB = defaultJobMemoryMB
+		limits.memoryMB = defaultMemoryMB
 	}
 	if limits.cpuMillicores <= 0 {
 		limits.cpuMillicores = defaultJobCPUMillicores
@@ -112,7 +115,9 @@ func runJobContainer(streamer *logs.Streamer, dir string, env []string, containe
 	}
 
 	err := runStreamedCmd(streamer, cmd, "docker")
-	if ctx.Err() != nil {
+	// A job that exited successfully right at the deadline succeeded;
+	// only a failed run is attributed to the timeout.
+	if err != nil && ctx.Err() != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) && currentOpContext().Err() == nil {
 			return fmt.Errorf("%w after %s; container %s was stopped", errJobTimedOut, timeout, containerName)
 		}
@@ -124,10 +129,8 @@ func runJobContainer(streamer *logs.Streamer, dir string, env []string, containe
 // killJobContainer stops a job container. Uses its own short deadline
 // because the op context is already done when this runs.
 func killJobContainer(name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), jobKillTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "kill", name).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "No such container") && !strings.Contains(string(out), "is not running") {
-		log.Printf("docker kill %s: %v: %s", name, err, strings.TrimSpace(string(out)))
+	out, err := cleanupCommand(cleanupTimeout, "docker", "kill", name)
+	if err != nil && !strings.Contains(out, "No such container") && !strings.Contains(out, "is not running") {
+		log.Printf("docker kill %s: %v: %s", name, err, strings.TrimSpace(out))
 	}
 }

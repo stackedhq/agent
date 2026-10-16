@@ -44,16 +44,24 @@ func TestJobLabelArgsOverrideInheritedLabels(t *testing.T) {
 }
 
 func TestJobResourceArgs(t *testing.T) {
-	if got := strings.Join(jobResourceArgs(map[string]interface{}{}), " "); got != "--memory=512m --cpus=1" {
-		t.Fatalf("defaults = %q", got)
+	if got := strings.Join(jobResourceArgs(map[string]interface{}{}, defaultCronMemoryMB), " "); got != "--memory=512m --cpus=1" {
+		t.Fatalf("cron defaults = %q", got)
 	}
-	got := strings.Join(jobResourceArgs(map[string]interface{}{"cpuLimit": float64(2500), "memoryLimitMb": float64(2048)}), " ")
+	if got := strings.Join(jobResourceArgs(map[string]interface{}{}, defaultReleaseMemoryMB), " "); got != "--memory=1024m --cpus=1" {
+		t.Fatalf("release defaults = %q", got)
+	}
+	got := strings.Join(jobResourceArgs(map[string]interface{}{"cpuLimit": float64(2500), "memoryLimitMb": float64(2048)}, defaultCronMemoryMB), " ")
 	if got != "--memory=2048m --cpus=2.5" {
 		t.Fatalf("service limits = %q", got)
 	}
-	got = strings.Join(jobResourceArgs(map[string]interface{}{"memoryLimitMb": float64(256)}), " ")
+	got = strings.Join(jobResourceArgs(map[string]interface{}{"memoryLimitMb": float64(256)}, defaultReleaseMemoryMB), " ")
 	if got != "--memory=256m --cpus=1" {
 		t.Fatalf("partial limits = %q", got)
+	}
+	// Zero / negative values mean "unset" and fall back to the default.
+	got = strings.Join(jobResourceArgs(map[string]interface{}{"cpuLimit": float64(0), "memoryLimitMb": float64(-1)}, defaultCronMemoryMB), " ")
+	if got != "--memory=512m --cpus=1" {
+		t.Fatalf("non-positive limits = %q", got)
 	}
 }
 
@@ -65,7 +73,7 @@ func TestDockerJobContainerTimeoutKillsContainer(t *testing.T) {
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", "-v", name).Run() })
 	args := []string{"run", "--rm", "--name", name}
 	args = append(args, jobLabelArgs("cron")...)
-	args = append(args, jobResourceArgs(nil)...)
+	args = append(args, jobResourceArgs(nil, defaultCronMemoryMB)...)
 	args = append(args, "alpine:3", "sh", "-c", "echo started; sleep 120")
 
 	start := time.Now()

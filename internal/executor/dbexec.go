@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,7 +9,6 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-	"time"
 )
 
 // Secrets for `docker exec` never go in argv.
@@ -79,8 +77,6 @@ func mongoConfigYAML(password string) string {
 	return "password: " + string(b) + "\n"
 }
 
-const mongoConfigCleanupTimeout = 30 * time.Second
-
 // writeMongoToolConfig writes a `--config` file holding password into the
 // container (0600, via stdin, never argv) and returns its path and a cleanup
 // func that removes it. The cleanup uses its own deadline so it still runs
@@ -97,9 +93,7 @@ func writeMongoToolConfig(container, password string) (string, func(), error) {
 		return "", func() {}, fmt.Errorf("write mongo tool config in %s: %v: %s", container, err, strings.TrimSpace(string(out)))
 	}
 	cleanup := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), mongoConfigCleanupTimeout)
-		defer cancel()
-		_ = exec.CommandContext(ctx, "docker", "exec", container, "rm", "-f", path).Run()
+		_, _ = cleanupCommand(cleanupTimeout, "docker", "exec", container, "rm", "-f", path)
 	}
 	return path, cleanup, nil
 }

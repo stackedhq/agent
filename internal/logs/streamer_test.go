@@ -185,3 +185,68 @@ func TestStreamDoesNotBlockOnSlowServer(t *testing.T) {
 		t.Fatalf("expected a dropped-lines marker at the end, got %q", last)
 	}
 }
+
+// Long lines must hit the byte cap well before the line cap: the buffer
+// stays under maxBufferedBytes while the server is stalled, and the
+// overflow is reported as dropped lines.
+func TestStreamCapsBufferedBytes(t *testing.T) {
+	s := NewStreamer(nil, "op")
+	line := strings.Repeat("x", MaxLineBytes-100) + "\n"
+	const total = 200 // ~12.5 MiB of input, far fewer than maxBufferedLines
+	pr, pw := io.Pipe()
+	go func() {
+		for i := 0; i < total; i++ {
+			_, _ = pw.Write([]byte(line))
+		}
+		_ = pw.Close()
+	}()
+
+	// Hold the send lock so the background flusher can't drain the
+	// buffer, simulating a stalled server.
+	s.sendMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		s.Stream(pr)
+		close(done)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s.mu.Lock()
+		kept, dropped, size := len(s.buffer), s.dropped, s.bufferedBytes
+		s.mu.Unlock()
+		if kept+dropped == total {
+			if size > maxBufferedBytes {
+				t.Fatalf("buffered %d bytes, cap is %d", size, maxBufferedBytes)
+			}
+			if dropped == 0 {
+				t.Fatal("expected lines to be dropped once the byte cap was reached")
+			}
+			if kept >= maxBufferedLines {
+				t.Fatalf("byte cap did not apply: kept %d lines", kept)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reader stalled: kept=%d dropped=%d", kept, dropped)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.sendMu.Unlock()
+	<-done
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buffer, s.bufferedBytes = nil, 0
+}
+
+func TestFlushResetsBufferedBytes(t *testing.T) {
+	s := NewStreamer(nil, "op")
+	s.AddLine("hello")
+	if s.bufferedBytes == 0 {
+		t.Fatal("AddLine should count bytes")
+	}
+	s.Flush()
+	if s.bufferedBytes != 0 || len(s.buffer) != 0 {
+		t.Fatalf("flush left %d bytes / %d lines", s.bufferedBytes, len(s.buffer))
+	}
+}

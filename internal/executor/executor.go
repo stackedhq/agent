@@ -110,17 +110,33 @@ func (e *Executor) ExecuteWithTimeout(op client.Operation, timeout time.Duration
 	e.reportOutcome(op, out.result, out.err)
 }
 
+// handlerStuckLimit is how long a handler may keep running after its op
+// timed out before the agent gives up on it and exits, so systemd
+// (Restart=always) brings back a clean agent instead of the poller staying
+// blocked forever behind a call that ignores the op context.
+var handlerStuckLimit = 15 * time.Minute
+
+// exitProcess is os.Exit, swappable in tests.
+var exitProcess = os.Exit
+
 // waitForHandler blocks until a timed-out handler returns. Its commands
-// were bound to the expired context, so this is normally immediate.
+// were bound to the expired context, so this is normally immediate. If the
+// handler is still running handlerStuckLimit later, the agent exits.
 func waitForHandler(op client.Operation, done <-chan opOutcome) {
 	ticker := time.NewTicker(opUnwindLogInterval)
 	defer ticker.Stop()
+	watchdog := time.NewTimer(handlerStuckLimit)
+	defer watchdog.Stop()
 	for {
 		select {
 		case <-done:
 			return
 		case <-ticker.C:
 			log.Printf("Operation %s (%s): handler still running after its timeout; waiting before the next operation", op.ID, op.Type)
+		case <-watchdog.C:
+			log.Printf("Operation %s (%s): handler still running %s after its timeout; exiting so systemd restarts a clean agent", op.ID, op.Type, handlerStuckLimit)
+			exitProcess(1)
+			return
 		}
 	}
 }

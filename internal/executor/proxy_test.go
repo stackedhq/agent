@@ -331,13 +331,20 @@ func TestParsePortInUseFromDocker(t *testing.T) {
 	out := `Container proxy-caddy-1  Starting
 Error response from daemon: driver failed programming external connectivity on endpoint proxy-caddy-1 (abc): Bind for 0.0.0.0:80 failed: port is already allocated
 `
-	port, _ := parsePortInUseFromDocker(out)
-	if port != 80 {
-		t.Errorf("expected port 80, got %d", port)
+	// Holder lookup runs `docker ps`; stub it so the test doesn't depend
+	// on (or hang on) a local daemon.
+	prev := lookupPortHolder
+	t.Cleanup(func() { lookupPortHolder = prev })
+	lookupPortHolder = func(p int) string {
+		if p != 80 {
+			t.Errorf("holder lookup for port %d", p)
+		}
+		return "nginx-1"
 	}
-	// Holder lookup runs docker ps which won't be available in tests;
-	// we tolerate empty holder. Production path is exercised by
-	// integration.
+	port, holder := parsePortInUseFromDocker(out)
+	if port != 80 || holder != "nginx-1" {
+		t.Errorf("expected port 80 / nginx-1, got %d / %q", port, holder)
+	}
 }
 
 func TestParsePortInUseFromDockerNoMatch(t *testing.T) {

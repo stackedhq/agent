@@ -206,7 +206,7 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 	args = append(args, runEnv.Args(envPath)...)
 	args = append(args, "--name", containerName)
 	args = append(args, jobLabelArgs("cron")...)
-	args = append(args, jobResourceArgs(op.Payload)...)
+	args = append(args, jobResourceArgs(op.Payload, defaultCronMemoryMB)...)
 	args = append(args, imageName, "sh", "-lc", command)
 	if err := runJobContainer(streamer, dir, runEnv.CommandEnv(), containerName, timeout, args); err != nil {
 		return fail(fmt.Errorf("job command failed: %w", err))

@@ -180,8 +180,14 @@ func TestDockerMariaDBOps(t *testing.T) {
 	md := startDBContainer(t, "mariadb:11",
 		map[string]string{"MARIADB_ROOT_PASSWORD": testRootPw, "MARIADB_DATABASE": "appdb", "MARIADB_USER": "app", "MARIADB_PASSWORD": testPw},
 		[]string{"sh", "-c", `mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -e 'select 1' appdb`})
-	// mariadb:11 dropped the mysql* compatibility names the agent uses.
+	// mariadb:11 dropped the mysql* compatibility names. The dump side
+	// falls back to mariadb-dump on its own (and must be detected as
+	// MariaDB so --set-gtid-purged is left out); restore/reset/rotate
+	// still call the client as `mysql`.
 	execIn(t, md, "sh", "-c", "ln -sf /usr/bin/mariadb /usr/local/bin/mysql")
+	if tool, err := detectMySQLDumpTool(md); err != nil || !tool.mariaDB {
+		t.Fatalf("detectMySQLDumpTool(mariadb:11) = %+v, %v", tool, err)
+	}
 	creds := testCreds()
 	sql := func(pw, q string) string {
 		cmd := exec.Command("docker", "exec", "-e", "MYSQL_PWD", md, "mariadb", "-uroot", "-N", "-e", q, "appdb")
@@ -193,9 +199,6 @@ func TestDockerMariaDBOps(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	sql(testRootPw, "create table t(id int); insert into t values (1),(2);")
-	// mysqldump --set-gtid-purged is MySQL-only; mariadb-dump rejects it,
-	// so drop it via a wrapper for this test.
-	execIn(t, md, "sh", "-c", `rm -f /usr/local/bin/mysqldump && printf '#!/bin/sh\nfor a; do shift; [ "$a" = --set-gtid-purged=OFF ] || set -- "$@" "$a"; done\nexec mariadb-dump "$@"\n' > /usr/local/bin/mysqldump && chmod +x /usr/local/bin/mysqldump`)
 	roundTrip(t, "mariadb", md, creds, func() { sql(testRootPw, "delete from t") })
 	if got := sql(testRootPw, "select count(*) from t"); got != "2" {
 		t.Fatalf("restore lost rows: %q", got)
@@ -206,6 +209,44 @@ func TestDockerMariaDBOps(t *testing.T) {
 	}
 	if got := sql(newRoot, "select 1"); got != "1" {
 		t.Fatalf("root login with rotated password: %q", got)
+	}
+}
+
+func TestDockerMySQLOps(t *testing.T) {
+	my := startDBContainer(t, "mysql:8.4",
+		map[string]string{"MYSQL_ROOT_PASSWORD": testRootPw, "MYSQL_DATABASE": "appdb", "MYSQL_USER": "app", "MYSQL_PASSWORD": testPw},
+		// TCP only answers once the entrypoint's init server (which runs
+		// with --skip-networking) has been replaced by the real one.
+		[]string{"sh", "-c", `mysql -h127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" -e 'select 1' appdb`})
+	if tool, err := detectMySQLDumpTool(my); err != nil || tool.name != "mysqldump" || tool.mariaDB {
+		t.Fatalf("detectMySQLDumpTool(mysql:8.4) = %+v, %v", tool, err)
+	}
+	creds := testCreds()
+	sql := func(pw, q string) string {
+		cmd := exec.Command("docker", "exec", "-e", "MYSQL_PWD", my, "mysql", "-uroot", "-N", "-e", q, "appdb")
+		cmd.Env = append(os.Environ(), "MYSQL_PWD="+pw)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("mysql: %v %s", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	sql(testRootPw, "create table t(id int); insert into t values (1),(2);")
+	roundTrip(t, "mysql", my, creds, func() { sql(testRootPw, "delete from t") })
+	if got := sql(testRootPw, "select count(*) from t"); got != "2" {
+		t.Fatalf("restore lost rows: %q", got)
+	}
+	newRoot := testNewPw + "-root"
+	if err := alterPassword(my, "mysql", creds, map[string]string{"password": testNewPw, "rootPassword": newRoot}, logs.NewStreamer(nil, "op"), &Executor{}); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if got := sql(newRoot, "select 1"); got != "1" {
+		t.Fatalf("root login with rotated password: %q", got)
+	}
+	cmd := exec.Command("docker", "exec", "-e", "MYSQL_PWD", my, "mysql", "-h127.0.0.1", "-uapp", "-N", "-e", "select 1", "appdb")
+	cmd.Env = append(os.Environ(), "MYSQL_PWD="+testNewPw)
+	if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("app login with rotated password failed: %v %s", err, out)
 	}
 }
 

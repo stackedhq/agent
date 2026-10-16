@@ -56,7 +56,7 @@ func TestNewDockerExecPassesSecretsByName(t *testing.T) {
 
 func TestBackupAndRestoreArgsKeepPasswordsOutOfArgv(t *testing.T) {
 	for _, engine := range []string{"postgres", "mysql", "mariadb", "mongo"} {
-		dump, err := buildBackupDumpArgs(engine, "db1", testCreds(), "/tmp/stacked-mongo-x.yaml")
+		dump, err := buildBackupDumpArgs(engine, "db1", testCreds(), "/tmp/stacked-mongo-x.yaml", mysqlDumpTool{})
 		if err != nil {
 			t.Fatalf("%s dump: %v", engine, err)
 		}
@@ -84,14 +84,14 @@ func TestBackupAndRestoreArgsKeepPasswordsOutOfArgv(t *testing.T) {
 			}
 		}
 	}
-	if _, err := buildBackupDumpArgs("mongo", "db1", testCreds(), ""); err == nil {
+	if _, err := buildBackupDumpArgs("mongo", "db1", testCreds(), "", mysqlDumpTool{}); err == nil {
 		t.Fatalf("mongo dump without a config file must fail rather than prompt")
 	}
 }
 
 func TestMigrationPipeAndResetKeepPasswordsOutOfArgv(t *testing.T) {
 	for _, engine := range []string{"postgres", "mysql", "mongo"} {
-		dump, restore, err := buildPipeArgs(engine, "src", "tgt", testCreds(), testCreds(), "/tmp/a.yaml", "/tmp/b.yaml")
+		dump, restore, err := buildPipeArgs(engine, "src", "tgt", testCreds(), testCreds(), "/tmp/a.yaml", "/tmp/b.yaml", mysqlDumpTool{})
 		if err != nil {
 			t.Fatalf("%s: %v", engine, err)
 		}
@@ -141,5 +141,66 @@ func TestMongoConfigYAMLQuotesPassword(t *testing.T) {
 	got := mongoConfigYAML("a\"b\\c\nd: e")
 	if got != `password: "a\"b\\c\nd: e"`+"\n" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestMySQLDumpToolArgv(t *testing.T) {
+	mysql := strings.Join(mysqlDumpTool{}.argv("appdb"), " ")
+	if mysql != "mysqldump -u root --single-transaction --routines --triggers --set-gtid-purged=OFF appdb" {
+		t.Fatalf("mysql argv = %q", mysql)
+	}
+	for _, tool := range []mysqlDumpTool{{name: "mysqldump", mariaDB: true}, {name: "mariadb-dump", mariaDB: true}} {
+		got := tool.argv("appdb")
+		if strings.Contains(strings.Join(got, " "), "gtid") {
+			t.Fatalf("MariaDB dump must not get --set-gtid-purged: %q", got)
+		}
+		if got[0] != tool.name || got[len(got)-1] != "appdb" {
+			t.Fatalf("argv = %q", got)
+		}
+	}
+	dump, err := buildBackupDumpArgs("mariadb", "db1", testCreds(), "", mysqlDumpTool{name: "mariadb-dump", mariaDB: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(dump.Args, " "), "gtid") || !strings.Contains(strings.Join(dump.Args, " "), "db1 mariadb-dump") {
+		t.Fatalf("mariadb dump args = %q", dump.Args)
+	}
+}
+
+func TestIsMariaDBVersion(t *testing.T) {
+	cases := map[string]bool{
+		"mysqldump  Ver 10.19 Distrib 10.11.6-MariaDB, for debian-linux-gnu (x86_64)":   true,
+		"mariadb-dump from 11.4.2-MariaDB, client 10.19 for debian-linux-gnu (aarch64)": true,
+		"mysqldump  Ver 8.4.2 for Linux on x86_64 (MySQL Community Server - GPL)":       false,
+	}
+	for banner, want := range cases {
+		if got := isMariaDBVersion(banner); got != want {
+			t.Errorf("isMariaDBVersion(%q) = %v, want %v", banner, got, want)
+		}
+	}
+}
+
+func TestSanitizeAlterPasswordOutput(t *testing.T) {
+	out := strings.Join([]string{
+		`ERROR:  syntax error at or near "WITH"`,
+		`LINE 2: ALTER USER "app" WITH PASSWORD 'n3w-secret';`,
+		`                         ^`,
+		`mysql: [Warning] could not use n3w-secret here`,
+		`ERROR 1045 (28000): Access denied for user 'root'@'localhost'`,
+	}, "\n")
+	got := sanitizeAlterPasswordOutput(out, map[string]string{"user": "app", "password": "old-secret"}, map[string]string{"password": "n3w-secret"})
+	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, "n3w-secret") || strings.Contains(joined, "ALTER USER") {
+		t.Fatalf("password leaked into log output:\n%s", joined)
+	}
+	if strings.Contains(joined, "^") {
+		t.Fatalf("caret marker for the dropped LINE should be dropped too:\n%s", joined)
+	}
+	if !strings.Contains(joined, "syntax error") || !strings.Contains(joined, "Access denied") {
+		t.Fatalf("non-secret lines must be kept:\n%s", joined)
+	}
+	// The user name is not a secret and stays readable.
+	if !strings.Contains(joined, "'root'@'localhost'") {
+		t.Fatalf("unexpected masking:\n%s", joined)
 	}
 }

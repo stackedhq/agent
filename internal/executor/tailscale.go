@@ -219,7 +219,7 @@ func (e *Executor) TailscaleDisable(op client.Operation) error {
 		// success matches the user intent ("be off").
 		return nil
 	}
-	out, err := exec.Command("tailscale", "down").CombinedOutput()
+	out, err := opCommand("tailscale", "down").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tailscale down: %s: %w", strings.TrimSpace(string(out)), err)
 	}

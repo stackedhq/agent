@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os/exec"
 	"sort"
 	"strings"
 
@@ -622,9 +621,19 @@ func dokployTraefikExists() bool {
 // requiring a working directory — we operate on container names, not
 // compose projects.
 func runDockerSilent(args ...string) (string, error) {
-	cmd := exec.Command("docker", args...)
+	cmd := opCommand("docker", args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// checkContainerName rejects a server-supplied container name that is not
+// a plain docker name before it reaches a `docker exec` / `docker inspect`
+// argv (a leading `-` would be parsed as a flag).
+func checkContainerName(what, name string) error {
+	if !isSafeContainerName(name) {
+		return fmt.Errorf("invalid %s container name %q", what, name)
+	}
+	return nil
 }
 
 // isSafeContainerName matches docker's own naming rules:
