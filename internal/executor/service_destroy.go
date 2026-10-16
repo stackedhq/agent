@@ -22,6 +22,9 @@ func (e *Executor) ServiceDestroy(op client.Operation) error {
 	if serviceID == "" {
 		return fmt.Errorf("service_destroy requires serviceId in payload")
 	}
+	if !isUUID(serviceID) {
+		return fmt.Errorf("service_destroy: invalid serviceId")
+	}
 
 	removeVolumes := true
 	if rv, ok := op.Payload["removeVolumes"].(bool); ok {
@@ -36,7 +39,7 @@ func (e *Executor) ServiceDestroy(op client.Operation) error {
 	// 1. docker compose down -v (removes containers + docker-managed volumes)
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); err == nil {
 		log.Printf("Running docker compose down -v for service %s", serviceID)
-		if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "down", "-v"); err != nil {
+		if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "down", "-v")...); err != nil {
 			streamer.AddLine("ERROR: " + err.Error())
 			streamer.Flush()
 			return fmt.Errorf("docker compose down: %w", err)

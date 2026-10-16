@@ -1,0 +1,20 @@
+services:
+  11111111-2222-4333-8444-555555555555:
+    container_name: "11111111-2222-4333-8444-555555555555"
+    image: "ghcr.io/acme/api:1.2.3"
+    restart: "unless-stopped"
+    environment:
+      HAS_HASH: "a#b"
+      HAS_QUOTE: "has \"quotes\" inside"
+      HOST: "0.0.0.0"
+      NODE_ENV: "production"
+      SMTP_FROM: "Riffado <noreply@riffado.com>"
+    networks:
+      - "stacked"
+    labels:
+      com.stacked.kind: "service"
+
+networks:
+  stacked:
+    name: "stacked"
+    external: true
