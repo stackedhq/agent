@@ -183,7 +183,7 @@ func (a *Archiver) flush() {
 		return
 	}
 
-	issued, err := a.client.RequestLogArchiveURL(a.serviceID)
+	issued, err := a.client.RequestLogArchiveURL(a.serviceID, int64(len(gzipped)))
 	if err != nil {
 		if errors.Is(err, client.ErrArchivalDisabled) {
 			log.Printf("archiver[%s]: archival disabled by server; skipping further uploads", a.serviceID)

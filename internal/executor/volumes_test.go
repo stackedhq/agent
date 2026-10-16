@@ -614,3 +614,17 @@ func TestHostPathPolicyErrorMessages(t *testing.T) {
 		}
 	}
 }
+
+func TestHostPathPolicyRejectsParentsOfDeniedRoots(t *testing.T) {
+	const svc = "11111111-2222-4333-8444-555555555555"
+	for _, p := range []string{"/var", "/var/lib", "/opt", "/var/snap/.."} {
+		if _, err := checkHostPathPolicy(svc, p); err == nil {
+			t.Errorf("%s: expected rejection", p)
+		}
+	}
+	for _, p := range []string{"/srv/app", "/mnt/data", "/data/x", "/media/usb", "/var/www/site", "/opt/myapp", "/var/lib/myapp", "/opt/stacked/data/vaultwarden"} {
+		if _, err := checkHostPathPolicy(svc, p); err != nil {
+			t.Errorf("%s: unexpected rejection: %v", p, err)
+		}
+	}
+}

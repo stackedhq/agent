@@ -216,7 +216,23 @@ func checkHostPathPolicy(serviceID, hostPath string) (string, error) {
 		}
 		return "", denyHostPath(clean, "system path, inside "+denied)
 	}
+	if contained := deniedRootUnder(clean); contained != "" {
+		// A parent of a denied root (e.g. /var, /opt) would expose it
+		// through the mount just the same.
+		return "", denyHostPath(clean, "contains the system path "+contained)
+	}
 	return clean, nil
+}
+
+// deniedRootUnder returns a denied root that lies strictly inside clean,
+// or "".
+func deniedRootUnder(clean string) string {
+	for _, root := range deniedHostPathRoots {
+		if strings.HasPrefix(root, clean+"/") {
+			return root
+		}
+	}
+	return ""
 }
 
 func deniedHostRoot(clean string) string {

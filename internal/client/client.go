@@ -459,10 +459,21 @@ type LogArchiveConfirm struct {
 // rather than spamming requests every minute.
 var ErrArchivalDisabled = fmt.Errorf("log archival disabled on server")
 
+// uploadSizeRequest declares the exact byte size of an upload before the
+// server presigns it. The server signs Content-Length into the URL, so the
+// PUT must send exactly this many bytes.
+type uploadSizeRequest struct {
+	SizeBytes int64 `json:"sizeBytes"`
+}
+
 // RequestLogArchiveURL asks the server for a presigned PUT URL the agent
 // can use to upload a gzipped NDJSON chunk directly to R2.
-func (c *Client) RequestLogArchiveURL(serviceID string) (*LogArchiveURL, error) {
-	body, err := c.doRequest("POST", "/api/agent/logs/"+serviceID+"/archive-url", nil)
+func (c *Client) RequestLogArchiveURL(serviceID string, sizeBytes int64) (*LogArchiveURL, error) {
+	req, err := json.Marshal(uploadSizeRequest{SizeBytes: sizeBytes})
+	if err != nil {
+		return nil, fmt.Errorf("marshal archive URL request: %w", err)
+	}
+	body, err := c.doRequest("POST", "/api/agent/logs/"+serviceID+"/archive-url", bytes.NewReader(req))
 	if err != nil {
 		// Surface ARCHIVAL_DISABLED as a typed error. The body of a 503
 		// response is folded into err.Error() by doRequest — a string
@@ -625,8 +636,12 @@ func (c *Client) GetBackupCredentials(databaseID string) (*BackupCredentials, er
 
 // RequestBackupUploadURL asks the server for a presigned PUT URL for a
 // backup row's (server-owned) key. Marks the backup row running.
-func (c *Client) RequestBackupUploadURL(backupID string) (*BackupUploadURL, error) {
-	body, err := c.doRequest("POST", "/api/agent/backups/"+backupID+"/upload-url", nil)
+func (c *Client) RequestBackupUploadURL(backupID string, sizeBytes int64) (*BackupUploadURL, error) {
+	req, err := json.Marshal(uploadSizeRequest{SizeBytes: sizeBytes})
+	if err != nil {
+		return nil, fmt.Errorf("marshal backup upload URL request: %w", err)
+	}
+	body, err := c.doRequest("POST", "/api/agent/backups/"+backupID+"/upload-url", bytes.NewReader(req))
 	if err != nil {
 		if strings.Contains(err.Error(), "BACKUPS_DISABLED") {
 			return nil, ErrBackupsDisabled

@@ -193,7 +193,7 @@ func dumpAndUpload(
 	}
 	defer os.Remove(tmpPath)
 
-	issued, err := c.RequestBackupUploadURL(backupID)
+	issued, err := c.RequestBackupUploadURL(backupID, size)
 	if err != nil {
 		return fmt.Errorf("request upload URL: %w", err)
 	}
