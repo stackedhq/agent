@@ -37,7 +37,7 @@ make build
 # -X github.com/stackedapp/stacked/agent/internal/heartbeat.Version=X.Y.Z
 ```
 
-**Releasing:** Tag with `vX.Y.Z` and push — GitHub Actions builds binaries and creates a release.
+**Releasing:** Tag with `vX.Y.Z` and push. `release.yml` builds both binaries, signs `SHA256SUMS` in the `release` Environment (needs approval; secret `AGENT_SIGNING_KEY`), and publishes binaries + `SHA256SUMS` + `SHA256SUMS.sig` with build provenance. Every action is SHA-pinned; keep it that way when bumping.
 
 ```bash
 git tag v0.7.0
@@ -91,7 +91,7 @@ If a release changes an embedded template and you want it to land on existing in
 
 - **Log streaming**: Commands run via `runCommand` or `runCommandWithStreamer`, output goes through `logs.Streamer` which batches lines and POSTs to the server every 1s or 50 lines
 - **Progress reporting**: `streamer.SetProgress(N)` + `streamer.AddLine("==> Phase...")` at deploy phase boundaries
-- **Self-update**: Downloads new binary → replaces in-place → `os.Exit(0)` → systemd restarts with new binary
+- **Self-update**: Fetches `SHA256SUMS` + `SHA256SUMS.sig` for `v<targetVersion>` from the fixed GitHub release URL, verifies the ed25519 signature against the keys in `internal/executor/release_keys.go`, streams the binary to a temp file next to the agent while hashing it, then renames over → `os.Exit(0)` → systemd restarts. Refuses same-version and downgrades. There is no server-supplied download URL.
 - **All operations are sequential**: Poller claims pending ops and executes them one at a time
 
 ## State Files

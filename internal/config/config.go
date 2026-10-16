@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/stackedapp/stacked/agent/internal/client"
 )
 
 type Config struct {
@@ -42,6 +44,12 @@ func Load() (*Config, error) {
 
 	// Strip trailing slash
 	cfg.Agent.Server = strings.TrimRight(cfg.Agent.Server, "/")
+
+	// Fail fast on insecure server URLs: the token rides on every
+	// request and ops are executed as root-equivalent.
+	if err := client.ValidateServerURL(cfg.Agent.Server); err != nil {
+		return nil, fmt.Errorf("agent.server in %s: %w", path, err)
+	}
 
 	return &cfg, nil
 }
