@@ -71,6 +71,9 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 		}
 		return nil, fail(fmt.Errorf("get credentials: %w", err))
 	}
+	if creds.NetworkAliases, err = resolveNetworkAliases(creds.NetworkAliases); err != nil {
+		return nil, fail(err)
+	}
 	// Honor an explicit port from the server, including 0 (worker service
 	// — HealthProbe skips the TCP probe for non-positive ports). Only fall
 	// back to the 3000 default when the field is absent (older server).
@@ -444,9 +447,12 @@ func renderServiceNetworks(aliases []string) string {
 }
 
 // validNetworkAlias mirrors the server's slug constraints: a lowercase DNS
-// label, 1–63 chars, alphanumeric with internal hyphens.
+// label, 1–63 chars, alphanumeric with internal hyphens, and not a name
+// reserved for Stacked infrastructure (see aliases.go). Names of existing
+// containers are filtered separately by resolveNetworkAliases, which
+// needs docker.
 var networkAliasRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 func validNetworkAlias(s string) bool {
-	return networkAliasRe.MatchString(s)
+	return networkAliasRe.MatchString(s) && !isReservedAlias(s)
 }

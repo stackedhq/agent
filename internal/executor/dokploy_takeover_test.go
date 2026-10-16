@@ -227,3 +227,21 @@ func TestProbeContainerBindings_ShapeRoundTrip(t *testing.T) {
 			raw, want)
 	}
 }
+
+func TestResolveDokployAttachNetwork(t *testing.T) {
+	if got, err := resolveDokployAttachNetwork("", "dokploy-network"); err != nil || got != "dokploy-network" {
+		t.Fatalf("empty payload: %q, %v", got, err)
+	}
+	if got, err := resolveDokployAttachNetwork("dokploy-network", "dokploy-network"); err != nil || got != "dokploy-network" {
+		t.Fatalf("matching payload: %q, %v", got, err)
+	}
+	if _, err := resolveDokployAttachNetwork("some-other-net", "dokploy-network"); err == nil {
+		t.Fatal("payload network differing from the detected one must be refused")
+	}
+	if _, err := resolveDokployAttachNetwork("dokploy-network", ""); err == nil {
+		t.Fatal("attach without a detected dokploy network must be refused")
+	}
+	if _, err := resolveDokployAttachNetwork("", gateNetworkName); err == nil {
+		t.Fatal("must never attach to the gate network")
+	}
+}

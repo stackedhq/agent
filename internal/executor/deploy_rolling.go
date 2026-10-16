@@ -118,6 +118,9 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	if err != nil {
 		return nil, fail(fmt.Errorf("get credentials: %w", err))
 	}
+	if creds.NetworkAliases, err = resolveNetworkAliases(creds.NetworkAliases); err != nil {
+		return nil, fail(err)
+	}
 	imageName, err := e.resolveImage(op, serviceID, dir, creds, streamer)
 	if err != nil {
 		return nil, fail(err)
@@ -301,6 +304,9 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	creds, err := e.Client.GetCredentials(serviceID)
 	if err != nil {
 		return nil, fail(fmt.Errorf("get credentials: %w", err))
+	}
+	if creds.NetworkAliases, err = resolveNetworkAliases(creds.NetworkAliases); err != nil {
+		return nil, fail(err)
 	}
 	if creds.EnvVars == nil {
 		creds.EnvVars = map[string]string{}
