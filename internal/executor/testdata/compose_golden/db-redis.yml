@@ -1,0 +1,27 @@
+services:
+  database:
+    image: "redis:7-alpine"
+    container_name: "stk-db-rd"
+    restart: "unless-stopped"
+    command:
+      - "sh"
+      - "-c"
+      - "set -e\nconf=/tmp/stacked-redis.conf\numask 077\nprintf 'requirepass %s\\n' \"$$STACKED_REDIS_REQUIREPASS\" > \"$$conf\"\nchmod 0644 \"$$conf\"\nif command -v docker-entrypoint.sh >/dev/null 2>&1; then\n  exec docker-entrypoint.sh redis-server \"$$conf\"\nfi\nexec redis-server \"$$conf\"\n"
+    environment:
+      STACKED_REDIS_REQUIREPASS: "\"\\x58\\x79\\x7a\\x2d\\x31\\x32\\x33\\x5f\\x61\\x62\\x63\""
+    volumes:
+      - "data:/data"
+    ports:
+      - "16379:6379"
+    networks:
+      - "stacked"
+    labels:
+      com.stacked.kind: "database"
+
+volumes:
+  data:
+
+networks:
+  stacked:
+    name: "stacked"
+    external: true

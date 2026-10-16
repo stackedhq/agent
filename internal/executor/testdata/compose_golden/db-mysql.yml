@@ -1,0 +1,26 @@
+services:
+  database:
+    image: "mysql:8"
+    container_name: "stk-db-my"
+    restart: "unless-stopped"
+    environment:
+      MYSQL_ROOT_PASSWORD: "true"
+      MYSQL_DATABASE: "appdb"
+      MYSQL_USER: "app"
+      MYSQL_PASSWORD: "Xyz-123_abc"
+    volumes:
+      - "data:/var/lib/mysql"
+    ports:
+      - "100.64.0.5:13306:3306"
+    networks:
+      - "stacked"
+    labels:
+      com.stacked.kind: "database"
+
+volumes:
+  data:
+
+networks:
+  stacked:
+    name: "stacked"
+    external: true

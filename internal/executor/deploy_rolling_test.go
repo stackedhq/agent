@@ -9,7 +9,7 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 	serviceID := "svc-123"
 	args := rollingContainerArgs(
 		serviceID+"-blue", serviceID, "blue",
-		"registry/app:tag", "/opt/stacked/services/svc-123/.env",
+		"registry/app:tag", []string{"--env-file=/opt/stacked/services/svc-123/stacked.env"},
 		resourceLimits{restartPolicy: "unless-stopped"},
 		nil, "",
 	)
@@ -35,7 +35,7 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 
 func TestRollingContainerArgsFriendlyAliases(t *testing.T) {
 	args := rollingContainerArgs(
-		"svc-1-blue", "svc-1", "blue", "img", "/env",
+		"svc-1-blue", "svc-1", "blue", "img", []string{"--env-file=/env"},
 		resourceLimits{restartPolicy: "unless-stopped"},
 		[]string{"api", "old-name", "BAD ALIAS", ""}, "",
 	)
@@ -62,7 +62,7 @@ func TestRollingContainerArgsFriendlyAliases(t *testing.T) {
 
 func TestRollingContainerArgsAppliesLimits(t *testing.T) {
 	args := rollingContainerArgs(
-		"svc-1-green", "svc-1", "green", "img", "/env",
+		"svc-1-green", "svc-1", "green", "img", []string{"--env-file=/env"},
 		resourceLimits{cpuMillicores: 1500, memoryMB: 512, restartPolicy: "on-failure"},
 		nil, "",
 	)
@@ -79,7 +79,7 @@ func TestRollingContainerArgsAppliesLimits(t *testing.T) {
 
 func TestRollingContainerArgsOmitsUnsetLimits(t *testing.T) {
 	args := rollingContainerArgs(
-		"svc-1-blue", "svc-1", "blue", "img", "/env",
+		"svc-1-blue", "svc-1", "blue", "img", []string{"--env-file=/env"},
 		resourceLimits{restartPolicy: "unless-stopped"},
 		nil, "",
 	)
@@ -146,7 +146,7 @@ func TestRequiresFastRestartForAnyAttachedStorage(t *testing.T) {
 }
 
 func TestRollingContainerArgsAppliesDockerImageCommand(t *testing.T) {
-	args := rollingContainerArgs("svc-blue", "svc", "blue", "image", "/env",
+	args := rollingContainerArgs("svc-blue", "svc", "blue", "image", []string{"--env-file=/env"},
 		resourceLimits{restartPolicy: "unless-stopped"}, nil, "node server.js && echo ready")
 	want := []string{"image", "sh", "-lc", "node server.js && echo ready"}
 	if len(args) < len(want) {

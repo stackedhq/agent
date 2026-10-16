@@ -126,16 +126,17 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		return nil, fail(err)
 	}
 
-	// Phase 2: write env file (shared by both slots).
-	if creds.EnvVars == nil {
-		creds.EnvVars = map[string]string{}
+	// Phase 2: write env file (shared by both slots). Single-line values
+	// go in stacked.env (0600); multi-line values reach `docker run`
+	// through its process env (`-e KEY`), never argv.
+	env, envWarnings := serviceEnv(creds.EnvVars)
+	addEnvWarnings(streamer, envWarnings)
+	runEnv, envPath, err := writeServiceEnvFile(dir, env)
+	if err != nil {
+		return nil, fail(err)
 	}
-	if _, ok := creds.EnvVars["HOST"]; !ok {
-		creds.EnvVars["HOST"] = "0.0.0.0"
-	}
-	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
-		return nil, fail(fmt.Errorf("write .env: %w", err))
+	if err := cleanupLegacyEnvFile(dir); err != nil {
+		log.Printf("cleanup legacy .env for %s: %v", serviceID, err)
 	}
 
 	// Phase 3: ensure the network exists.
@@ -155,7 +156,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// of the same name behind, remove it before starting fresh.
 	_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
 
-	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, envPath, op, creds.NetworkAliases); err != nil {
+	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, runEnv, envPath, op, creds.NetworkAliases); err != nil {
 		return nil, fail(err)
 	}
 
@@ -314,10 +315,8 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	if _, ok := creds.EnvVars["HOST"]; !ok {
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
-	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
-		return nil, fail(fmt.Errorf("write .env: %w", err))
-	}
+	env, envWarnings := serviceEnv(creds.EnvVars)
+	addEnvWarnings(streamer, envWarnings)
 
 	// Pre-pull / pre-build BEFORE stopping the old container so the
 	// outage window doesn't include a slow registry fetch. The deploy
@@ -332,8 +331,8 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// `<serviceID>` so volumes mount exclusively (only one writer at
 	// a time). Reuses the existing compose template — the recreate
 	// path's container shape — so logs/metrics keying is unchanged.
-	volumeMounts := parseVolumes(op.Payload)
-	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
+	volumeMounts, err := prepareVolumeHostDirs(serviceID, parseVolumes(op.Payload))
+	if err != nil {
 		return nil, fail(err)
 	}
 	fileMounts, err := e.prepareFileMounts(op, serviceID)
@@ -345,9 +344,12 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 		return nil, fail(err)
 	}
 	startCommand := dockerCommandOverride(op.Payload)
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand, env)
 	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
+	}
+	if err := cleanupLegacyEnvFile(dir); err != nil {
+		log.Printf("cleanup legacy .env for %s: %v", serviceID, err)
 	}
 
 	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
@@ -365,7 +367,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 
 	streamer.AddLine("Starting new container...")
 	streamer.Flush()
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--force-recreate", "--remove-orphans"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "up", "-d", "--force-recreate", "--remove-orphans")...); err != nil {
 		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
 
@@ -459,10 +461,11 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 // them (standard scaled-service behaviour, both are healthy by then);
 // steady state resolves to the single running slot. recreate /
 // fast-restart already get this for free via `container_name`.
-func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation, aliases []string) error {
+func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName string, runEnv dockerRunEnv, envPath string, op client.Operation, aliases []string) error {
 	startCommand := dockerCommandOverride(op.Payload)
-	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload), aliases, startCommand)
+	args := rollingContainerArgs(containerName, serviceID, slot, imageName, runEnv.Args(envPath), resourceLimitsFromPayload(op.Payload), aliases, startCommand)
 	cmd := exec.Command("docker", args...)
+	cmd.Env = runEnv.CommandEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		streamer.AddLine(strings.TrimSpace(string(out)))
@@ -474,7 +477,7 @@ func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot
 // rollingContainerArgs builds the `docker run` argv for a rolling slot
 // container. Pure (no side effects) so the flag contract — notably the
 // stable `--network-alias` — can be unit-tested without invoking docker.
-func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits, aliases []string, startCommand string) []string {
+func rollingContainerArgs(containerName, serviceID, slot, imageName string, envArgs []string, limits resourceLimits, aliases []string, startCommand string) []string {
 	startCommand = strings.TrimSpace(startCommand)
 	args := []string{
 		"run", "-d",
@@ -491,8 +494,8 @@ func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath str
 			args = append(args, "--network-alias="+a)
 		}
 	}
+	args = append(args, envArgs...)
 	args = append(args,
-		"--env-file="+envPath,
 		"--label", "com.docker.compose.project="+serviceID,
 		"--label", "com.stacked.kind=service",
 		"--label", "com.stacked.slot="+slot,

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -52,6 +51,10 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		streamer.AddLine("ERROR: " + err.Error())
 		streamer.Flush()
 		return err
+	}
+
+	if err := validateDeployPayload(serviceID, op.Payload); err != nil {
+		return fail(err)
 	}
 
 	streamer.SetProgress(0)
@@ -108,17 +111,14 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		imageName = built
 	}
 
-	// Write the env file the one-shot container will read. Same shape
-	// the deploy executor writes for the running container.
-	if creds.EnvVars == nil {
-		creds.EnvVars = map[string]string{}
-	}
-	if _, ok := creds.EnvVars["HOST"]; !ok {
-		creds.EnvVars["HOST"] = "0.0.0.0"
-	}
-	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
-		return fail(fmt.Errorf("write .env: %w", err))
+	// Write the env file the one-shot container will read. Same env the
+	// deploy executor gives the running container; multi-line values go
+	// through the docker CLI's process env (`-e KEY`), never argv.
+	env, envWarnings := serviceEnv(creds.EnvVars)
+	addEnvWarnings(streamer, envWarnings)
+	runEnv, envPath, err := writeServiceEnvFile(dir, env)
+	if err != nil {
+		return fail(err)
 	}
 
 	// Release containers see the same managed files as the deploy target, so
@@ -142,12 +142,12 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 	args := []string{
 		"run", "--rm",
 		"--network=stacked",
-		"--env-file=" + envPath,
-		"--name", serviceID + "-release",
 	}
+	args = append(args, runEnv.Args(envPath)...)
+	args = append(args, "--name", serviceID+"-release")
 	args = append(args, fileMountDockerArgs(fileMounts)...)
 	args = append(args, imageName, "sh", "-lc", releaseCmd)
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", args...); err != nil {
+	if err := e.runCommandWithStreamerEnv(streamer, dir, runEnv.CommandEnv(), "docker", args...); err != nil {
 		return fail(fmt.Errorf("release command failed: %w", err))
 	}
 

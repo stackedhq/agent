@@ -31,12 +31,12 @@ func (e *Executor) Restart(op client.Operation) error {
 	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
 
 	log.Printf("Restarting service %s", serviceID)
-	if err := e.runCommand(op.ID, dir, "docker", "compose", "restart"); err != nil {
+	if err := e.runCommand(op.ID, dir, "docker", composeArgs(dir, "restart")...); err != nil {
 		log.Printf("compose restart failed for %s, falling back to up -d: %v", serviceID, err)
 		// Tear down any half-present containers (releases port bindings) but
 		// keep volumes so data survives.
-		_ = e.runCommand(op.ID, dir, "docker", "compose", "down")
-		if err := e.runCommand(op.ID, dir, "docker", "compose", "up", "-d"); err != nil {
+		_ = e.runCommand(op.ID, dir, "docker", composeArgs(dir, "down")...)
+		if err := e.runCommand(op.ID, dir, "docker", composeArgs(dir, "up", "-d")...); err != nil {
 			return fmt.Errorf("docker compose up: %w", err)
 		}
 	}

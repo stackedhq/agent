@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -9,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -32,6 +30,14 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 
 	// Create a single streamer for the entire deploy lifecycle
 	streamer := logs.NewStreamer(e.Client, op.ID)
+
+	// Reject payload values that would end up in argv, paths or the
+	// compose file before doing any work.
+	if err := validateDeployPayload(serviceID, op.Payload); err != nil {
+		streamer.AddLine("ERROR: " + err.Error())
+		streamer.Flush()
+		return nil, err
+	}
 
 	// Branch on deploy strategy. `recreate` (default, blank, or older
 	// agents that don't read the field) follows the historical
@@ -103,22 +109,11 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 
-	// Write .env file from server-managed env vars
-	if len(creds.EnvVars) > 0 {
-		envContent := buildEnvFile(creds.EnvVars)
-		envPath := filepath.Join(dir, ".env")
-		if err := writeFile(envPath, envContent); err != nil {
-			return nil, fail(fmt.Errorf("write .env: %w", err))
-		}
-	} else {
-		// Ensure .env exists (docker compose requires it with env_file directive)
-		envPath := filepath.Join(dir, ".env")
-		if _, err := os.Stat(envPath); os.IsNotExist(err) {
-			if err := writeFile(envPath, ""); err != nil {
-				return nil, fail(fmt.Errorf("write .env: %w", err))
-			}
-		}
-	}
+	// The container env is rendered into docker-compose.yml as an
+	// `environment:` map (see service_env.go); nothing is written to the
+	// compose project's `.env` any more.
+	env, envWarnings := serviceEnv(creds.EnvVars)
+	addEnvWarnings(streamer, envWarnings)
 
 	var imageName string
 
@@ -144,8 +139,8 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// Materialize managed file mounts only after the image is ready, but before
 	// Compose can start the container. Their plaintext never enters the payload
 	// or logs.
-	volumeMounts := parseVolumes(op.Payload)
-	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
+	volumeMounts, err := prepareVolumeHostDirs(serviceID, parseVolumes(op.Payload))
+	if err != nil {
 		return nil, fail(err)
 	}
 	fileMounts, err := e.prepareFileMounts(op, serviceID)
@@ -157,10 +152,13 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 		return nil, fail(err)
 	}
 	startCommand := dockerCommandOverride(op.Payload)
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand, env)
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
+	}
+	if err := cleanupLegacyEnvFile(dir); err != nil {
+		log.Printf("cleanup legacy .env for %s: %v", serviceID, err)
 	}
 
 	// Phase: Docker compose up (85%)
@@ -172,7 +170,7 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
 
 	log.Printf("Starting container for %s", serviceID)
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "up", "-d", "--remove-orphans")...); err != nil {
 		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
 
@@ -212,12 +210,18 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 // buildFromSource clones the repo and builds an image with Nixpacks.
 func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, creds *client.Credentials, streamer *logs.Streamer) (string, error) {
 	gitBranch := getStringPayload(op.Payload, "gitBranch")
-	commitSha := getStringPayload(op.Payload, "commitSha")
 	buildCommand := getStringPayload(op.Payload, "buildCommand")
 	startCommand := getStringPayload(op.Payload, "startCommand")
 
 	if gitBranch == "" {
 		gitBranch = "main"
+	}
+	if !validGitBranch(gitBranch) {
+		return "", fmt.Errorf("invalid git branch %q", truncateForError(gitBranch))
+	}
+	commitSha, err := normalizeCommitSha(getStringPayload(op.Payload, "commitSha"))
+	if err != nil {
+		return "", err
 	}
 
 	repoDir := filepath.Join(dir, "repo")
@@ -229,6 +233,15 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 			return "", fmt.Errorf("no git clone URL available")
 		}
 	}
+	src, err := parseGitSource(gitRepo)
+	if err != nil {
+		return "", err
+	}
+	git, err := newGitSession(src)
+	if err != nil {
+		return "", err
+	}
+	defer git.Close()
 
 	// Phase: Git clone/pull (2%)
 	streamer.SetProgress(2)
@@ -238,23 +251,27 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 	// Clone or pull
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(err) {
 		log.Printf("Cloning into %s", repoDir)
-		if err := e.runCommandWithStreamer(streamer, dir, "git", "clone", "--branch", gitBranch, "--single-branch", gitRepo, "repo"); err != nil {
+		if err := e.runCommandWithStreamerEnv(streamer, dir, git.env, "git", gitCloneArgs(gitBranch, src.URL, "repo")...); err != nil {
 			return "", fmt.Errorf("git clone: %w", err)
 		}
 	} else {
 		log.Printf("Pulling latest for %s", serviceID)
-		_, _ = runCommandSilent(repoDir, "git", "remote", "set-url", "origin", gitRepo)
-		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "fetch", "origin"); err != nil {
+		// Always (re)point origin at the tokenless URL. This also scrubs
+		// the token that older agents embedded in .git/config.
+		if out, err := runCommandSilentEnv(repoDir, git.env, "git", gitSetRemoteArgs(src.URL)...); err != nil {
+			return "", fmt.Errorf("git remote set-url: %s: %w", strings.TrimSpace(out), err)
+		}
+		if err := e.runCommandWithStreamerEnv(streamer, repoDir, git.env, "git", gitFetchBranchArgs(gitBranch)...); err != nil {
 			return "", fmt.Errorf("git fetch: %w", err)
 		}
-		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "reset", "--hard", "origin/"+gitBranch); err != nil {
+		if err := e.runCommandWithStreamerEnv(streamer, repoDir, git.env, "git", gitResetArgs(gitBranch)...); err != nil {
 			return "", fmt.Errorf("git reset: %w", err)
 		}
 	}
 
 	// Checkout specific commit if requested
 	if commitSha != "" {
-		if err := e.runCommandWithStreamer(streamer, repoDir, "git", "checkout", commitSha); err != nil {
+		if err := e.runCommandWithStreamerEnv(streamer, repoDir, git.env, "git", gitCheckoutArgs(commitSha, gitSupportsEndOfOptions())...); err != nil {
 			return "", fmt.Errorf("git checkout %s: %w", commitSha, err)
 		}
 	}
@@ -267,52 +284,92 @@ func (e *Executor) buildFromSource(op client.Operation, serviceID, dir string, c
 	imageName := "stacked-" + serviceID
 	log.Printf("Building image with Nixpacks for %s", serviceID)
 
-	nixpacksArgs := []string{"build", repoDir, "--name", imageName}
-	if buildCommand != "" {
-		nixpacksArgs = append(nixpacksArgs, "--build-cmd", buildCommand)
-	}
-	if startCommand != "" {
-		nixpacksArgs = append(nixpacksArgs, "--start-cmd", startCommand)
-	}
-	for k, v := range creds.EnvVars {
-		nixpacksArgs = append(nixpacksArgs, "--env", k+"="+v)
-	}
-
-	if err := e.runCommandWithStreamer(streamer, dir, "nixpacks", nixpacksArgs...); err != nil {
+	nixpacksArgs, nixpacksEnv := nixpacksBuildArgs(repoDir, imageName, buildCommand, startCommand, creds.EnvVars)
+	if err := e.runCommandWithStreamerEnv(streamer, dir, nixpacksEnv, "nixpacks", nixpacksArgs...); err != nil {
 		return "", fmt.Errorf("nixpacks build: %w", err)
 	}
 
 	return imageName, nil
 }
 
-// buildEnvFile creates a .env file content from a key-value map, consumed
-// by docker compose's per-service `env_file:` directive. Keys are sorted
-// for deterministic output.
+// nixpacksBuildArgs builds the `nixpacks build` argv and process env.
+// Build env values are not put in argv: each var is passed as `--env=KEY`,
+// which makes nixpacks read the value from its own environment. Names that
+// would change how nixpacks, git or the docker CLI behave (PATH, HOME,
+// DOCKER_*, NIXPACKS_*, ...) can't go through the process env, so those
+// keep the `--env=KEY=VALUE` form; they are configuration, not secrets.
+// Returns a nil env (inherit) when nothing needs to be passed.
 //
-// Values are written verbatim — do NOT wrap them in quotes. Unlike a
-// `.env` file used for Compose variable *substitution* (a project-root
-// `.env` next to the compose file), values loaded via a service's
-// `env_file:` list are never quote-stripped by Docker Compose: quote
-// characters are passed straight through as literal content of the
-// container's environment variable. An earlier version of this function
-// quoted values containing spaces/special characters to make the file
-// look like valid shell-quoted `.env` syntax, which instead baked literal
-// `"…"` characters into values like `SMTP_FROM=Riffado <noreply@...>`.
-func buildEnvFile(vars map[string]string) string {
-	keys := make([]string, 0, len(vars))
-	for k := range vars {
-		keys = append(keys, k)
+// Note: nixpacks itself forwards build variables to `docker build` as
+// `--build-arg KEY=VALUE`, so values are still briefly in that child's
+// argv while the image builds.
+func nixpacksBuildArgs(repoDir, imageName, buildCommand, startCommand string, vars map[string]string) ([]string, []string) {
+	args := []string{"build", repoDir, "--name", imageName}
+	if buildCommand != "" {
+		args = append(args, "--build-cmd="+buildCommand)
 	}
-	sort.Strings(keys)
+	if startCommand != "" {
+		args = append(args, "--start-cmd="+startCommand)
+	}
+	var extra []string
+	for _, k := range sortedKeys(vars) {
+		if !validEnvKey(k) || strings.ContainsRune(vars[k], 0) {
+			continue
+		}
+		if nixpacksArgvEnvKey(k) {
+			args = append(args, "--env="+k+"="+vars[k])
+			continue
+		}
+		args = append(args, "--env="+k)
+		extra = append(extra, k+"="+vars[k])
+	}
+	if len(extra) == 0 {
+		return args, nil
+	}
+	return args, mergeEnv(os.Environ(), extra)
+}
 
-	var b strings.Builder
-	for _, k := range keys {
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(vars[k])
-		b.WriteByte('\n')
+func nixpacksArgvEnvKey(k string) bool {
+	if dockerCLIEnvKey(k) {
+		return true
 	}
-	return b.String()
+	u := strings.ToUpper(k)
+	for _, p := range []string{"NIXPACKS_", "GIT_", "RUST_", "CARGO_"} {
+		if strings.HasPrefix(u, p) {
+			return true
+		}
+	}
+	switch u {
+	case "SHELL", "USER", "LOGNAME", "PWD", "IFS", "ENV", "BASH_ENV", "TZ", "LANG", "LC_ALL":
+		return true
+	}
+	return false
+}
+
+// validateDeployPayload checks every deploy/release payload field that
+// reaches argv, a path, or the compose file. Pure (no filesystem access).
+func validateDeployPayload(serviceID string, payload map[string]interface{}) error {
+	if !isUUID(serviceID) {
+		return fmt.Errorf("invalid serviceId")
+	}
+	if img := getStringPayload(payload, "dockerImage"); img != "" {
+		if err := validateImageReference(img); err != nil {
+			return err
+		}
+	}
+	if err := validateRestartPolicy(resourceLimitsFromPayload(payload).restartPolicy); err != nil {
+		return err
+	}
+	if b := getStringPayload(payload, "gitBranch"); b != "" && !validGitBranch(b) {
+		return fmt.Errorf("invalid git branch %q", truncateForError(b))
+	}
+	if _, err := normalizeCommitSha(getStringPayload(payload, "commitSha")); err != nil {
+		return err
+	}
+	if _, err := validateVolumes(serviceID, parseVolumes(payload)); err != nil {
+		return err
+	}
+	return nil
 }
 
 // resourceLimits captures the per-container CPU/memory caps and restart
@@ -351,7 +408,7 @@ func (l resourceLimits) cpus() string {
 	return s
 }
 
-func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, aliases []string, startCommand string) string {
+func generateCompose(serviceID, imageName string, mounts []volumeMount, limits resourceLimits, aliases []string, startCommand string, env map[string]string) string {
 	// `com.stacked.kind: service` lets the runtimelogs and databaselogs
 	// managers correctly partition `docker ps` output. The runtimelogs
 	// manager treats label-less containers as services for back-compat
@@ -366,52 +423,63 @@ func generateCompose(serviceID, imageName string, mounts []volumeMount, limits r
 	// `docker inspect: exit status 1`. Databases (database.go) already do
 	// this; services were missing it.
 	//
-	// The `volumes:` block is spliced in only when there are mounts —
-	// omitting the key entirely is intentional (some compose versions
-	// read an empty `volumes:` as "remove previously configured
-	// volumes", which would conflict with the historical no-volumes
-	// template). Callers (deploy.go, deploy_rolling.go) are responsible
-	// for `ensureVolumeHostDirs` before invoking `docker compose up` so
-	// the bind sources exist with predictable mode/ownership.
-	volumesBlock := renderComposeVolumes(mounts)
-	commandBlock := renderComposeCommand(startCommand)
+	// Every scalar is rendered through compose_yaml.go: JSON-quoted with
+	// `$` escaped, so no payload value can add YAML structure or trigger
+	// Compose interpolation.
+	//
+	// The `volumes:` key is emitted only when there are mounts — omitting
+	// the key entirely is intentional (some compose versions read an empty
+	// `volumes:` as "remove previously configured volumes"). Callers
+	// (deploy.go, deploy_rolling.go) are responsible for
+	// `prepareVolumeHostDirs` before invoking `docker compose up` so the
+	// bind sources exist with predictable mode/ownership.
+	//
 	// Resource block: restart policy is always emitted; mem_limit / cpus
 	// only when the service has a configured cap (otherwise the container
 	// runs unlimited, matching the historical behaviour). `mem_limit` and
 	// `cpus` are both honoured by `docker compose up` in non-swarm mode.
-	var resourceBlock strings.Builder
-	resourceBlock.WriteString("    restart: " + limits.restartPolicy + "\n")
+	svc := yMap{
+		{Key: "container_name", Value: yStr(serviceID)},
+		{Key: "image", Value: yStr(imageName)},
+		{Key: "restart", Value: yStr(limits.restartPolicy)},
+	}
 	if limits.memoryMB > 0 {
-		fmt.Fprintf(&resourceBlock, "    mem_limit: %dm\n", limits.memoryMB)
+		svc = append(svc, yKV{Key: "mem_limit", Value: yStr(fmt.Sprintf("%dm", limits.memoryMB))})
 	}
 	if c := limits.cpus(); c != "" {
-		resourceBlock.WriteString("    cpus: " + c + "\n")
+		svc = append(svc, yKV{Key: "cpus", Value: yRaw(c)})
 	}
-	return fmt.Sprintf(`services:
-  %s:
-    container_name: %s
-    image: %s
-%s%s    env_file:
-      - .env
-%s%s    labels:
-      com.stacked.kind: service
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, serviceID, serviceID, imageName, resourceBlock.String(), commandBlock, volumesBlock, renderServiceNetworks(aliases))
+	if cmd := composeCommand(startCommand); cmd != nil {
+		svc = append(svc, yKV{Key: "command", Value: cmd})
+	}
+	if len(env) > 0 {
+		svc = append(svc, yKV{Key: "environment", Value: composeEnvironment(env)})
+	}
+	if len(mounts) > 0 {
+		svc = append(svc, yKV{Key: "volumes", Value: composeVolumeSpecs(mounts)})
+	}
+	svc = append(svc,
+		yKV{Key: "networks", Value: serviceNetworks(aliases)},
+		yKV{Key: "labels", Value: yMap{{Key: "com.stacked.kind", Value: yStr("service")}}},
+	)
+	return renderYAML(yMap{
+		{Key: "services", Value: yMap{{Key: serviceID, Value: svc}}},
+		{Key: "networks", Value: stackedNetworkDecl()},
+	})
 }
 
-// renderServiceNetworks emits the service-level `networks:` block. With no
-// friendly aliases it's the historical list form (`- stacked`). With aliases
-// it switches to the map form so we can attach extra `--network-alias` values
-// (the human-readable internal hostnames). Docker still registers the compose
-// service key (`<serviceID>`) as an alias in both forms, so the UUID floor is
-// preserved regardless.
-// renderComposeCommand uses JSON-array syntax, which is also valid YAML. It
-// prevents YAML injection and matches the rolling `docker run` path: execute
-// the override through a shell while preserving the image ENTRYPOINT.
+// stackedNetworkDecl is the shared external `stacked` network.
+func stackedNetworkDecl() yMap {
+	return yMap{{Key: "stacked", Value: yMap{
+		{Key: "name", Value: yStr("stacked")},
+		{Key: "external", Value: yRaw("true")},
+	}}}
+}
+
+// dockerCommandOverride returns the start command for docker-image
+// services. The compose path renders it as an exec-form `command:` and the
+// rolling `docker run` path appends it after the image; both execute it
+// through a shell while preserving the image ENTRYPOINT.
 func dockerCommandOverride(payload map[string]interface{}) string {
 	if getStringPayload(payload, "dockerImage") == "" {
 		return ""
@@ -419,31 +487,34 @@ func dockerCommandOverride(payload map[string]interface{}) string {
 	return strings.TrimSpace(getStringPayload(payload, "startCommand"))
 }
 
-func renderComposeCommand(command string) string {
+// composeCommand returns the exec-form `command:` list, or nil when unset.
+func composeCommand(command string) yNode {
 	command = strings.TrimSpace(command)
 	if command == "" {
-		return ""
+		return nil
 	}
-	encoded, _ := json.Marshal([]string{"sh", "-lc", command})
-	return "    command: " + string(encoded) + "\n"
+	return yStrList("sh", "-lc", command)
 }
 
-func renderServiceNetworks(aliases []string) string {
-	if len(aliases) == 0 {
-		return "    networks:\n      - stacked\n"
-	}
-	var b strings.Builder
-	b.WriteString("    networks:\n      stacked:\n        aliases:\n")
+// serviceNetworks renders the service-level `networks:` value. With no
+// friendly aliases it's the historical list form (`- stacked`). With aliases
+// it switches to the map form so we can attach extra `--network-alias` values
+// (the human-readable internal hostnames). Docker still registers the compose
+// service key (`<serviceID>`) as an alias in both forms, so the UUID floor is
+// preserved regardless.
+func serviceNetworks(aliases []string) yNode {
+	var valid []string
 	for _, a := range aliases {
 		// Defense-in-depth: the server allocates these from a strict slug,
-		// but skip anything that isn't a plausible DNS label so a bad value
-		// can't corrupt the compose file.
-		if !validNetworkAlias(a) {
-			continue
+		// but skip anything that isn't a plausible DNS label.
+		if validNetworkAlias(a) {
+			valid = append(valid, a)
 		}
-		fmt.Fprintf(&b, "          - %s\n", a)
 	}
-	return b.String()
+	if len(valid) == 0 {
+		return yStrList("stacked")
+	}
+	return yMap{{Key: "stacked", Value: yMap{{Key: "aliases", Value: yStrList(valid...)}}}}
 }
 
 // validNetworkAlias mirrors the server's slug constraints: a lowercase DNS
