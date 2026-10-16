@@ -93,6 +93,9 @@ If a release changes an embedded template and you want it to land on existing in
 - **Progress reporting**: `streamer.SetProgress(N)` + `streamer.AddLine("==> Phase...")` at deploy phase boundaries
 - **Self-update**: Fetches `SHA256SUMS` + `SHA256SUMS.sig` for `v<targetVersion>` from the fixed GitHub release URL, verifies the ed25519 signature against the keys in `internal/executor/release_keys.go`, streams the binary to a temp file next to the agent while hashing it, then renames over → `os.Exit(0)` → systemd restarts. Refuses same-version and downgrades. There is no server-supplied download URL.
 - **All operations are sequential**: Poller claims pending ops and executes them one at a time
+- **Per-op deadlines**: `poller.opTimeout` picks a deadline by op type (deploy 45m, backup/restore/migrate 2h, most others 10m). On expiry the op is reported `failed` (`code: OP_TIMEOUT`) and every command started through `opCommand` (which `runCommand*` / `runCommandSilent*` use) is killed with its whole process group. Start new long-running commands through those helpers, not bare `exec.Command`, or they won't be stopped. Killing `docker exec` does not stop the process inside the container; one-shot job containers go through `runJobContainer`, which `docker kill`s them.
+- **Job containers** (`cron_run`, `release_command`): stamped `com.stacked.kind=job` with inherited compose/slot labels cleared, capped at the service's CPU/memory or 1 CPU / 512 MB, timed out (cron: payload `timeoutSeconds` or 1h; release: 30m). See `internal/executor/jobs.go`.
+- **No secrets in argv**: process args are world-readable on the host, including those of processes inside containers. DB passwords go to `docker exec` as `-e NAME` with the value in the CLI's env (`newDockerExec`), over stdin, or (mongo tools) in a 0600 `--config` file written inside the container (`writeMongoToolConfig`).
 
 ## State Files
 

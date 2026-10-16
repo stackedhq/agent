@@ -260,12 +260,22 @@ func splitTimestamp(raw string) (ts, rest string) {
 // cursorPath returns the on-disk file used to persist the last-seen
 // timestamp for this service.
 func (f *Forwarder) cursorPath() string {
+	// The ID comes from a container label. Managers already skip non-UUID
+	// labels; this keeps a crafted label (e.g. "../../x") from ever
+	// reaching filepath.Join.
+	if !isUUID(f.serviceID) {
+		return ""
+	}
 	return filepath.Join(logsRootDir, f.serviceID, ".cursor")
 }
 
 // readCursor returns the persisted resume timestamp or empty string if none.
 func (f *Forwarder) readCursor() string {
-	data, err := os.ReadFile(f.cursorPath())
+	path := f.cursorPath()
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
@@ -283,16 +293,17 @@ func (f *Forwarder) writeCursor() {
 	f.mu.Lock()
 	ts := f.lastTimestamp
 	f.mu.Unlock()
-	if ts == "" {
+	path := f.cursorPath()
+	if ts == "" || path == "" {
 		return
 	}
 
-	dir := filepath.Dir(f.cursorPath())
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Printf("runtimelogs[%s]: cursor mkdir: %v", f.serviceID, err)
 		return
 	}
-	if err := os.WriteFile(f.cursorPath(), []byte(ts), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(ts), 0o644); err != nil {
 		log.Printf("runtimelogs[%s]: cursor write: %v", f.serviceID, err)
 	}
 }

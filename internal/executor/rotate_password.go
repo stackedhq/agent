@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
@@ -13,10 +15,10 @@ import (
 // credentials from env vars.
 //
 // Flow per engine:
-//   - postgres: ALTER USER ... WITH PASSWORD '...' via docker exec psql
-//   - mysql:    ALTER USER for both the app user and root
-//   - mongo:    db.changeUserPassword() via docker exec mongosh
-//   - redis:    CONFIG SET requirepass via docker exec redis-cli
+//   - postgres: ALTER USER ... WITH PASSWORD '...' via docker exec psql (stdin)
+//   - mysql:    ALTER USER for both the app user and root (stdin, MYSQL_PWD)
+//   - mongo:    db.changeUserPassword() via docker exec mongosh (process.env)
+//   - redis:    CONFIG SET requirepass via redis-cli -x (stdin, REDISCLI_AUTH)
 //
 // After the engine-level change succeeds, we rewrite the compose file
 // (identical to what db_provision/db_set_access produce) and `compose up -d`
@@ -82,7 +84,7 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 	// losing data — the named volume survives).
 	streamer.AddLine("Reconciling container with new credentials")
 	streamer.Flush()
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "up", "-d", "--remove-orphans")...); err != nil {
 		return fail(fmt.Errorf("compose up: %w", err))
 	}
 
@@ -92,25 +94,68 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 }
 
 func alterPassword(containerName, dbType string, oldCreds, newCreds map[string]string, streamer *logs.Streamer, e *Executor) error {
+	step, err := buildAlterPassword(containerName, dbType, oldCreds, newCreds)
+	if err != nil {
+		return err
+	}
+	streamer.AddLine(step.message)
+	streamer.Flush()
+	cmd := step.exec.Command()
+	if step.stdin != "" {
+		cmd.Stdin = strings.NewReader(step.stdin)
+	}
+	out, err := cmd.CombinedOutput()
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed != "" {
+		for _, line := range strings.Split(trimmed, "\n") {
+			streamer.AddLine(line)
+		}
+		streamer.Flush()
+	}
+	if err != nil {
+		return fmt.Errorf("docker exec %s: %w", dbType, err)
+	}
+	if step.expectOutput != "" && trimmed != step.expectOutput {
+		// redis-cli exits 0 even when AUTH or the command fails.
+		return fmt.Errorf("%s did not confirm the change (expected %q)", dbType, step.expectOutput)
+	}
+	return nil
+}
+
+// alterPasswordStep is one engine-level password change. Neither the old
+// nor the new password appears in argv: the old one authenticates through
+// the docker CLI's env (`-e NAME`), the new one goes over stdin (SQL,
+// redis-cli -x) or env (mongosh reads process.env).
+type alterPasswordStep struct {
+	message string
+	exec    dockerExec
+	stdin   string
+	// expectOutput, when set, must equal the command's trimmed output.
+	expectOutput string
+}
+
+func buildAlterPassword(containerName, dbType string, oldCreds, newCreds map[string]string) (alterPasswordStep, error) {
 	switch dbType {
 	case "postgres":
 		user := oldCreds["user"]
 		newPw := newCreds["password"]
 		dbName := oldCreds["dbName"]
 		if user == "" || newPw == "" || dbName == "" {
-			return fmt.Errorf("postgres credentials incomplete")
+			return alterPasswordStep{}, fmt.Errorf("postgres credentials incomplete")
 		}
 		// ALTER USER via psql inside the container. Local-socket peer
-		// auth means we don't need the old password to connect.
-		sql := fmt.Sprintf(`ALTER USER %s WITH PASSWORD '%s';`, user, escapeSQLString(newPw))
-		streamer.AddLine("Altering postgres user password")
-		streamer.Flush()
-		return e.runCommandWithStreamer(streamer, "", "docker", "exec",
-			containerName,
-			"psql", "-U", user, "-d", dbName,
-			"-v", "ON_ERROR_STOP=1",
-			"-c", sql,
-		)
+		// auth means we don't need the old password to connect. The
+		// statement (which carries the new password) is read from stdin.
+		// standard_conforming_strings is pinned so backslashes in the
+		// password stay literal.
+		sql := fmt.Sprintf("SET standard_conforming_strings = on;\nALTER USER \"%s\" WITH PASSWORD '%s';\n",
+			sqlIdentEscape(user), strings.ReplaceAll(newPw, "'", "''"))
+		return alterPasswordStep{
+			message: "Altering postgres user password",
+			exec: newDockerExec(true, containerName, nil,
+				"psql", "--no-psqlrc", "-q", "-U", user, "-d", dbName, "-v", "ON_ERROR_STOP=1"),
+			stdin: sql,
+		}, nil
 
 	case "mysql":
 		user := oldCreds["user"]
@@ -118,62 +163,63 @@ func alterPassword(containerName, dbType string, oldCreds, newCreds map[string]s
 		newPw := newCreds["password"]
 		newRootPw := newCreds["rootPassword"]
 		if user == "" || oldRootPw == "" || newPw == "" || newRootPw == "" {
-			return fmt.Errorf("mysql credentials incomplete")
+			return alterPasswordStep{}, fmt.Errorf("mysql credentials incomplete")
 		}
-		// Connect as root with old password, change both passwords.
+		// Connect as root with the old password (MYSQL_PWD), change both
+		// passwords with SQL on stdin.
+		// root exists as both 'root'@'%' and 'root'@'localhost' in the
+		// official images; the agent's own `docker exec mysql -u root`
+		// (backups, restores) connects over the socket as the latter, so
+		// both must change.
 		sql := fmt.Sprintf(
-			`ALTER USER '%s'@'%%' IDENTIFIED BY '%s'; ALTER USER 'root'@'%%' IDENTIFIED BY '%s'; FLUSH PRIVILEGES;`,
-			escapeSQLString(user), escapeSQLString(newPw), escapeSQLString(newRootPw),
+			"ALTER USER '%s'@'%%' IDENTIFIED BY '%s'; ALTER USER 'root'@'%%' IDENTIFIED BY '%s'; ALTER USER IF EXISTS 'root'@'localhost' IDENTIFIED BY '%s'; FLUSH PRIVILEGES;\n",
+			escapeSQLString(user), escapeSQLString(newPw), escapeSQLString(newRootPw), escapeSQLString(newRootPw),
 		)
-		streamer.AddLine("Altering mysql user and root passwords")
-		streamer.Flush()
-		return e.runCommandWithStreamer(streamer, "", "docker", "exec",
-			containerName,
-			"mysql", "-u", "root", "-p"+oldRootPw,
-			"-e", sql,
-		)
+		return alterPasswordStep{
+			message: "Altering mysql user and root passwords",
+			exec: newDockerExec(true, containerName, map[string]string{"MYSQL_PWD": oldRootPw},
+				"mysql", "-u", "root"),
+			stdin: sql,
+		}, nil
 
 	case "mongo":
 		user := oldCreds["user"]
 		oldPw := oldCreds["password"]
 		newPw := newCreds["password"]
 		if user == "" || oldPw == "" || newPw == "" {
-			return fmt.Errorf("mongo credentials incomplete")
+			return alterPasswordStep{}, fmt.Errorf("mongo credentials incomplete")
 		}
-		// mongosh with old credentials, then changeUserPassword.
-		js := fmt.Sprintf(`db.changeUserPassword("%s", "%s")`, escapeJSString(user), escapeJSString(newPw))
-		streamer.AddLine("Altering mongo user password")
-		streamer.Flush()
-		return e.runCommandWithStreamer(streamer, "", "docker", "exec",
-			containerName,
-			"mongosh",
-			"-u", user, "-p", oldPw,
-			"--authenticationDatabase", "admin",
-			"admin",
-			"--eval", js,
-		)
+		// mongosh has no password env var: connect unauthenticated, then
+		// auth and change the password with values read from the exec'd
+		// process env. The script itself holds no secret.
+		userJSON, _ := json.Marshal(user)
+		js := fmt.Sprintf(`const u = %s; const admin = db.getSiblingDB("admin"); admin.auth(u, process.env.STACKED_MONGO_OLD_PASSWORD); admin.changeUserPassword(u, process.env.STACKED_MONGO_NEW_PASSWORD);`, userJSON)
+		return alterPasswordStep{
+			message: "Altering mongo user password",
+			exec: newDockerExec(false, containerName, map[string]string{
+				"STACKED_MONGO_OLD_PASSWORD": oldPw,
+				"STACKED_MONGO_NEW_PASSWORD": newPw,
+			}, "mongosh", "--quiet", "--norc", "admin", "--eval", js),
+		}, nil
 
 	case "redis":
 		oldPw := oldCreds["password"]
 		newPw := newCreds["password"]
 		if oldPw == "" || newPw == "" {
-			return fmt.Errorf("redis credentials incomplete")
+			return alterPasswordStep{}, fmt.Errorf("redis credentials incomplete")
 		}
-		streamer.AddLine("Setting new redis password")
-		streamer.Flush()
-		// AUTH with old password, then CONFIG SET requirepass.
-		// Two separate commands: AUTH first, then CONFIG SET.
-		if err := e.runCommandWithStreamer(streamer, "", "docker", "exec",
-			containerName,
-			"redis-cli", "-a", oldPw,
-			"CONFIG", "SET", "requirepass", newPw,
-		); err != nil {
-			return err
-		}
-		return nil
+		// REDISCLI_AUTH authenticates with the old password; `-x` reads
+		// the last argument (the new password) from stdin.
+		return alterPasswordStep{
+			message: "Setting new redis password",
+			exec: newDockerExec(true, containerName, map[string]string{"REDISCLI_AUTH": oldPw},
+				"redis-cli", "-x", "CONFIG", "SET", "requirepass"),
+			stdin:        newPw,
+			expectOutput: "OK",
+		}, nil
 
 	default:
-		return fmt.Errorf("unsupported database type for password rotation: %s", dbType)
+		return alterPasswordStep{}, fmt.Errorf("unsupported database type for password rotation: %s", dbType)
 	}
 }
 

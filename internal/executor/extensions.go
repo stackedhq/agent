@@ -30,10 +30,10 @@ func validExtensionName(s string) bool {
 // We connect via `docker exec ... psql` rather than over the published
 // port for two reasons:
 //
-//   1. The official `postgres` image trusts local-socket peer auth, so
-//      we don't need the password in the payload.
-//   2. It works regardless of the host's network config, including hosts
-//      where the database port isn't bound to localhost.
+//  1. The official `postgres` image trusts local-socket peer auth, so
+//     we don't need the password in the payload.
+//  2. It works regardless of the host's network config, including hosts
+//     where the database port isn't bound to localhost.
 //
 // Defense-in-depth on the extension name: the server already validates
 // against a closed allowlist, but we re-validate here with a strict

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
@@ -33,8 +35,28 @@ func New(c *client.Client) *Executor {
 	return &Executor{Client: c}
 }
 
-// Execute dispatches an operation to the correct handler based on type.
+// Execute dispatches an operation with no deadline. The poller uses
+// ExecuteWithTimeout; this stays for callers that don't need one.
 func (e *Executor) Execute(op client.Operation) {
+	e.ExecuteWithTimeout(op, 0)
+}
+
+// opUnwindLogInterval is how often a still-running handler is logged after
+// its operation timed out.
+const opUnwindLogInterval = 5 * time.Minute
+
+type opOutcome struct {
+	result map[string]interface{}
+	err    error
+}
+
+// ExecuteWithTimeout dispatches an operation to the correct handler based
+// on type. With timeout > 0 the op runs under a deadline: every command
+// started through opCommand (runCommand*, runCommandSilent*, the backup /
+// migrate / query / job helpers) is killed when it expires, and the op is
+// reported failed at that moment. The call still waits for the handler to
+// unwind before returning, so operations stay strictly sequential.
+func (e *Executor) ExecuteWithTimeout(op client.Operation, timeout time.Duration) {
 	NoteMachineID(op.MachineID)
 
 	// Report running
@@ -42,6 +64,68 @@ func (e *Executor) Execute(op client.Operation) {
 		log.Printf("Failed to report running status for %s: %v", op.ID, err)
 	}
 
+	ctx, cancel := context.Background(), context.CancelFunc(func() {})
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	restore := setOpContext(ctx)
+	defer restore()
+
+	done := make(chan opOutcome, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Operation %s (%s) panicked: %v", op.ID, op.Type, r)
+				done <- opOutcome{err: fmt.Errorf("agent error while running %s: %v", op.Type, r)}
+			}
+		}()
+		result, err := e.dispatch(op)
+		done <- opOutcome{result: result, err: err}
+	}()
+
+	var out opOutcome
+	select {
+	case out = <-done:
+	case <-ctx.Done():
+		select {
+		case out = <-done:
+			// Finished right at the deadline: report the real outcome.
+			e.reportOutcome(op, out.result, out.err)
+			return
+		default:
+		}
+		// Report the timeout now so the dashboard isn't left waiting on a
+		// handler that is being killed. A late handler result is dropped
+		// (the server ignores updates to terminal operations anyway).
+		timeoutErr := fmt.Errorf("operation timed out after %s", timeout)
+		log.Printf("Operation %s (%s) failed: %v", op.ID, op.Type, timeoutErr)
+		_ = e.Client.UpdateStatus(op.ID, &client.StatusUpdate{
+			Status: "failed",
+			Result: map[string]interface{}{"error": timeoutErr.Error(), "code": "OP_TIMEOUT"},
+		})
+		waitForHandler(op, done)
+		return
+	}
+	e.reportOutcome(op, out.result, out.err)
+}
+
+// waitForHandler blocks until a timed-out handler returns. Its commands
+// were bound to the expired context, so this is normally immediate.
+func waitForHandler(op client.Operation, done <-chan opOutcome) {
+	ticker := time.NewTicker(opUnwindLogInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			log.Printf("Operation %s (%s): handler still running after its timeout; waiting before the next operation", op.ID, op.Type)
+		}
+	}
+}
+
+func (e *Executor) dispatch(op client.Operation) (map[string]interface{}, error) {
 	var err error
 	var result map[string]interface{}
 	// Reject path-bearing identifiers before any handler can join them
@@ -118,6 +202,10 @@ func (e *Executor) Execute(op client.Operation) {
 		err = fmt.Errorf("unknown operation type: %s", op.Type)
 	}
 
+	return result, err
+}
+
+func (e *Executor) reportOutcome(op client.Operation, result map[string]interface{}, err error) {
 	// Open-ended ops (today: tailscale_setup) take responsibility for
 	// their own terminal status updates — the handler has already
 	// reported `running` with an interim result, and the final
@@ -175,10 +263,15 @@ func (e *Executor) runCommandWithStreamer(streamer *logs.Streamer, dir, name str
 // process env (nil inherits the agent's env). Used to hand secrets to child
 // processes without putting them in argv.
 func (e *Executor) runCommandWithStreamerEnv(streamer *logs.Streamer, dir string, env []string, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+	cmd := opCommand(name, args...)
 	cmd.Dir = dir
 	cmd.Env = env
+	return runStreamedCmd(streamer, cmd, name)
+}
 
+// runStreamedCmd starts a prepared command with stdout+stderr merged into
+// the streamer and waits for it.
+func runStreamedCmd(streamer *logs.Streamer, cmd *exec.Cmd, name string) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -204,7 +297,7 @@ func runCommandSilent(dir, name string, args ...string) (string, error) {
 }
 
 func runCommandSilentEnv(dir string, env []string, name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	cmd := opCommand(name, args...)
 	cmd.Dir = dir
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()

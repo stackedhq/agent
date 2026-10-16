@@ -8,6 +8,42 @@ import (
 	"github.com/stackedapp/stacked/agent/internal/executor"
 )
 
+// Per-operation deadlines. When one expires the op is reported failed and
+// its commands are killed; ops still run one at a time.
+const (
+	// deployOpTimeout covers clone + build + rollout.
+	deployOpTimeout = 45 * time.Minute
+	// dbDataOpTimeout covers ops that move a whole database or volume.
+	dbDataOpTimeout = 2 * time.Hour
+	// imagePullOpTimeout covers ops that may pull a large image first.
+	imagePullOpTimeout = 30 * time.Minute
+	// defaultOpTimeout is everything else (config, start/stop, probes).
+	defaultOpTimeout = 10 * time.Minute
+	// jobSetupSlack is added to a job's own run timeout for the image
+	// check and credential fetch around it.
+	jobSetupSlack = 10 * time.Minute
+)
+
+// opTimeout returns the deadline for one operation.
+func opTimeout(op client.Operation) time.Duration {
+	switch op.Type {
+	case "deploy":
+		return deployOpTimeout
+	case "release_command":
+		// The release op builds the image (like a deploy) and then runs
+		// the command under its own timeout.
+		return deployOpTimeout + executor.ReleaseCommandTimeout
+	case "cron_run":
+		return executor.CronJobTimeout(op.Payload) + jobSetupSlack
+	case "db_backup", "db_restore", "db_migrate", "volume_migrate":
+		return dbDataOpTimeout
+	case "db_provision", "setup":
+		return imagePullOpTimeout
+	default:
+		return defaultOpTimeout
+	}
+}
+
 // Loop polls for operations at the given interval until the stop channel is closed.
 func Loop(c *client.Client, exec *executor.Executor, interval time.Duration, stop <-chan struct{}) {
 	// Poll once immediately on startup
@@ -44,8 +80,9 @@ func poll(c *client.Client, exec *executor.Executor) {
 
 	// Execute sequentially
 	for _, op := range ops {
-		log.Printf("Executing operation %s (type=%s)", op.ID, op.Type)
-		exec.Execute(op)
+		timeout := opTimeout(op)
+		log.Printf("Executing operation %s (type=%s, timeout=%s)", op.ID, op.Type, timeout)
+		exec.ExecuteWithTimeout(op, timeout)
 	}
 }
 

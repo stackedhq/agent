@@ -8,13 +8,17 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
 )
+
+// backupTmpDir buffers dumps on disk. A var so tests can point it at a
+// temp dir.
+var backupTmpDir = filepath.Join(stackedDir, "backups-tmp")
 
 // Backup dumps a database container with the engine-appropriate tool
 // (`pg_dump -Fc` / `mysqldump` / `mongodump --archive`), gzips the dump to a
@@ -119,10 +123,24 @@ func (e *Executor) Restore(op client.Operation) error {
 		return fail(fmt.Errorf("%s not available in container %s: %w", restoreTool, container, err))
 	}
 
-	// Step 1: pre-restore safety dump. If this fails we abort BEFORE
+	// Step 1: fetch the backup to local disk and verify it BEFORE anything
+	// destructive. A missing object, expired URL, network failure, size or
+	// checksum mismatch, or a corrupt gzip stream aborts here with the
+	// database untouched. (Streaming straight into the restore tool after
+	// the reset would leave an empty database on any of those.)
+	streamer.SetProgress(10)
+	streamer.AddLine("Downloading and verifying backup…")
+	streamer.Flush()
+	dumpPath, err := downloadBackupToFile(e.Client, restoreBackupID)
+	if err != nil {
+		return fail(fmt.Errorf("backup download failed; restore aborted, live data untouched: %w", err))
+	}
+	defer os.Remove(dumpPath)
+
+	// Step 2: pre-restore safety dump. If this fails we abort BEFORE
 	// touching live data, so the database is left exactly as it was.
 	if safetyBackupID != "" {
-		streamer.SetProgress(15)
+		streamer.SetProgress(30)
 		streamer.AddLine("Taking pre-restore safety backup…")
 		streamer.Flush()
 		if err := dumpAndUpload(streamer, e.Client, engine, container, creds.Creds, safetyBackupID); err != nil {
@@ -130,8 +148,8 @@ func (e *Executor) Restore(op client.Operation) error {
 		}
 	}
 
-	// Step 2: reset the target (drop + recreate for SQL engines; mongo
-	// restores with --drop), then stream the dump back in.
+	// Step 3: reset the target (drop + recreate for SQL engines; mongo
+	// restores with --drop), then feed the verified dump back in.
 	streamer.SetProgress(50)
 	streamer.AddLine("Resetting target before restore…")
 	streamer.Flush()
@@ -140,9 +158,9 @@ func (e *Executor) Restore(op client.Operation) error {
 	}
 
 	streamer.SetProgress(65)
-	streamer.AddLine("Downloading and restoring…")
+	streamer.AddLine("Restoring…")
 	streamer.Flush()
-	if err := downloadAndRestore(streamer, e.Client, engine, container, creds.Creds, restoreBackupID); err != nil {
+	if err := restoreFromFile(streamer, engine, container, creds.Creds, dumpPath); err != nil {
 		return fail(err)
 	}
 
@@ -162,35 +180,70 @@ func dumpAndUpload(
 	creds map[string]string,
 	backupID string,
 ) error {
-	dumpArgs, err := buildBackupDumpArgs(engine, container, creds)
-	if err != nil {
-		return err
-	}
-
 	// Buffer to a disk-backed dir under /opt/stacked rather than the OS
 	// temp dir, which on many VPSes is tmpfs (RAM-backed) — a multi-GB
 	// dump there could OOM the host.
-	tmpDir := filepath.Join(stackedDir, "backups-tmp")
+	tmpDir := backupTmpDir
 	if err := ensureDir(tmpDir); err != nil {
 		return fmt.Errorf("ensure temp dir: %w", err)
 	}
-	tmp, err := os.CreateTemp(tmpDir, "stacked-backup-*.gz")
+	tmpPath, size, sum, err := dumpToFile(streamer, engine, container, creds, tmpDir)
 	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+		return err
+	}
+	defer os.Remove(tmpPath)
+
+	issued, err := c.RequestBackupUploadURL(backupID)
+	if err != nil {
+		return fmt.Errorf("request upload URL: %w", err)
+	}
+	if err := uploadFileToURL(issued.URL, issued.Method, issued.Headers, tmpPath, size); err != nil {
+		return fmt.Errorf("upload to R2: %w", err)
+	}
+	if err := c.ConfirmBackup(backupID, &client.BackupConfirm{
+		SizeBytes: size,
+		Sha256:    sum,
+	}); err != nil {
+		return fmt.Errorf("confirm backup: %w", err)
+	}
+	return nil
+}
+
+// dumpToFile runs the engine dump, gzips it into a new 0600 temp file in
+// dir, and returns its path, size and hex SHA-256. The caller removes the
+// file; on error it is already removed.
+func dumpToFile(streamer *logs.Streamer, engine, container string, creds map[string]string, dir string) (path string, size int64, sum string, err error) {
+	mongoConfig, cleanupConfig, err := prepareMongoConfig(engine, container, creds)
+	if err != nil {
+		return "", 0, "", err
+	}
+	defer cleanupConfig()
+	dump, err := buildBackupDumpArgs(engine, container, creds, mongoConfig)
+	if err != nil {
+		return "", 0, "", err
+	}
+
+	tmp, err := os.CreateTemp(dir, "stacked-backup-*.gz")
+	if err != nil {
+		return "", 0, "", fmt.Errorf("create temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
 	hasher := sha256.New()
 	gw := gzip.NewWriter(io.MultiWriter(tmp, hasher))
 
-	cmd := exec.Command("docker", dumpArgs...)
+	cmd := dump.Command()
 	cmd.Stdout = gw
 	stderr, _ := cmd.StderrPipe()
 
 	if err := cmd.Start(); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("start dump: %w", err)
+		return "", 0, "", fmt.Errorf("start dump: %w", err)
 	}
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -198,8 +251,9 @@ func dumpAndUpload(
 		defer wg.Done()
 		tailStderr(streamer, "[dump]", stderr)
 	}()
-	dumpErr := cmd.Wait()
+	// Drain stderr fully before Wait (Wait closes the pipe).
 	wg.Wait()
+	dumpErr := cmd.Wait()
 
 	if cerr := gw.Close(); cerr != nil && dumpErr == nil {
 		dumpErr = cerr
@@ -208,66 +262,138 @@ func dumpAndUpload(
 		dumpErr = cerr
 	}
 	if dumpErr != nil {
-		return fmt.Errorf("dump failed: %w", dumpErr)
+		return "", 0, "", fmt.Errorf("dump failed: %w", dumpErr)
 	}
 
 	info, err := os.Stat(tmpPath)
 	if err != nil {
-		return fmt.Errorf("stat dump: %w", err)
+		return "", 0, "", fmt.Errorf("stat dump: %w", err)
 	}
-	sum := hex.EncodeToString(hasher.Sum(nil))
-
-	issued, err := c.RequestBackupUploadURL(backupID)
-	if err != nil {
-		return fmt.Errorf("request upload URL: %w", err)
-	}
-	if err := uploadFileToURL(issued.URL, issued.Method, issued.Headers, tmpPath, info.Size()); err != nil {
-		return fmt.Errorf("upload to R2: %w", err)
-	}
-	if err := c.ConfirmBackup(backupID, &client.BackupConfirm{
-		SizeBytes: info.Size(),
-		Sha256:    sum,
-	}); err != nil {
-		return fmt.Errorf("confirm backup: %w", err)
-	}
-	return nil
+	return tmpPath, info.Size(), hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-// downloadAndRestore streams a presigned GET of the gzipped dump and pipes
-// the decompressed bytes into the engine's restore tool inside the container.
-func downloadAndRestore(
-	streamer *logs.Streamer,
-	c *client.Client,
-	engine, container string,
-	creds map[string]string,
-	backupID string,
-) error {
-	restoreArgs, err := buildBackupRestoreArgs(engine, container, creds)
+// downloadBackupToFile fetches a stored backup into a private temp file
+// under /opt/stacked/backups-tmp and verifies it: HTTP status, the SHA-256
+// recorded when the backup was confirmed (when the server sends it), and
+// the gzip stream itself (decompressing it end to end checks its CRC and
+// length trailer, so truncated or corrupt objects are caught even without a
+// server checksum). Returns the path; the caller removes it.
+func downloadBackupToFile(c *client.Client, backupID string) (string, error) {
+	issued, err := c.RequestBackupDownloadURL(backupID)
+	if err != nil {
+		return "", fmt.Errorf("request download URL: %w", err)
+	}
+	tmpDir := backupTmpDir
+	if err := ensureDir(tmpDir); err != nil {
+		return "", fmt.Errorf("ensure temp dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(tmpDir, "stacked-restore-*.gz")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	path := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(path)
+		}
+	}()
+
+	sum, err := fetchToFile(issued.URL, tmp)
+	if cerr := tmp.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", err
+	}
+	if err := verifyBackupFile(path, sum, issued.Sha256); err != nil {
+		return "", err
+	}
+	ok = true
+	return path, nil
+}
+
+// fetchToFile GETs url into f and returns the hex SHA-256 of the body.
+func fetchToFile(url string, f *os.File) (string, error) {
+	req, err := http.NewRequestWithContext(currentOpContext(), http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("build download request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return "", fmt.Errorf("download GET %d: %s", resp.StatusCode, string(b))
+	}
+	hasher := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, hasher), resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("download: %w", err)
+	}
+	if resp.ContentLength >= 0 && n != resp.ContentLength {
+		return "", fmt.Errorf("download truncated: got %d of %d bytes", n, resp.ContentLength)
+	}
+	if n == 0 {
+		return "", fmt.Errorf("downloaded backup is empty")
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// verifyBackupFile checks the downloaded dump against the expected SHA-256
+// (skipped when the server didn't send one) and that it is a complete,
+// valid gzip stream.
+func verifyBackupFile(path, gotSha, wantSha string) error {
+	if wantSha != "" && !strings.EqualFold(gotSha, wantSha) {
+		return fmt.Errorf("backup checksum mismatch: expected sha256 %s, got %s", wantSha, gotSha)
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	issued, err := c.RequestBackupDownloadURL(backupID)
+	defer f.Close()
+	gzr, err := gzip.NewReader(f)
 	if err != nil {
-		return fmt.Errorf("request download URL: %w", err)
+		return fmt.Errorf("backup is not a valid gzip stream: %w", err)
+	}
+	if _, err := io.Copy(io.Discard, gzr); err != nil {
+		return fmt.Errorf("backup gzip stream is corrupt or truncated: %w", err)
+	}
+	return gzr.Close()
+}
+
+// restoreFromFile pipes the decompressed local dump into the engine's
+// restore tool inside the container.
+func restoreFromFile(
+	streamer *logs.Streamer,
+	engine, container string,
+	creds map[string]string,
+	dumpPath string,
+) error {
+	mongoConfig, cleanupConfig, err := prepareMongoConfig(engine, container, creds)
+	if err != nil {
+		return err
+	}
+	defer cleanupConfig()
+	restore, err := buildBackupRestoreArgs(engine, container, creds, mongoConfig)
+	if err != nil {
+		return err
 	}
 
-	resp, err := http.Get(issued.URL)
+	f, err := os.Open(dumpPath)
 	if err != nil {
-		return fmt.Errorf("download: %w", err)
+		return fmt.Errorf("open dump: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("download GET %d: %s", resp.StatusCode, string(b))
-	}
-
-	gzr, err := gzip.NewReader(resp.Body)
+	defer f.Close()
+	gzr, err := gzip.NewReader(f)
 	if err != nil {
 		return fmt.Errorf("open gzip stream: %w", err)
 	}
 	defer gzr.Close()
 
-	cmd := exec.Command("docker", restoreArgs...)
+	cmd := restore.Command()
 	cmd.Stdin = gzr
 	stderr, _ := cmd.StderrPipe()
 
@@ -280,8 +406,8 @@ func downloadAndRestore(
 		defer wg.Done()
 		tailStderr(streamer, "[restore]", stderr)
 	}()
-	restoreErr := cmd.Wait()
 	wg.Wait()
+	restoreErr := cmd.Wait()
 	if restoreErr != nil {
 		return fmt.Errorf("restore failed: %w", restoreErr)
 	}
@@ -304,7 +430,7 @@ func uploadFileToURL(url, method string, headers map[string]string, path string,
 	}
 	defer f.Close()
 
-	req, err := http.NewRequest(method, url, f)
+	req, err := http.NewRequestWithContext(currentOpContext(), method, url, f)
 	if err != nil {
 		return err
 	}
@@ -328,92 +454,99 @@ func uploadFileToURL(url, method string, headers map[string]string, path string,
 	return nil
 }
 
-// buildBackupDumpArgs returns the `docker exec …` arg list for an
+// prepareMongoConfig writes the mongo-tools `--config` password file into
+// container when engine is mongo; for other engines it is a no-op returning
+// an empty path.
+func prepareMongoConfig(engine, container string, creds map[string]string) (string, func(), error) {
+	if engine != "mongo" {
+		return "", func() {}, nil
+	}
+	return writeMongoToolConfig(container, creds["password"])
+}
+
+// buildBackupDumpArgs returns the `docker exec …` invocation for an
 // engine-appropriate dump that emits the backup bytes on stdout. Mirrors the
-// dump halves of the migration pipeline.
-func buildBackupDumpArgs(engine, container string, creds map[string]string) ([]string, error) {
+// dump halves of the migration pipeline. Passwords travel in the docker
+// CLI's env (`-e NAME`) or, for mongo, in the --config file at mongoConfig.
+func buildBackupDumpArgs(engine, container string, creds map[string]string, mongoConfig string) (dockerExec, error) {
 	switch engine {
 	case "postgres":
 		user := creds["user"]
-		pw := creds["password"]
 		dbName := creds["dbName"]
 		if user == "" || dbName == "" {
-			return nil, fmt.Errorf("postgres creds incomplete")
+			return dockerExec{}, fmt.Errorf("postgres creds incomplete")
 		}
-		return []string{
-			"exec", "-e", "PGPASSWORD=" + pw, container,
+		return newDockerExec(false, container, map[string]string{"PGPASSWORD": creds["password"]},
 			"pg_dump", "-U", user, "-d", dbName, "-Fc", "--no-owner", "--no-privileges",
-		}, nil
+		), nil
 	case "mysql", "mariadb":
 		root := creds["rootPassword"]
 		dbName := creds["dbName"]
 		if root == "" || dbName == "" {
-			return nil, fmt.Errorf("mysql/mariadb creds incomplete (rootPassword required)")
+			return dockerExec{}, fmt.Errorf("mysql/mariadb creds incomplete (rootPassword required)")
 		}
-		return []string{
-			"exec", "-e", "MYSQL_PWD=" + root, container,
+		return newDockerExec(false, container, map[string]string{"MYSQL_PWD": root},
 			"mysqldump", "-u", "root",
 			"--single-transaction", "--routines", "--triggers",
 			"--set-gtid-purged=OFF",
 			dbName,
-		}, nil
+		), nil
 	case "mongo":
 		user := creds["user"]
-		pw := creds["password"]
 		if user == "" {
-			return nil, fmt.Errorf("mongo creds incomplete")
+			return dockerExec{}, fmt.Errorf("mongo creds incomplete")
+		}
+		if mongoConfig == "" {
+			return dockerExec{}, fmt.Errorf("mongo dump needs a credentials config file")
 		}
 		// --archive (no file arg) emits a single binary archive on stdout.
 		// No `-t`: a pseudo-TTY would corrupt the archive bytes.
-		return []string{
-			"exec", container,
+		return newDockerExec(false, container, nil,
 			"mongodump", "--archive",
-			"--username=" + user,
-			"--password=" + pw,
+			"--config="+mongoConfig,
+			"--username="+user,
 			"--authenticationDatabase=admin",
-		}, nil
+		), nil
 	}
-	return nil, fmt.Errorf("unsupported engine: %s", engine)
+	return dockerExec{}, fmt.Errorf("unsupported engine: %s", engine)
 }
 
-// buildBackupRestoreArgs returns the `docker exec -i …` arg list that reads
-// the dump from stdin and restores it.
-func buildBackupRestoreArgs(engine, container string, creds map[string]string) ([]string, error) {
+// buildBackupRestoreArgs returns the `docker exec -i …` invocation that
+// reads the dump from stdin and restores it.
+func buildBackupRestoreArgs(engine, container string, creds map[string]string, mongoConfig string) (dockerExec, error) {
 	switch engine {
 	case "postgres":
 		user := creds["user"]
-		pw := creds["password"]
 		dbName := creds["dbName"]
 		if user == "" || dbName == "" {
-			return nil, fmt.Errorf("postgres creds incomplete")
+			return dockerExec{}, fmt.Errorf("postgres creds incomplete")
 		}
-		return []string{
-			"exec", "-i", "-e", "PGPASSWORD=" + pw, container,
+		return newDockerExec(true, container, map[string]string{"PGPASSWORD": creds["password"]},
 			"pg_restore", "-U", user, "-d", dbName, "--no-owner", "--no-privileges",
-		}, nil
+		), nil
 	case "mysql", "mariadb":
 		root := creds["rootPassword"]
 		dbName := creds["dbName"]
 		if root == "" || dbName == "" {
-			return nil, fmt.Errorf("mysql/mariadb creds incomplete (rootPassword required)")
+			return dockerExec{}, fmt.Errorf("mysql/mariadb creds incomplete (rootPassword required)")
 		}
-		return []string{
-			"exec", "-i", "-e", "MYSQL_PWD=" + root, container,
+		return newDockerExec(true, container, map[string]string{"MYSQL_PWD": root},
 			"mysql", "-u", "root", dbName,
-		}, nil
+		), nil
 	case "mongo":
 		user := creds["user"]
-		pw := creds["password"]
 		if user == "" {
-			return nil, fmt.Errorf("mongo creds incomplete")
+			return dockerExec{}, fmt.Errorf("mongo creds incomplete")
 		}
-		return []string{
-			"exec", "-i", container,
+		if mongoConfig == "" {
+			return dockerExec{}, fmt.Errorf("mongo restore needs a credentials config file")
+		}
+		return newDockerExec(true, container, nil,
 			"mongorestore", "--archive", "--drop",
-			"--username=" + user,
-			"--password=" + pw,
+			"--config="+mongoConfig,
+			"--username="+user,
 			"--authenticationDatabase=admin",
-		}, nil
+		), nil
 	}
-	return nil, fmt.Errorf("unsupported engine: %s", engine)
+	return dockerExec{}, fmt.Errorf("unsupported engine: %s", engine)
 }

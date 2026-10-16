@@ -535,6 +535,10 @@ type backupUploadURLResponse struct {
 type BackupDownloadURL struct {
 	URL string `json:"url"`
 	Key string `json:"key"`
+	// Sha256 is the hex digest recorded when the backup was confirmed.
+	// Optional: when present the agent verifies the download against it
+	// before touching the database.
+	Sha256 string `json:"sha256,omitempty"`
 }
 
 type backupDownloadURLResponse struct {

@@ -71,8 +71,8 @@ func TestOther(t *testing.T) {
 	}{
 		{Blue, Green},
 		{Green, Blue},
-		{"", Blue},       // no state -> default first slot
-		{Legacy, Blue},   // legacy migrates to blue on first flip
+		{"", Blue},     // no state -> default first slot
+		{Legacy, Blue}, // legacy migrates to blue on first flip
 	}
 	for _, c := range cases {
 		if got := c.in.Other(); got != c.want {
