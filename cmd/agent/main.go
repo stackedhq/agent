@@ -50,6 +50,9 @@ func main() {
 	// before any op (or the startup proxy reconcile) can regenerate
 	// the Caddyfile.
 	executor.SetServerBaseURL(cfg.Agent.Server)
+	// Restore the machine ID learned from earlier ops so the startup
+	// Caddyfile already scopes the on-demand TLS ask URL (`?m=`).
+	executor.LoadMachineID()
 	exec := executor.New(c)
 	logMgr := runtimelogs.NewManager(c)
 	dbLogMgr := databaselogs.NewManager(c)

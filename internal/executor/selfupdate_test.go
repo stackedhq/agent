@@ -21,6 +21,8 @@ type fakeRelease struct {
 	sums    []byte
 	sig     []byte
 	binary  []byte
+	// versionFile is served as VERSION; nil serves "<version>\n".
+	versionFile []byte
 }
 
 // serveRelease starts an httptest server laid out like GitHub releases
@@ -31,6 +33,11 @@ func serveRelease(t *testing.T, rel fakeRelease, trusted ...ed25519.PublicKey) {
 	prefix := "/v" + rel.version + "/"
 	mux.HandleFunc(prefix+sumsFile, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(rel.sums) })
 	mux.HandleFunc(prefix+sumsSigFile, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(rel.sig) })
+	versionBody := rel.versionFile
+	if versionBody == nil {
+		versionBody = []byte(rel.version + "\n")
+	}
+	mux.HandleFunc(prefix+versionFile, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(versionBody) })
 	mux.HandleFunc(prefix+"stacked-agent-linux-amd64", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			t.Errorf("release download carried an Authorization header")
@@ -55,8 +62,14 @@ func genKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 	return pub, priv
 }
 
+// sumsFor builds a SHA256SUMS for binary (as name) bound to v1.2.3.
 func sumsFor(binary []byte, name string) []byte {
-	return []byte(fmt.Sprintf("%x  stacked-agent-linux-arm64\n%x  %s\n", sha256.Sum256([]byte("other")), sha256.Sum256(binary), name))
+	return sumsForVersion(binary, name, "1.2.3")
+}
+
+func sumsForVersion(binary []byte, name, version string) []byte {
+	return []byte(fmt.Sprintf("%x  stacked-agent-linux-arm64\n%x  %s\n%x  VERSION\n",
+		sha256.Sum256([]byte("other")), sha256.Sum256(binary), name, sha256.Sum256([]byte(version+"\n"))))
 }
 
 func newDest(t *testing.T) string {
@@ -177,6 +190,33 @@ func TestInstallVerifiedReleaseRejects(t *testing.T) {
 				return fakeRelease{sums: sums, sig: ed25519.Sign(priv, sums), binary: bin}, pub
 			},
 			wantErr: "no entry for stacked-agent-linux-amd64",
+		},
+		{
+			// A validly signed older release replayed under the v1.2.3 path.
+			name: "replayed older release",
+			build: func(t *testing.T) (fakeRelease, ed25519.PublicKey) {
+				pub, priv := genKey(t)
+				sums := sumsForVersion(bin, "stacked-agent-linux-amd64", "1.2.2")
+				return fakeRelease{sums: sums, sig: ed25519.Sign(priv, sums), binary: bin, versionFile: []byte("1.2.2\n")}, pub
+			},
+			wantErr: `signed VERSION says "1.2.2", not "1.2.3"`,
+		},
+		{
+			name: "VERSION not in SHA256SUMS",
+			build: func(t *testing.T) (fakeRelease, ed25519.PublicKey) {
+				pub, priv := genKey(t)
+				sums := []byte(fmt.Sprintf("%x  stacked-agent-linux-amd64\n", sha256.Sum256(bin)))
+				return fakeRelease{sums: sums, sig: ed25519.Sign(priv, sums), binary: bin}, pub
+			},
+			wantErr: "not bound to a version",
+		},
+		{
+			name: "VERSION tampered",
+			build: func(t *testing.T) (fakeRelease, ed25519.PublicKey) {
+				pub, priv := genKey(t)
+				return fakeRelease{sums: goodSums, sig: ed25519.Sign(priv, goodSums), binary: bin, versionFile: []byte("1.2.3 \n")}, pub
+			},
+			wantErr: "VERSION checksum mismatch",
 		},
 		{
 			name: "duplicate entry",

@@ -242,3 +242,90 @@ func TestEnsureDirAndWriteFilePrivateModes(t *testing.T) {
 		t.Fatalf("new file mode = %o, want 0600", info.Mode().Perm())
 	}
 }
+
+// Blue/green doesn't rewrite docker-compose.yml: while an old compose file
+// still references `.env`, the deploy rewrites it with the new values
+// (0600) so a later `compose up` (restart fallback) doesn't start stale
+// env. With a new-format compose file the legacy `.env` is removed.
+func TestSyncLegacyEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	legacy, err := os.ReadFile(filepath.Join("testdata", "compose_legacy", "service-min.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envPath, []byte("SECRET=old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncLegacyEnvFile(dir, map[string]string{"SECRET": "new", "HOST": "0.0.0.0", "PEM": "a\nb"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "HOST=0.0.0.0\nSECRET=new\n" {
+		t.Fatalf(".env = %q", got)
+	}
+	if info, _ := os.Stat(envPath); info.Mode().Perm() != 0o600 {
+		t.Fatalf(".env mode = %o, want 0600", info.Mode().Perm())
+	}
+
+	// Missing .env with a legacy compose file: created.
+	_ = os.Remove(envPath)
+	if err := syncLegacyEnvFile(dir, map[string]string{"A": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(envPath); string(got) != "A=1\n" {
+		t.Fatalf(".env = %q", got)
+	}
+
+	// New-format compose: removed.
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(generateCompose(goldenServiceID, "img", nil, resourceLimits{restartPolicy: "no"}, nil, "", map[string]string{"A": "1"})), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncLegacyEnvFile(dir, map[string]string{"A": "2"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(envPath); !os.IsNotExist(err) {
+		t.Fatalf(".env should be removed, stat err = %v", err)
+	}
+
+	// No compose file at all (first blue/green deploy of a fresh dir): no .env.
+	empty := t.TempDir()
+	if err := syncLegacyEnvFile(empty, map[string]string{"A": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(empty, ".env")); !os.IsNotExist(err) {
+		t.Fatalf(".env created without a legacy compose file: %v", err)
+	}
+}
+
+func TestLiteralEnvWarningListsKeysNotValues(t *testing.T) {
+	w := literalEnvWarning(map[string]string{
+		"PLAIN":   "hello",
+		"DOLLAR":  "pa$$word-secret",
+		"DQUOTED": `"quoted-secret"`,
+		"SQUOTED": "'quoted-secret'",
+		"MIXED":   `"not matching'`,
+		"ONEQ":    `"`,
+		"HOST":    "0.0.0.0",
+	})
+	if !strings.Contains(w, "DOLLAR, DQUOTED, SQUOTED contain") {
+		t.Fatalf("warning = %q", w)
+	}
+	for _, leak := range []string{"secret", "PLAIN", "MIXED", "ONEQ", "HOST"} {
+		if strings.Contains(w, leak) {
+			t.Fatalf("warning mentions %q: %q", leak, w)
+		}
+	}
+	if !strings.Contains(w, "literally") {
+		t.Fatalf("warning must explain the literal behaviour: %q", w)
+	}
+	if got := literalEnvWarning(map[string]string{"A": "1", "HOST": "0.0.0.0"}); got != "" {
+		t.Fatalf("unexpected warning %q", got)
+	}
+}

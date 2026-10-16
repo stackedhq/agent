@@ -86,11 +86,37 @@ func SetServerBaseURL(u string) {
 // URL so the server can scope authorization to this machine's domains.
 var machineID atomic.Value // string
 
+// machineIDPath persists the machine ID across restarts so the Caddyfile
+// rendered by the startup reconcile (before any op has been claimed)
+// already carries `?m=`. Package var for tests.
+var machineIDPath = filepath.Join(stackedDir, "machine-id")
+
 // NoteMachineID records the machine ID from an operation. Only
 // UUID-shaped values are accepted, since it's spliced into a URL in
-// the Caddyfile.
+// the Caddyfile. A new value is persisted to machineIDPath (0600).
 func NoteMachineID(id string) {
 	id = strings.ToLower(strings.TrimSpace(id))
+	if !uuidRe.MatchString(id) || id == currentMachineID() {
+		return
+	}
+	machineID.Store(id)
+	if err := writeFileAtomic(machineIDPath, []byte(id+"\n"), 0o600); err != nil {
+		log.Printf("persist machine id: %v", err)
+	}
+}
+
+// LoadMachineID restores the machine ID persisted by NoteMachineID.
+// Called at startup before the proxy reconcile; a missing or invalid
+// file just leaves the ID unknown until the first op.
+func LoadMachineID() {
+	data, err := os.ReadFile(machineIDPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("load machine id: %v", err)
+		}
+		return
+	}
+	id := strings.ToLower(strings.TrimSpace(string(data)))
 	if uuidRe.MatchString(id) {
 		machineID.Store(id)
 	}
@@ -252,11 +278,7 @@ func migrateLegacyGateCaddyfile() error {
 		return err
 	}
 	parsed = sanitizeDomains(parsed)
-	gateCfg, err := buildGateConfig(parsed)
-	if err != nil {
-		return err
-	}
-	if err := applyGateConfig(gateCfg); err != nil {
+	if err := applyGateConfig(buildGateConfig(parsed)); err != nil {
 		return fmt.Errorf("auth gate: %w", err)
 	}
 	log.Printf("proxy: migrating Caddyfile to %s", gateUpstream)
@@ -314,6 +336,13 @@ func ensureProxy() error {
 		return fmt.Errorf("ensure Caddyfile: %w", err)
 	}
 
+	// Record networks attached to the current Caddy at runtime (Dokploy
+	// takeover) before `compose up` can recreate the container without
+	// them. Best-effort: a failure here must not block routing.
+	if err := recordCaddyRuntimeNetworks(); err != nil {
+		log.Printf("proxy: record caddy runtime networks: %v", err)
+	}
+
 	// Start Caddy (no-op if already running). docker compose up -d is
 	// idempotent against a running container, and the docker daemon is
 	// the authoritative arbiter of port conflicts — if :80 or :443 is
@@ -341,6 +370,11 @@ func ensureProxy() error {
 		return fmt.Errorf("start caddy: %s: %w", out, err)
 	}
 	removeLegacyGateContainer()
+
+	// Re-attach runtime networks a recreate may have dropped.
+	if err := reconnectCaddyNetworks(); err != nil {
+		log.Printf("proxy: %v", err)
+	}
 
 	// Best-effort here; proxy_config requires the gate (and fails the
 	// op) only when a domain is actually gated (applyGateConfig).
@@ -412,13 +446,7 @@ func (e *Executor) ProxyConfig(op client.Operation) error {
 	}
 
 	parsed := sanitizeDomains(parseDomains(domains))
-	if err := validatePortBoundHosts(parsed); err != nil {
-		return err
-	}
-	gateCfg, err := buildGateConfig(parsed)
-	if err != nil {
-		return err
-	}
+	gateCfg := buildGateConfig(parsed)
 
 	if err := ensureProxy(); err != nil {
 		return fmt.Errorf("ensure proxy: %w", err)
@@ -647,26 +675,21 @@ func parseDomains(raw []interface{}) []cachedDomain {
 	return out
 }
 
-func validatePortBoundHosts(parsed []cachedDomain) error {
-	for _, d := range parsed {
-		if !d.isPortBound() {
-			continue
-		}
-		if err := validateUpstreamHost(d.Host); err != nil {
-			return fmt.Errorf("invalid port-bound upstream host for %s: %w", d.Domain, err)
-		}
-	}
-	return nil
-}
-
 // caddyDomainRe is a strict hostname: lowercase LDH labels (no
 // wildcard; the server never sends one). Length is checked separately.
 var caddyDomainRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
-// caddyPathRe is the allowed route-path charset: RFC 3986 path
-// characters only. No `{`/`}` (Caddy placeholders / blocks), no
-// whitespace, `#`, `?` or `"`, so a path can't break out of its token.
-var caddyPathRe = regexp.MustCompile(`^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$`)
+// caddyPathUnsafe are the characters (besides whitespace and control
+// characters) that could break a route path out of its Caddyfile token
+// or change how Caddy lexes it: `{`/`}` (blocks and placeholders), `"`
+// and backtick (quoting), `\` (escapes), `#` (comments). `?` and `*`
+// would change the matcher's meaning. Everything else the server
+// accepts (printable ASCII) is allowed; paths outside the bare-token
+// charset are rendered quoted (caddyPathToken).
+const caddyPathUnsafe = "{}\"`\\#?*"
+
+// caddyBareTokenRe is the charset that renders as an unquoted token.
+var caddyBareTokenRe = regexp.MustCompile(`^[A-Za-z0-9._~/-]+$`)
 
 const maxCaddyPathLen = 1024
 
@@ -675,7 +698,29 @@ func validCaddyDomain(d string) bool {
 }
 
 func validCaddyPath(p string) bool {
-	return len(p) <= maxCaddyPathLen && caddyPathRe.MatchString(p)
+	if len(p) == 0 || len(p) > maxCaddyPathLen || p[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		// Printable ASCII only, no space (0x20): this also rejects
+		// every control character and non-ASCII byte.
+		if c <= 0x20 || c >= 0x7f || strings.IndexByte(caddyPathUnsafe, c) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// caddyPathMatcher renders a validated route path plus the trailing `*`
+// as a Caddyfile token, quoted when it contains anything outside the
+// bare-token charset. validCaddyPath has already excluded `"` and `\`,
+// so plain double quotes need no escaping.
+func caddyPathMatcher(path string) string {
+	if caddyBareTokenRe.MatchString(path) {
+		return path + "*"
+	}
+	return `"` + path + `*"`
 }
 
 // validateDomainRow checks that a row's domain and path are safe to
@@ -691,12 +736,14 @@ func validateDomainRow(d cachedDomain) error {
 }
 
 // sanitizeDomains lowercases domains and drops (with a logged error)
-// rows whose domain or path isn't a safe Caddyfile token. Skipping a
-// row instead of failing the whole op keeps every other site on the
-// machine updatable, and is safe because the gate config and the
-// Caddyfile are both derived from the same filtered list: a dropped row
-// simply isn't routed. The server validates both fields too; this is
-// defence in depth.
+// rows whose domain or path isn't a safe Caddyfile token, or whose
+// port-bound upstream host is rejected by validateUpstreamHost. Skipping
+// a row instead of failing the whole op keeps every other site on the
+// machine updatable (one bad row must not fail every proxy_config, or
+// RegenerateCaddyfile and with it a blue/green flip), and is safe
+// because the gate config and the Caddyfile are both derived from the
+// same filtered list: a dropped row simply isn't routed. The server
+// validates these fields too; this is defence in depth.
 func sanitizeDomains(parsed []cachedDomain) []cachedDomain {
 	out := make([]cachedDomain, 0, len(parsed))
 	for _, d := range parsed {
@@ -704,6 +751,12 @@ func sanitizeDomains(parsed []cachedDomain) []cachedDomain {
 		if err := validateDomainRow(d); err != nil {
 			log.Printf("proxy: skipping domain row: %v", err)
 			continue
+		}
+		if d.isPortBound() {
+			if err := validateUpstreamHost(d.Host); err != nil {
+				log.Printf("proxy: skipping domain row: invalid port-bound upstream host for %s: %v", d.Domain, err)
+				continue
+			}
 		}
 		out = append(out, d)
 	}
@@ -939,9 +992,9 @@ func writePathHandle(b *strings.Builder, d cachedDomain, state map[string]slots.
 	if path == "/" {
 		fmt.Fprintf(b, "%shandle {\n", indent)
 	} else if d.effectiveStripPrefix() {
-		fmt.Fprintf(b, "%shandle_path %s* {\n", indent, path)
+		fmt.Fprintf(b, "%shandle_path %s {\n", indent, caddyPathMatcher(path))
 	} else {
-		fmt.Fprintf(b, "%shandle %s* {\n", indent, path)
+		fmt.Fprintf(b, "%shandle %s {\n", indent, caddyPathMatcher(path))
 	}
 	if err := writeUpstream(b, d, state, indent+"    "); err != nil {
 		return err
@@ -979,17 +1032,18 @@ func renderUpstreamHostPort(host string, port int) (string, error) {
 }
 
 // dockerHostAlias is the extra_hosts name for the VPS itself inside the
-// Caddy container. Only ever produced by loopbackRewrite; users can't
-// type it directly.
+// Caddy container (see proxyCompose).
 const dockerHostAlias = "host.docker.internal"
 
 // loopbackRewrite is the one intentional exception to "no loopback
 // upstreams": these exact spellings mean "a port on this VPS" and are
-// rewritten to the docker host alias. Every other loopback address
-// (127.0.0.2, ::ffff:127.0.0.1, ...) is rejected by validateUpstreamHost.
+// rewritten to the docker host alias. The alias itself is accepted too
+// (the dashboard allows typing it) and normalized to its canonical
+// spelling. Every other loopback address (127.0.0.2, ::ffff:127.0.0.1,
+// ...) is rejected by validateUpstreamHost.
 func loopbackRewrite(host string) (string, bool) {
 	switch strings.ToLower(host) {
-	case "127.0.0.1", "localhost", "::1", "[::1]":
+	case "127.0.0.1", "localhost", "::1", "[::1]", dockerHostAlias, dockerHostAlias + ".":
 		return dockerHostAlias, true
 	}
 	return "", false
@@ -1000,9 +1054,11 @@ func loopbackRewrite(host string) (string, bool) {
 // rejects addresses that would point Caddy somewhere the user can't
 // mean: loopback (other than the loopbackRewrite spellings),
 // unspecified, link-local (incl. cloud metadata 169.254.169.254) and
-// multicast, with IPv4-mapped IPv6 unmapped first. Also rejects the
-// docker host alias and *.localhost (only the rewrite may produce them)
-// and names reserved for Stacked infrastructure (stacked-gate, caddy...).
+// multicast, with IPv4-mapped IPv6 unmapped first. Also rejects
+// *.localhost and names reserved for Stacked infrastructure
+// (stacked-gate, caddy...). UUID-shaped names are allowed: they are
+// Stacked service container names on the shared network, which the
+// dashboard lets users target directly.
 func validateUpstreamHost(host string) error {
 	if host == "" {
 		return fmt.Errorf("host is empty")
@@ -1047,8 +1103,11 @@ func validateUpstreamHost(host string) error {
 		return fmt.Errorf("host must be an IP literal or RFC-1123 hostname")
 	}
 	name := strings.TrimSuffix(strings.ToLower(host), ".")
-	if name == dockerHostAlias || name == "localhost" || strings.HasSuffix(name, ".localhost") {
+	if name == "localhost" || strings.HasSuffix(name, ".localhost") {
 		return fmt.Errorf("host %q is reserved; use 127.0.0.1 or localhost for a port on this machine", host)
+	}
+	if uuidRe.MatchString(name) {
+		return nil
 	}
 	if isReservedAlias(name) {
 		return fmt.Errorf("host %q is reserved for Stacked infrastructure", host)

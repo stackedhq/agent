@@ -116,6 +116,32 @@ func composeVolumeSpecs(mounts []volumeMount) yList {
 var deniedHostPathRoots = []string{
 	"/etc", "/root", "/home", "/boot", "/usr", "/bin", "/sbin", "/lib", "/lib64",
 	"/var/run", "/run", "/proc", "/sys", "/dev", "/var/lib/docker", "/opt/stacked",
+	"/var/spool", "/var/lib/containerd", "/var/snap", "/snap", "/var/lib/kubelet",
+}
+
+// hostPathHint is appended to every policy rejection so the deploy log
+// tells the user where a custom volume can go.
+const hostPathHint = "Choose a path under /srv, /mnt or /data."
+
+// hostPathPolicyError is a host path rejected by the volume policy. Its
+// message names the path and the rule, plus where to put it instead; it
+// ends up verbatim in the deploy log and the op error.
+type hostPathPolicyError struct {
+	Path  string // as cleaned (or quoted as given, for unparseable paths)
+	Rule  string // e.g. "system path, inside /home"
+	Mount string // container path, when known
+}
+
+func (e *hostPathPolicyError) Error() string {
+	at := ""
+	if e.Mount != "" {
+		at = " (mounted at " + e.Mount + ")"
+	}
+	return fmt.Sprintf("volume host path %s%s is not allowed (%s). %s", e.Path, at, e.Rule, hostPathHint)
+}
+
+func denyHostPath(path, rule string) error {
+	return &hostPathPolicyError{Path: path, Rule: rule}
 }
 
 // legacyCatalogDataRoot is the pre-managed-volume app catalog convention
@@ -130,19 +156,19 @@ const legacyCatalogDataRoot = "/opt/stacked/data"
 // `:` (volume-spec separator) and control characters.
 func cleanHostPath(p string) (string, error) {
 	if p == "" || len(p) > 4096 {
-		return "", fmt.Errorf("invalid host path")
+		return "", denyHostPath(fmt.Sprintf("%q", truncateForError(p)), "empty or longer than 4096 characters")
 	}
 	if !strings.HasPrefix(p, "/") {
-		return "", fmt.Errorf("host path %q must be absolute", truncateForError(p))
+		return "", denyHostPath(fmt.Sprintf("%q", truncateForError(p)), "must be an absolute path")
 	}
 	for _, r := range p {
 		if r < 0x20 || r == 0x7f || r == '$' || r == ':' {
-			return "", fmt.Errorf("host path %q contains a forbidden character", truncateForError(p))
+			return "", denyHostPath(fmt.Sprintf("%q", truncateForError(p)), "contains $, : or a control character")
 		}
 	}
 	for _, seg := range strings.Split(p, "/") {
 		if seg == ".." {
-			return "", fmt.Errorf("host path %q must not contain '..'", truncateForError(p))
+			return "", denyHostPath(fmt.Sprintf("%q", truncateForError(p)), "contains a '..' segment")
 		}
 	}
 	return filepath.Clean(p), nil
@@ -167,13 +193,13 @@ func checkHostPathPolicy(serviceID, hostPath string) (string, error) {
 		return "", err
 	}
 	if clean == "/" {
-		return "", fmt.Errorf("host path / is not allowed")
+		return "", denyHostPath(clean, "the filesystem root")
 	}
 	if isUUID(serviceID) {
 		own := managedServiceDir(serviceID)
 		if strings.HasPrefix(clean, own+"/") {
 			if pathAtOrUnder(clean, own+"/files") {
-				return "", fmt.Errorf("host path %s is reserved for managed file mounts", clean)
+				return "", denyHostPath(clean, "reserved for managed file mounts")
 			}
 			return clean, nil
 		}
@@ -181,8 +207,14 @@ func checkHostPathPolicy(serviceID, hostPath string) (string, error) {
 	if strings.HasPrefix(clean, legacyCatalogDataRoot+"/") && !pathAtOrUnder(clean, managedServiceDataRoot) {
 		return clean, nil
 	}
+	if pathAtOrUnder(clean, managedServiceDataRoot) {
+		return "", denyHostPath(clean, "Stacked-managed storage; only the service's own managed volumes may use it")
+	}
 	if denied := deniedHostRoot(clean); denied != "" {
-		return "", fmt.Errorf("host path %s is not allowed (inside %s)", clean, denied)
+		if denied == stackedDir {
+			return "", denyHostPath(clean, "Stacked's own directory "+stackedDir)
+		}
+		return "", denyHostPath(clean, "system path, inside "+denied)
 	}
 	return clean, nil
 }
@@ -219,10 +251,14 @@ func validateVolumes(serviceID string, mounts []volumeMount) ([]volumeMount, err
 	for _, m := range mounts {
 		clean, err := checkHostPathPolicy(serviceID, m.HostPath)
 		if err != nil {
+			var pe *hostPathPolicyError
+			if errors.As(err, &pe) {
+				pe.Mount = truncateForError(m.ContainerPath)
+			}
 			return nil, err
 		}
 		if err := validateContainerMountPath(m.ContainerPath); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("volume %s: %w", clean, err)
 		}
 		for _, prev := range out {
 			if containerPathsOverlap(clean, prev.HostPath) {

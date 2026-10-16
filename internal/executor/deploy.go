@@ -114,6 +114,7 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// compose project's `.env` any more.
 	env, envWarnings := serviceEnv(creds.EnvVars)
 	addEnvWarnings(streamer, envWarnings)
+	addLiteralEnvWarning(streamer, env)
 
 	var imageName string
 

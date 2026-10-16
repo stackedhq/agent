@@ -211,13 +211,18 @@ func (e *Executor) DokployCaddyAttachNetwork(op client.Operation) error {
 		// docker errors with "already exists in network" when the
 		// container is already attached. That's the desired end
 		// state — treat as success.
-		if strings.Contains(out, "already exists in network") || strings.Contains(out, "is already attached") {
-			log.Printf("dokploy_caddy_attach_network: caddy already attached to %s", network)
-			return nil
+		if !isAlreadyAttached(out) {
+			return fmt.Errorf("network connect %s: %s: %w", network, strings.TrimSpace(out), err)
 		}
-		return fmt.Errorf("network connect %s: %s: %w", network, strings.TrimSpace(out), err)
+		log.Printf("dokploy_caddy_attach_network: caddy already attached to %s", network)
+	} else {
+		log.Printf("dokploy_caddy_attach_network: attached caddy to %s", network)
 	}
-	log.Printf("dokploy_caddy_attach_network: attached caddy to %s", network)
+	// Persist the attachment so ensureProxy re-applies it whenever
+	// compose recreates Caddy (see caddy_networks.go).
+	if err := rememberCaddyNetwork(network); err != nil {
+		return fmt.Errorf("record caddy network %s: %w", network, err)
+	}
 	return nil
 }
 
@@ -238,6 +243,11 @@ func (e *Executor) DokployCaddyDetachNetwork(op client.Operation) error {
 	}
 	if network == "stacked" || network == gateNetworkName {
 		return fmt.Errorf("refusing to detach caddy from its own network %q", network)
+	}
+	// Forget first: even if the disconnect below fails, the next Caddy
+	// recreate must not re-attach a network the user asked to detach.
+	if err := forgetCaddyNetwork(network); err != nil {
+		return fmt.Errorf("forget caddy network %s: %w", network, err)
 	}
 	container, err := stackedCaddyContainerID()
 	if err != nil {

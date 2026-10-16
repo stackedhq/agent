@@ -9,8 +9,9 @@
 //
 //   - The gate keys every decision on the domain Caddy passes in the
 //     fixed per-site header X-Stacked-Gate-Domain (the configured domain
-//     literal from the Caddyfile), falling back to the normalized Host
-//     header only when that header is absent.
+//     literal from the Caddyfile). Both Caddy blocks that reach the gate
+//     always set it, so a request without it is denied (403); the Host
+//     header is never consulted.
 //   - A domain the gate has no valid entry for gets 403, never 200.
 //   - While the config file is missing, unreadable or invalid, every
 //     request gets 403 until a valid config loads.
@@ -338,12 +339,11 @@ func NormalizeHost(h string) string {
 }
 
 // requestDomain returns the domain the gate should key on: Caddy's
-// fixed per-site header when present, otherwise the normalized Host.
+// fixed per-site header. Empty (deny) when the header is missing; the
+// Host header is deliberately ignored, since every Caddy block that
+// reaches the gate sets the header.
 func requestDomain(r *http.Request) string {
-	if v := r.Header.Get(DomainHeader); v != "" {
-		return NormalizeHost(v)
-	}
-	return NormalizeHost(r.Host)
+	return NormalizeHost(r.Header.Get(DomainHeader))
 }
 
 // lookup returns the gate for domain. ok=false means deny (no valid
@@ -654,15 +654,24 @@ func (s *Server) dummy() []byte {
 	return s.dummyHash
 }
 
+// handleLogout clears the session cookie. POST only, so a cross-site
+// <img src=".../__stacked/logout"> or link prefetch can't sign users out.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
-	http.Redirect(w, r, "/__stacked/login", http.StatusFound)
+	http.Redirect(w, r, "/__stacked/login", http.StatusSeeOther)
 }
 
 // handleHealth reports load state for the agent (via `gate status`

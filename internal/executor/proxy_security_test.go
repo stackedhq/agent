@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -26,12 +28,20 @@ func TestValidCaddyDomain(t *testing.T) {
 }
 
 func TestValidCaddyPath(t *testing.T) {
-	for _, p := range []string{"/", "/api", "/api/v1", "/a-b_c.d~e", "/%20x", "/@me", "/a:b"} {
+	for _, p := range []string{
+		"/", "/api", "/api/v1", "/a-b_c.d~e", "/%20x", "/@me", "/a:b",
+		// Printable ASCII the server accepts and that can't break a
+		// (quoted) Caddyfile token.
+		"/a'b", "/a(b)", "/a[b]", "/a<b>", "/a|b", "/a^b", "/a!$&+,;=b", "/<<EOF",
+	} {
 		if !validCaddyPath(p) {
 			t.Errorf("validCaddyPath(%q) = false, want true", p)
 		}
 	}
-	for _, p := range []string{"", "api", "/api {", "/{path}", "/a}", "/a b", "/a\tb", "/a\nrespond 200", "/a#b", "/a?b", `/a"b`, "/a\\b", "/" + strings.Repeat("a", maxCaddyPathLen)} {
+	for _, p := range []string{
+		"", "api", "/api {", "/{path}", "/a}", "/a b", "/a\tb", "/a\nrespond 200", "/a#b", "/a?b", `/a"b`, "/a\\b",
+		"/a`b", "/a*", "/a\x7fb", "/caf\u00e9", "/a\u00a0b", "/" + strings.Repeat("a", maxCaddyPathLen),
+	} {
 		if validCaddyPath(p) {
 			t.Errorf("validCaddyPath(%q) = true, want false", p)
 		}
@@ -48,6 +58,73 @@ func TestSanitizeDomainsLowercasesAndSkipsBadRows(t *testing.T) {
 	got := sanitizeDomains(in)
 	if len(got) != 2 || got[0].Domain != "app.example.com" || got[1].ServiceID != "svc-4" {
 		t.Fatalf("sanitizeDomains = %+v", got)
+	}
+}
+
+func TestCaddyPathMatcherQuotesOutsideBareCharset(t *testing.T) {
+	cases := map[string]string{
+		"/api":        "/api*",
+		"/a-b_c.d~e/": "/a-b_c.d~e/*",
+		"/api%20v1":   `"/api%20v1*"`,
+		"/a'b":        `"/a'b*"`,
+		"/a(b)":       `"/a(b)*"`,
+		"/@me":        `"/@me*"`,
+	}
+	for in, want := range cases {
+		if got := caddyPathMatcher(in); got != want {
+			t.Errorf("caddyPathMatcher(%q) = %s, want %s", in, got, want)
+		}
+	}
+	out, err := generateCaddyfileChecked([]cachedDomain{
+		{Domain: "app.example.com", ServiceID: "s1", Port: 3000, Path: "/api%20v1"},
+		{Domain: "app.example.com", ServiceID: "s2", Port: 3000, Path: "/docs", StripPrefix: boolPtr(false)},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`handle_path "/api%20v1*" {`, "handle /docs* {"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// One bad port-bound row is skipped; the rest of the machine's domains
+// still render (a single invalid row must not fail every proxy_config).
+func TestSanitizeDomainsSkipsInvalidPortBoundRows(t *testing.T) {
+	in := []cachedDomain{
+		{Domain: "meta.example.com", Host: "169.254.169.254", Port: 80, Scheme: "http"},
+		{Domain: "wild.example.com", Host: "0.0.0.0", Port: 80, Scheme: "http"},
+		{Domain: "lo2.example.com", Host: "127.0.0.2", Port: 80, Scheme: "http"},
+		{Domain: "mapped.example.com", Host: "::ffff:127.0.0.1", Port: 80, Scheme: "http"},
+		{Domain: "inj.example.com", Host: "10.0.0.1\nrespond 200", Port: 80, Scheme: "http"},
+		{Domain: "hdi.example.com", Host: "host.docker.internal", Port: 8080, Scheme: "http"},
+		{Domain: "svc.example.com", Host: "3f2a1b4c-1d2e-4f5a-8b9c-0d1e2f3a4b5c", Port: 3000, Scheme: "http"},
+		{Domain: "lan.example.com", Host: "10.0.0.5", Port: 8443, Scheme: "https"},
+		{Domain: "app.example.com", ServiceID: "svc-1", Port: 3000},
+	}
+	got := sanitizeDomains(in)
+	var kept []string
+	for _, d := range got {
+		kept = append(kept, d.Domain)
+	}
+	want := []string{"hdi.example.com", "svc.example.com", "lan.example.com", "app.example.com"}
+	if strings.Join(kept, ",") != strings.Join(want, ",") {
+		t.Fatalf("kept %v, want %v", kept, want)
+	}
+	out, err := generateCaddyfileChecked(got, nil)
+	if err != nil {
+		t.Fatalf("sanitized rows must render: %v", err)
+	}
+	for _, line := range []string{
+		"reverse_proxy host.docker.internal:8080",
+		"reverse_proxy 3f2a1b4c-1d2e-4f5a-8b9c-0d1e2f3a4b5c:3000",
+		"reverse_proxy https://10.0.0.5:8443",
+		"reverse_proxy svc-1:3000",
+	} {
+		if !strings.Contains(out, line) {
+			t.Errorf("missing %q in:\n%s", line, out)
+		}
 	}
 }
 
@@ -97,14 +174,19 @@ func TestValidateUpstreamHostRejectsDangerousAddresses(t *testing.T) {
 	for _, h := range []string{
 		"127.0.0.2", "127.1.2.3", "::ffff:127.0.0.1", "[::ffff:127.0.0.1]", "0.0.0.0", "::", "[::]",
 		"169.254.169.254", "::ffff:169.254.169.254", "fe80::1", "[fe80::1]", "224.0.0.1", "ff02::1",
-		"255.255.255.255", "host.docker.internal", "HOST.DOCKER.INTERNAL", "host.docker.internal.",
-		"foo.localhost", "stacked-gate", "caddy", "fe80::1%eth0",
+		"255.255.255.255", "foo.localhost", "stacked-gate", "caddy", "gate", "stk-x", "fe80::1%eth0",
 	} {
 		if err := validateUpstreamHost(h); err == nil {
 			t.Errorf("validateUpstreamHost(%q) accepted, want rejection", h)
 		}
 	}
-	for _, h := range []string{"127.0.0.1", "localhost", "LOCALHOST", "::1", "[::1]", "10.0.0.5", "192.168.1.10", "100.64.0.1", "2001:db8::1", "plex", "nas.lan"} {
+	for _, h := range []string{
+		"127.0.0.1", "localhost", "LOCALHOST", "::1", "[::1]", "10.0.0.5", "192.168.1.10", "100.64.0.1", "2001:db8::1", "plex", "nas.lan",
+		// The dashboard accepts these: the docker host alias and Stacked
+		// service container names (UUIDs) on the shared network.
+		"host.docker.internal", "HOST.DOCKER.INTERNAL", "host.docker.internal.",
+		"3f2a1b4c-1d2e-4f5a-8b9c-0d1e2f3a4b5c", "3F2A1B4C-1D2E-4F5A-8B9C-0D1E2F3A4B5C",
+	} {
 		if err := validateUpstreamHost(h); err != nil {
 			t.Errorf("validateUpstreamHost(%q) = %v, want ok", h, err)
 		}
@@ -118,17 +200,69 @@ func TestRenderUpstreamHostPortLoopbackRewriteIsExplicit(t *testing.T) {
 			t.Errorf("%s -> %q, %v; want host.docker.internal:8080", h, got, err)
 		}
 	}
+	for _, h := range []string{"host.docker.internal", "HOST.Docker.Internal", "host.docker.internal."} {
+		got, err := renderUpstreamHostPort(h, 8080)
+		if err != nil || got != "host.docker.internal:8080" {
+			t.Errorf("%s -> %q, %v; want host.docker.internal:8080", h, got, err)
+		}
+	}
+	if got, err := renderUpstreamHostPort("3f2a1b4c-1d2e-4f5a-8b9c-0d1e2f3a4b5c", 3000); err != nil || got != "3f2a1b4c-1d2e-4f5a-8b9c-0d1e2f3a4b5c:3000" {
+		t.Errorf("uuid upstream -> %q, %v", got, err)
+	}
 	if _, err := renderUpstreamHostPort("::ffff:127.0.0.1", 8080); err == nil {
 		t.Error("v4-mapped loopback must be rejected, not rewritten")
 	}
 }
 
+func withMachineIDPath(t *testing.T) string {
+	t.Helper()
+	orig := machineIDPath
+	machineIDPath = filepath.Join(t.TempDir(), "machine-id")
+	t.Cleanup(func() { machineIDPath = orig })
+	return machineIDPath
+}
+
 func withMachineID(t *testing.T, id string) {
 	t.Helper()
+	withMachineIDPath(t)
 	prev := currentMachineID()
 	machineID.Store("")
 	NoteMachineID(id)
 	t.Cleanup(func() { machineID.Store(prev) })
+}
+
+func TestMachineIDPersistsAcrossRestart(t *testing.T) {
+	path := withMachineIDPath(t)
+	prev := currentMachineID()
+	t.Cleanup(func() { machineID.Store(prev) })
+
+	machineID.Store("")
+	NoteMachineID("not-a-uuid")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("invalid id persisted: %v", err)
+	}
+	NoteMachineID("3F2A1B4C-1D2E-4F5A-8B9C-0D1E2F3A4B5C")
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("machine id file: %v %v", info, err)
+	}
+
+	// "Restart": in-memory state gone, loaded back from disk.
+	machineID.Store("")
+	LoadMachineID()
+	if got := currentMachineID(); got != "3f2a1b4c-1d2e-4f5a-8b9c-0d1e2f3a4b5c" {
+		t.Fatalf("loaded machine id = %q", got)
+	}
+
+	// A tampered file is ignored.
+	machineID.Store("")
+	if err := os.WriteFile(path, []byte("x?evil=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	LoadMachineID()
+	if got := currentMachineID(); got != "" {
+		t.Fatalf("invalid file accepted: %q", got)
+	}
 }
 
 func TestOnDemandAskURLIncludesMachineID(t *testing.T) {

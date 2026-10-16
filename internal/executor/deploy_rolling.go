@@ -131,12 +131,15 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// through its process env (`-e KEY`), never argv.
 	env, envWarnings := serviceEnv(creds.EnvVars)
 	addEnvWarnings(streamer, envWarnings)
+	addLiteralEnvWarning(streamer, env)
 	runEnv, envPath, err := writeServiceEnvFile(dir, env)
 	if err != nil {
 		return nil, fail(err)
 	}
-	if err := cleanupLegacyEnvFile(dir); err != nil {
-		log.Printf("cleanup legacy .env for %s: %v", serviceID, err)
+	// Blue/green doesn't rewrite docker-compose.yml, so an older one may
+	// still reference `.env`; keep it current (see syncLegacyEnvFile).
+	if err := syncLegacyEnvFile(dir, env); err != nil {
+		return nil, fail(fmt.Errorf("update legacy .env: %w", err))
 	}
 
 	// Phase 3: ensure the network exists.
@@ -317,6 +320,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	}
 	env, envWarnings := serviceEnv(creds.EnvVars)
 	addEnvWarnings(streamer, envWarnings)
+	addLiteralEnvWarning(streamer, env)
 
 	// Pre-pull / pre-build BEFORE stopping the old container so the
 	// outage window doesn't include a slow registry fetch. The deploy

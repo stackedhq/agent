@@ -25,21 +25,78 @@ type Client struct {
 }
 
 func New(server, token string) *Client {
-	return &Client{
+	c := &Client{
 		server:    server,
 		token:     token,
 		serverErr: ValidateServerURL(server),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-			// Never follow redirects on API calls: a redirect could
-			// downgrade to http or bounce the bearer token's request
-			// (and its body) to another origin. The server never
-			// redirects agent endpoints, so a 3xx is treated as an error.
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
 	}
+	c.httpClient = &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: c.checkRedirect,
+	}
+	return c
+}
+
+// maxAPIRedirects bounds how many same-origin redirects an API call
+// follows.
+const maxAPIRedirects = 3
+
+// checkRedirect follows a redirect only when it stays on https and on
+// the configured server's host (e.g. a path normalization on the same
+// origin), up to maxAPIRedirects. Anything else (a downgrade to http,
+// another host, too many hops) stops with the 3xx response, which
+// doRequest turns into an error: the bearer token and request body must
+// never go to another origin. Go's client keeps the Authorization header
+// on same-host redirects, which is the only case allowed here.
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > maxAPIRedirects {
+		return http.ErrUseLastResponse
+	}
+	if !sameHTTPSOrigin(c.server, req.URL) {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}
+
+// sameHTTPSOrigin reports whether target is https and on the same host
+// and effective port as the server URL.
+func sameHTTPSOrigin(server string, target *url.URL) bool {
+	base, err := url.Parse(server)
+	if err != nil || target == nil || target.Scheme != "https" {
+		return false
+	}
+	if !strings.EqualFold(base.Hostname(), target.Hostname()) {
+		return false
+	}
+	return effectivePort(base) == effectivePort(target)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
+}
+
+// NormalizeServerURL upgrades a plain http:// server URL on a
+// non-loopback host to https:// and reports whether it did. Every other
+// URL is returned unchanged (ValidateServerURL decides whether it's
+// acceptable). Used by config loading so a legacy http:// config keeps
+// the agent running (and able to self-update) instead of exiting in a
+// systemd restart loop, without ever sending the token over plain http.
+func NormalizeServerURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.Hostname() == "" || isLoopbackHost(u.Hostname()) {
+		return raw, false
+	}
+	u.Scheme = "https"
+	return u.String(), true
 }
 
 // ValidateServerURL requires an https:// server URL. Plain http:// is
@@ -708,7 +765,7 @@ func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, error) 
 	}
 
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return nil, fmt.Errorf("server answered %s with redirect HTTP %d to %q; agent API calls do not follow redirects, check agent.server in the config", path, resp.StatusCode, resp.Header.Get("Location"))
+		return nil, fmt.Errorf("server answered %s with redirect HTTP %d to %q; agent API calls only follow up to %d redirects that stay on https and the configured server host, check agent.server in the config", path, resp.StatusCode, resp.Header.Get("Location"), maxAPIRedirects)
 	}
 
 	if resp.StatusCode >= 400 {

@@ -70,6 +70,43 @@ func addEnvWarnings(streamer *logs.Streamer, warnings []string) {
 	}
 }
 
+// literalEnvWarning returns one deploy-log warning naming (never showing
+// the values of) env vars whose value contains `$` or is wrapped in
+// matching quotes. The old `.env` / env_file path let Compose expand
+// `$VAR` and strip quotes in such values; they are now passed to the
+// container exactly as stored, so an app relying on the old behaviour
+// sees a different value. Empty when no key is affected.
+func literalEnvWarning(env map[string]string) string {
+	var keys []string
+	for _, k := range sortedKeys(env) {
+		v := env[k]
+		if strings.Contains(v, "$") || isWrappedInMatchingQuotes(v) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("env vars %s contain $ or surrounding quotes. Values are now passed to the container literally: "+
+		"$VAR references are no longer expanded and quotes are no longer stripped. Update these values if your app relied on that.",
+		strings.Join(keys, ", "))
+}
+
+func isWrappedInMatchingQuotes(v string) bool {
+	if len(v) < 2 {
+		return false
+	}
+	first, last := v[0], v[len(v)-1]
+	return first == last && (first == '"' || first == '\'')
+}
+
+// addLiteralEnvWarning writes literalEnvWarning to the deploy log.
+func addLiteralEnvWarning(streamer *logs.Streamer, env map[string]string) {
+	if w := literalEnvWarning(env); w != "" {
+		addEnvWarnings(streamer, []string{w})
+	}
+}
+
 func sortedKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -214,11 +251,32 @@ func writeServiceEnvFile(dir string, env map[string]string) (dockerRunEnv, strin
 	return d, path, nil
 }
 
+// syncLegacyEnvFile is cleanupLegacyEnvFile for deploy paths that don't
+// rewrite docker-compose.yml (blue/green). While an older compose file
+// still lists `.env` as `env_file:`, a later `compose restart`/`up -d`
+// (restart op fallback) would start the container with whatever `.env`
+// holds, so it's rewritten (0600) with the current values in the format
+// the old agent used (verbatim KEY=VALUE, single-line values only).
+// Otherwise the legacy file is removed.
+func syncLegacyEnvFile(dir string, env map[string]string) error {
+	compose, err := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	if err == nil && composeReferencesLegacyEnv(string(compose)) {
+		envPath := filepath.Join(dir, legacyEnvFileName)
+		if info, statErr := os.Lstat(envPath); statErr == nil && !info.Mode().IsRegular() {
+			if rmErr := os.RemoveAll(envPath); rmErr != nil {
+				return rmErr
+			}
+		}
+		return writeFile(envPath, buildEnvFile(env))
+	}
+	return cleanupLegacyEnvFile(dir)
+}
+
 // cleanupLegacyEnvFile removes the pre-stacked.env `.env` from a service dir
 // once the compose file no longer references it. If an older compose file
 // still lists it as `env_file:` (e.g. a blue/green deploy, which doesn't
-// rewrite the compose file), the file is kept so `compose restart`/`up`
-// keep working, but its mode is tightened to 0600.
+// rewrite the compose file; see syncLegacyEnvFile), the file is kept so
+// `compose restart`/`up` keep working, but its mode is tightened to 0600.
 func cleanupLegacyEnvFile(dir string) error {
 	envPath := filepath.Join(dir, legacyEnvFileName)
 	info, err := os.Lstat(envPath)

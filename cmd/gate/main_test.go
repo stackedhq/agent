@@ -94,7 +94,7 @@ func TestNormalizeHost(t *testing.T) {
 func TestCheckHostVariantsGetLoginRedirect(t *testing.T) {
 	f := newFixture(t)
 	for _, host := range []string{"app.example.com", "APP.EXAMPLE.COM", "app.example.com.", "App.Example.Com.:443"} {
-		rec := f.do(t, checkReq(host, ""))
+		rec := f.do(t, checkReq(host, host))
 		if rec.Code != http.StatusFound {
 			t.Fatalf("host %q: status %d, want 302", host, rec.Code)
 		}
@@ -123,9 +123,58 @@ func TestCheckDomainHeaderWinsOverHost(t *testing.T) {
 	}
 }
 
+// TestCheckRequiresDomainHeader: without X-Stacked-Gate-Domain the gate
+// denies, even when Host names a gated domain.
+func TestCheckRequiresDomainHeader(t *testing.T) {
+	f := newFixture(t)
+	if rec := f.do(t, checkReq(testDomain, "")); rec.Code != http.StatusForbidden {
+		t.Fatalf("check without domain header: status %d, want 403", rec.Code)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/__stacked/login", nil)
+	req.Host = testDomain
+	if rec := f.do(t, req); rec.Code != http.StatusForbidden {
+		t.Fatalf("login page without domain header: status %d, want 403", rec.Code)
+	}
+	post := loginPost(testDomain, "admin", "hunter22", "/", "203.0.113.5")
+	post.Header.Del(DomainHeader)
+	if rec := f.do(t, post); rec.Code != http.StatusForbidden {
+		t.Fatalf("login POST without domain header: status %d, want 403", rec.Code)
+	}
+}
+
+func TestLogoutPostOnly(t *testing.T) {
+	f := newFixture(t)
+	for _, m := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
+		req := httptest.NewRequest(m, "/__stacked/logout", nil)
+		req.Header.Set(DomainHeader, testDomain)
+		rec := f.do(t, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s logout: status %d, want 405", m, rec.Code)
+		}
+		if len(rec.Result().Cookies()) != 0 {
+			t.Fatalf("%s logout cleared the cookie", m)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/__stacked/logout", nil)
+	req.Header.Set(DomainHeader, testDomain)
+	rec := f.do(t, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST logout: status %d, want 303", rec.Code)
+	}
+	cleared := false
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cookieName && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("POST logout did not clear the session cookie")
+	}
+}
+
 func TestCheckUnknownDomainDenied(t *testing.T) {
 	f := newFixture(t)
-	rec := f.do(t, checkReq("unknown.example.com", ""))
+	rec := f.do(t, checkReq("unknown.example.com", "unknown.example.com"))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status %d, want 403", rec.Code)
 	}
@@ -321,6 +370,7 @@ func TestLoginUnknownDomainDenied(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/__stacked/login", nil)
 	req.Host = "unknown.example.com"
+	req.Header.Set(DomainHeader, "unknown.example.com")
 	if rec := f.do(t, req); rec.Code != http.StatusForbidden {
 		t.Fatalf("GET status %d, want 403", rec.Code)
 	}
@@ -331,6 +381,7 @@ func TestLoginPageForHostVariants(t *testing.T) {
 	for _, host := range []string{"APP.EXAMPLE.COM", "app.example.com."} {
 		req := httptest.NewRequest(http.MethodGet, "/__stacked/login?rd=%2Fx", nil)
 		req.Host = host
+		req.Header.Set(DomainHeader, host)
 		rec := f.do(t, req)
 		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Sign in to continue") {
 			t.Fatalf("host %q: status %d", host, rec.Code)
