@@ -628,3 +628,27 @@ func TestHostPathPolicyRejectsParentsOfDeniedRoots(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckResolvedHostPath(t *testing.T) {
+	cases := []struct {
+		clean, resolved string
+		ok              bool
+	}{
+		{"/srv/app", "/srv/app", true},
+		{"/mnt/data", "/var/mnt/data", true},
+		// A top-level symlink pointing at a parent of a denied root.
+		{"/mnt", "/var", false},
+		{"/mnt/lib", "/var/lib", false},
+		{"/data", "/", false},
+		{"/mnt/x", "/etc/x", false},
+		{"/mnt/x", "/var/lib/docker/volumes", false},
+		// Legacy catalog data root stays exempt.
+		{legacyCatalogDataRoot + "/app", legacyCatalogDataRoot + "/app", true},
+	}
+	for _, c := range cases {
+		err := checkResolvedHostPath(c.clean, c.resolved)
+		if (err == nil) != c.ok {
+			t.Errorf("checkResolvedHostPath(%q, %q) = %v, want ok=%v", c.clean, c.resolved, err, c.ok)
+		}
+	}
+}

@@ -1,17 +1,18 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -245,6 +246,27 @@ func (d cachedDomain) isPortBound() bool {
 // agent from booting — Docker may be slow to come up, the proxy may
 // be in a transient bad state, etc. The poller will recover via the
 // next proxy_config or Setup op.
+// StartupProxyReconcileTimeout bounds the startup proxy reconcile so a
+// hung docker daemon can't keep the poller from ever starting.
+const StartupProxyReconcileTimeout = 10 * time.Minute
+
+// ReconcileProxyWithTimeout runs ReconcileProxy as if it were an op with
+// the given deadline: every command it starts is bound to that context
+// and killed when it expires. Must not run concurrently with ops (it
+// installs the package-level op context), so call it before the poller
+// starts.
+func ReconcileProxyWithTimeout(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	restore := setOpContext(ctx)
+	defer restore()
+	err := ReconcileProxy()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("timed out after %s: %w", timeout, ctxErr)
+	}
+	return err
+}
+
 func ReconcileProxy() error {
 	composePath := filepath.Join(proxyDir, "docker-compose.yml")
 	if _, err := os.Stat(composePath); err != nil {
@@ -385,12 +407,15 @@ func ensureProxy() error {
 	return nil
 }
 
+// lookupPortHolder is lookupPortHolderContainer, swappable in tests.
+var lookupPortHolder = lookupPortHolderContainer
+
 // lookupPortHolderContainer asks docker which container publishes the
 // given port on the host, if any. Returns "" if no docker container
 // claims it (the holder might be a systemd service, nginx on the
 // host, etc., in which case we can't name it cheaply).
 func lookupPortHolderContainer(port int) string {
-	out, err := exec.Command("docker", "ps",
+	out, err := opCommand("docker", "ps",
 		"--filter", fmt.Sprintf("publish=%d", port),
 		"--format", "{{.Names}}").Output()
 	if err != nil {
@@ -425,7 +450,7 @@ func parsePortInUseFromDocker(out string) (int, string) {
 	if _, err := fmt.Sscanf(strings.SplitN(out, "0.0.0.0:", 2)[1], "%d", &port); err != nil || port == 0 {
 		return 0, ""
 	}
-	return port, lookupPortHolderContainer(port)
+	return port, lookupPortHolder(port)
 }
 
 // ProxyConfig signature returns a structured result alongside the
@@ -534,7 +559,7 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 	// isn't portable across all Caddy versions.
 	composeFile := filepath.Join(proxyDir, "docker-compose.yml")
 	const candidateInContainer = "/tmp/Caddyfile.candidate"
-	writeCmd := exec.Command(
+	writeCmd := opCommand(
 		"docker", "compose", "-f", composeFile,
 		"exec", "-T", "caddy",
 		"sh", "-c", "cat > "+candidateInContainer,
@@ -546,14 +571,14 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 	// Best-effort cleanup; `/tmp` doesn't survive container restart
 	// anyway, but a tidy `rm` keeps `docker exec ls /tmp` boring.
 	defer func() {
-		_ = exec.Command(
+		_, _ = cleanupCommand(cleanupTimeout,
 			"docker", "compose", "-f", composeFile,
 			"exec", "-T", "caddy",
 			"rm", "-f", candidateInContainer,
-		).Run()
+		)
 	}()
 
-	if err := exec.Command(
+	if err := opCommand(
 		"docker", "compose", "-f", composeFile,
 		"exec", "-T", "caddy",
 		"caddy", "validate", "--config", candidateInContainer,
@@ -568,7 +593,7 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 		return fmt.Errorf("write Caddyfile: %w", err)
 	}
 
-	if err := exec.Command(
+	if err := opCommand(
 		"docker", "compose", "-f", composeFile,
 		"exec", "-T", "caddy",
 		"caddy", "reload", "--config", "/etc/caddy/Caddyfile",
@@ -577,7 +602,9 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 		// (e.g. a runtime cert issue). Restore the previous file so
 		// the next boot reload sees known-good config.
 		if len(prev) > 0 {
-			_ = os.WriteFile(caddyfilePath, prev, 0644)
+			if werr := writeFile(caddyfilePath, string(prev)); werr != nil {
+				log.Printf("restore previous Caddyfile after failed reload: %v", werr)
+			}
 		}
 		return fmt.Errorf("caddy reload: %w", err)
 	}

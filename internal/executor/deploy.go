@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -94,7 +93,7 @@ func (e *Executor) Deploy(op client.Operation) (map[string]interface{}, error) {
 	// Authenticate with GHCR if a registry token was provided
 	if creds.RegistryToken != "" {
 		log.Printf("Logging in to ghcr.io for %s", serviceID)
-		cmd := exec.Command("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
+		cmd := opCommand("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
 		cmd.Stdin = strings.NewReader(creds.RegistryToken)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			log.Printf("GHCR login failed (non-fatal): %s", string(out))

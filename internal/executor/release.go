@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os/exec"
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -90,7 +89,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		streamer.Flush()
 
 		if creds.RegistryToken != "" {
-			cmd := exec.Command("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
+			cmd := opCommand("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
 			cmd.Stdin = strings.NewReader(creds.RegistryToken)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				log.Printf("ghcr login (release) failed (non-fatal): %s", string(out))
@@ -148,7 +147,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 	args = append(args, runEnv.Args(envPath)...)
 	args = append(args, "--name", containerName)
 	args = append(args, jobLabelArgs("release")...)
-	args = append(args, jobResourceArgs(op.Payload)...)
+	args = append(args, jobResourceArgs(op.Payload, defaultReleaseMemoryMB)...)
 	args = append(args, fileMountDockerArgs(fileMounts)...)
 	args = append(args, imageName, "sh", "-lc", releaseCmd)
 	if err := runJobContainer(streamer, dir, runEnv.CommandEnv(), containerName, ReleaseCommandTimeout, args); err != nil {

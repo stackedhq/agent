@@ -128,3 +128,83 @@ func contextWithTimeout(t *testing.T, d time.Duration) context.Context {
 	t.Cleanup(cancel)
 	return ctx
 }
+
+// Cleanup must still run after the op deadline expired, and is bounded by
+// its own timeout.
+func TestCleanupCommandIgnoresExpiredOpContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	restore := setOpContext(ctx)
+	defer restore()
+
+	if _, err := runCommandSilent("", "sh", "-c", "true"); err == nil {
+		t.Fatal("op-bound command should fail under a cancelled op context")
+	}
+	out, err := cleanupCommand(cleanupTimeout, "sh", "-c", "echo cleaned")
+	if err != nil || strings.TrimSpace(out) != "cleaned" {
+		t.Fatalf("cleanupCommand = %q, %v", out, err)
+	}
+
+	start := time.Now()
+	if _, err := cleanupCommand(200*time.Millisecond, "sleep", "10"); err == nil {
+		t.Fatal("cleanupCommand should be killed at its own deadline")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("cleanupCommand took %s past its deadline", elapsed)
+	}
+}
+
+func TestStopCleanupTimeoutCoversGrace(t *testing.T) {
+	if got := stopCleanupTimeout(10); got != 10*time.Second+cleanupTimeout {
+		t.Fatalf("stopCleanupTimeout(10) = %s", got)
+	}
+	if got := stopCleanupTimeout(-5); got != cleanupTimeout {
+		t.Fatalf("stopCleanupTimeout(-5) = %s", got)
+	}
+}
+
+// A handler that never returns after its timeout makes the agent exit so
+// systemd restarts it.
+func TestWaitForHandlerWatchdogExits(t *testing.T) {
+	prevLimit, prevExit := handlerStuckLimit, exitProcess
+	t.Cleanup(func() { handlerStuckLimit, exitProcess = prevLimit, prevExit })
+	handlerStuckLimit = 50 * time.Millisecond
+	codes := make(chan int, 1)
+	exitProcess = func(code int) { codes <- code }
+
+	done := make(chan opOutcome) // never fires
+	returned := make(chan struct{})
+	go func() {
+		waitForHandler(client.Operation{ID: "op-stuck", Type: "deploy"}, done)
+		close(returned)
+	}()
+	select {
+	case code := <-codes:
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchdog did not fire")
+	}
+	<-returned
+}
+
+func TestWaitForHandlerReturnsWhenHandlerFinishes(t *testing.T) {
+	prevExit := exitProcess
+	t.Cleanup(func() { exitProcess = prevExit })
+	exitProcess = func(code int) { t.Errorf("unexpected exit(%d)", code) }
+
+	done := make(chan opOutcome, 1)
+	done <- opOutcome{}
+	waitForHandler(client.Operation{ID: "op-ok", Type: "deploy"}, done)
+}
+
+// The startup reconcile runs under its own deadline and restores the
+// previous op context afterwards.
+func TestReconcileProxyWithTimeoutRestoresOpContext(t *testing.T) {
+	before := currentOpContext()
+	_ = ReconcileProxyWithTimeout(time.Minute)
+	if currentOpContext() != before {
+		t.Fatal("op context not restored")
+	}
+}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,7 +73,7 @@ func dockerNetworkConnectArgs(network, container string) []string {
 }
 
 var dockerNetworkConnect = func(network, container string) error {
-	cmd := exec.Command("docker", dockerNetworkConnectArgs(network, container)...)
+	cmd := opCommand("docker", dockerNetworkConnectArgs(network, container)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -93,7 +92,7 @@ var dockerNetworkConnect = func(network, container string) error {
 // stderr (newlines, the boilerplate "Error response from daemon: " prefix)
 // and fold it into the returned error so the dashboard banner can show it.
 func runDockerInspect(args ...string) (string, error) {
-	cmd := exec.Command("docker", append([]string{"inspect"}, args...)...)
+	cmd := opCommand("docker", append([]string{"inspect"}, args...)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -65,6 +65,12 @@ func (e *Executor) DBMigrate(op client.Operation) error {
 	if srcContainer == "" || tgtContainer == "" {
 		return fail(fmt.Errorf("migration credentials missing container names"))
 	}
+	if err := checkContainerName("source", srcContainer); err != nil {
+		return fail(err)
+	}
+	if err := checkContainerName("target", tgtContainer); err != nil {
+		return fail(err)
+	}
 
 	streamer.AddLine(fmt.Sprintf("Source: %s (Dokploy) → Target: %s (Stacked)", srcContainer, tgtContainer))
 	streamer.Flush()
@@ -81,8 +87,8 @@ func (e *Executor) DBMigrate(op client.Operation) error {
 		return fail(fmt.Errorf("target container %s not running: %w", tgtContainer, err))
 	}
 
-	requiredTool, restoreTool := dumpToolsForEngine(dbType)
-	if err := assertToolInContainer(srcContainer, requiredTool); err != nil {
+	_, restoreTool := dumpToolsForEngine(dbType)
+	if requiredTool, err := assertDumpToolInContainer(dbType, srcContainer); err != nil {
 		return fail(fmt.Errorf("%s not available in source container %s — most often caused by an alpine/slim variant. Re-create the source DB in Dokploy using the non-alpine image, or migrate manually. (%w)", requiredTool, srcContainer, err))
 	}
 	if err := assertToolInContainer(tgtContainer, restoreTool); err != nil {
@@ -446,6 +452,66 @@ func assertContainerRunning(name string) error {
 	return nil
 }
 
+// assertDumpToolInContainer is the pre-flight check for the source-side
+// dump tool. MySQL-family containers may ship `mysqldump` or only
+// `mariadb-dump` (mariadb:11 dropped the mysql* names), so either counts.
+// Returns the tool name for error messages.
+func assertDumpToolInContainer(engine, container string) (string, error) {
+	tool, _ := dumpToolsForEngine(engine)
+	if engine == "mysql" || engine == "mariadb" {
+		found, err := detectMySQLDumpTool(container)
+		if err != nil {
+			return "mysqldump/mariadb-dump", err
+		}
+		return found.name, nil
+	}
+	return tool, assertToolInContainer(container, tool)
+}
+
+// mysqlDumpTool is the dump binary found in a MySQL-family container and
+// whether it is MariaDB's. The zero value is MySQL's `mysqldump`.
+type mysqlDumpTool struct {
+	name    string
+	mariaDB bool
+}
+
+// detectMySQLDumpTool finds the dump binary in container (`mysqldump`,
+// else `mariadb-dump`) and asks it for its version: MariaDB's dump tool
+// rejects MySQL-only flags such as --set-gtid-purged.
+func detectMySQLDumpTool(container string) (mysqlDumpTool, error) {
+	var lastErr error
+	for _, name := range []string{"mysqldump", "mariadb-dump"} {
+		out, err := opCommand("docker", "exec", container, name, "--version").CombinedOutput()
+		if err != nil {
+			lastErr = fmt.Errorf("%s --version: %v: %s", name, err, strings.TrimSpace(string(out)))
+			continue
+		}
+		return mysqlDumpTool{name: name, mariaDB: name == "mariadb-dump" || isMariaDBVersion(string(out))}, nil
+	}
+	return mysqlDumpTool{}, fmt.Errorf("neither mysqldump nor mariadb-dump found inside %s (%v)", container, lastErr)
+}
+
+// isMariaDBVersion reports whether a `mysqldump --version` banner is
+// MariaDB's (e.g. "mysqldump  Ver 10.19 Distrib 10.11.6-MariaDB, ...").
+func isMariaDBVersion(banner string) bool {
+	return strings.Contains(strings.ToLower(banner), "mariadb")
+}
+
+// argv is the dump command line for dbName (without `docker exec`).
+func (t mysqlDumpTool) argv(dbName string) []string {
+	name := t.name
+	if name == "" {
+		name = "mysqldump"
+	}
+	args := []string{name, "-u", "root", "--single-transaction", "--routines", "--triggers"}
+	if !t.mariaDB {
+		// MySQL with GTIDs on would otherwise emit SET @@GLOBAL.GTID_PURGED,
+		// which fails to restore into a server with its own GTID history.
+		args = append(args, "--set-gtid-purged=OFF")
+	}
+	return append(args, dbName)
+}
+
 // assertToolInContainer checks `which <tool>` inside the container.
 // Detects the alpine/slim image footgun before we ever start a destructive
 // drop on the target. Returns an actionable error if the tool is missing.
@@ -536,7 +602,13 @@ func runMigrationPipe(streamer *logs.Streamer, engine, srcContainer, tgtContaine
 		return err
 	}
 	defer cleanupTgt()
-	dump, restore, err := buildPipeArgs(engine, srcContainer, tgtContainer, src, tgt, srcMongoConfig, tgtMongoConfig)
+	var mysqlDump mysqlDumpTool
+	if engine == "mysql" || engine == "mariadb" {
+		if mysqlDump, err = detectMySQLDumpTool(srcContainer); err != nil {
+			return err
+		}
+	}
+	dump, restore, err := buildPipeArgs(engine, srcContainer, tgtContainer, src, tgt, srcMongoConfig, tgtMongoConfig, mysqlDump)
 	if err != nil {
 		return err
 	}
@@ -620,7 +692,7 @@ func runMigrationPipe(streamer *logs.Streamer, engine, srcContainer, tgtContaine
 // buildPipeArgs returns the `docker exec ...` invocations for the
 // source-side dump and the target-side restore for a given engine. For mongo
 // the passwords are in --config files already written into each container.
-func buildPipeArgs(engine, srcContainer, tgtContainer string, src, tgt map[string]string, srcMongoConfig, tgtMongoConfig string) (dockerExec, dockerExec, error) {
+func buildPipeArgs(engine, srcContainer, tgtContainer string, src, tgt map[string]string, srcMongoConfig, tgtMongoConfig string, mysqlDump mysqlDumpTool) (dockerExec, dockerExec, error) {
 	switch engine {
 	case "postgres":
 		if src["user"] == "" || src["dbName"] == "" || tgt["user"] == "" || tgt["dbName"] == "" {
@@ -642,7 +714,7 @@ func buildPipeArgs(engine, srcContainer, tgtContainer string, src, tgt map[strin
 	// The halves are the same commands the backup path uses. For mongo,
 	// --archive (no file arg) streams a single binary archive; there is
 	// no `-t` on docker exec, a pseudo-TTY would corrupt it.
-	dump, err := buildBackupDumpArgs(engine, srcContainer, src, srcMongoConfig)
+	dump, err := buildBackupDumpArgs(engine, srcContainer, src, srcMongoConfig, mysqlDump)
 	if err != nil {
 		return dockerExec{}, dockerExec{}, err
 	}

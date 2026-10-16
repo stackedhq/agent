@@ -26,6 +26,9 @@ const (
 	// streamed lines are dropped (and counted) instead of blocking the
 	// child process.
 	maxBufferedLines = 10000
+	// maxBufferedBytes bounds the same buffer by size: 10000 lines of up
+	// to MaxLineBytes each would otherwise be ~640 MiB.
+	maxBufferedBytes = 4 << 20
 )
 
 // tokenURLPattern matches the `x-access-token:<token>@github.com` shape
@@ -50,7 +53,7 @@ func redactLine(s string) string {
 // Streamer reads lines from an io.Reader and batches them to the Stacked API.
 //
 // Reading never waits on the network: Stream only appends to an in-memory
-// buffer (bounded, see maxBufferedLines) and a separate goroutine does the
+// buffer (bounded, see maxBufferedLines / maxBufferedBytes) and a separate goroutine does the
 // HTTP sends. A child process writing to the pipe therefore never blocks
 // because the server is slow, and an over-long line is truncated instead of
 // stopping the reader.
@@ -59,7 +62,9 @@ type Streamer struct {
 	operationID string
 	mu          sync.Mutex
 	buffer      []string
-	progress    *int
+	// bufferedBytes is the total length of the lines in buffer.
+	bufferedBytes int
+	progress      *int
 	// dropped counts streamed lines discarded because the buffer was full.
 	dropped int
 	// sendMu serialises sends so batches reach the server in order.
@@ -85,6 +90,7 @@ func (s *Streamer) AddLine(msg string) {
 	line := "[" + time.Now().UTC().Format("15:04:05") + "] " + redactLine(msg)
 	s.mu.Lock()
 	s.buffer = append(s.buffer, line)
+	s.bufferedBytes += len(line)
 	s.mu.Unlock()
 }
 
@@ -114,12 +120,13 @@ func (s *Streamer) Stream(r io.Reader) {
 	_ = ReadLines(r, MaxLineBytes, func(text string) {
 		line := "[" + time.Now().UTC().Format("15:04:05") + "] " + redactLine(text)
 		s.mu.Lock()
-		if len(s.buffer) >= maxBufferedLines {
+		if len(s.buffer) >= maxBufferedLines || s.bufferedBytes+len(line) > maxBufferedBytes {
 			s.dropped++
 			s.mu.Unlock()
 			return
 		}
 		s.buffer = append(s.buffer, line)
+		s.bufferedBytes += len(line)
 		shouldFlush := len(s.buffer) >= maxBatchSize
 		s.mu.Unlock()
 
@@ -158,6 +165,7 @@ func (s *Streamer) flush() {
 	}
 	lines := s.buffer
 	s.buffer = nil
+	s.bufferedBytes = 0
 	progress := s.progress
 	// Clear progress after capturing so we don't re-send the same value
 	s.progress = nil

@@ -438,16 +438,31 @@ func rejectCustomPathSymlinks(clean string) error {
 		}
 		existing = current
 	}
-	// Policy applies to where the path really lands, not just its spelling.
-	resolved, err := filepath.EvalSymlinks(existing)
+	// Policy applies to where the path really lands, not just its spelling:
+	// the resolved existing prefix plus the components still to be created.
+	resolvedExisting, err := filepath.EvalSymlinks(existing)
 	if err != nil {
 		return err
 	}
-	if resolved == "/" && existing != "/" {
+	resolved := filepath.Join(resolvedExisting, strings.TrimPrefix(clean, existing))
+	return checkResolvedHostPath(clean, resolved)
+}
+
+// checkResolvedHostPath applies the host path policy to where clean really
+// lands (resolved): not the root, not inside a denied root, and not a
+// parent of one. The legacy catalog data root keeps its exemption.
+func checkResolvedHostPath(clean, resolved string) error {
+	if resolved == "/" && clean != "/" {
 		return fmt.Errorf("host path %s resolves to /", clean)
 	}
-	if denied := deniedHostRoot(resolved); denied != "" && !pathAtOrUnder(clean, legacyCatalogDataRoot) {
+	if pathAtOrUnder(clean, legacyCatalogDataRoot) {
+		return nil
+	}
+	if denied := deniedHostRoot(resolved); denied != "" {
 		return fmt.Errorf("host path %s resolves inside %s", clean, denied)
+	}
+	if contained := deniedRootUnder(resolved); contained != "" {
+		return fmt.Errorf("host path %s resolves to %s, which contains the system path %s", clean, resolved, contained)
 	}
 	return nil
 }

@@ -53,6 +53,9 @@ func (e *Executor) Backup(op client.Operation) error {
 	}
 	container := creds.ContainerName
 	engine := creds.Engine
+	if err := checkContainerName("database", container); err != nil {
+		return fail(err)
+	}
 
 	streamer.AddLine(fmt.Sprintf("Backing up %s container %s", engine, container))
 	streamer.Flush()
@@ -60,8 +63,7 @@ func (e *Executor) Backup(op client.Operation) error {
 	if err := assertContainerRunning(container); err != nil {
 		return fail(fmt.Errorf("container %s not running: %w", container, err))
 	}
-	dumpTool, _ := dumpToolsForEngine(engine)
-	if err := assertToolInContainer(container, dumpTool); err != nil {
+	if dumpTool, err := assertDumpToolInContainer(engine, container); err != nil {
 		return fail(fmt.Errorf("%s not available in container %s: %w", dumpTool, container, err))
 	}
 
@@ -111,12 +113,15 @@ func (e *Executor) Restore(op client.Operation) error {
 	}
 	container := creds.ContainerName
 	engine := creds.Engine
+	if err := checkContainerName("database", container); err != nil {
+		return fail(err)
+	}
 
 	if err := assertContainerRunning(container); err != nil {
 		return fail(fmt.Errorf("container %s not running: %w", container, err))
 	}
-	dumpTool, restoreTool := dumpToolsForEngine(engine)
-	if err := assertToolInContainer(container, dumpTool); err != nil {
+	_, restoreTool := dumpToolsForEngine(engine)
+	if dumpTool, err := assertDumpToolInContainer(engine, container); err != nil {
 		return fail(fmt.Errorf("%s not available in container %s: %w", dumpTool, container, err))
 	}
 	if err := assertToolInContainer(container, restoreTool); err != nil {
@@ -218,7 +223,13 @@ func dumpToFile(streamer *logs.Streamer, engine, container string, creds map[str
 		return "", 0, "", err
 	}
 	defer cleanupConfig()
-	dump, err := buildBackupDumpArgs(engine, container, creds, mongoConfig)
+	var mysqlDump mysqlDumpTool
+	if engine == "mysql" || engine == "mariadb" {
+		if mysqlDump, err = detectMySQLDumpTool(container); err != nil {
+			return "", 0, "", err
+		}
+	}
+	dump, err := buildBackupDumpArgs(engine, container, creds, mongoConfig, mysqlDump)
 	if err != nil {
 		return "", 0, "", err
 	}
@@ -468,7 +479,10 @@ func prepareMongoConfig(engine, container string, creds map[string]string) (stri
 // engine-appropriate dump that emits the backup bytes on stdout. Mirrors the
 // dump halves of the migration pipeline. Passwords travel in the docker
 // CLI's env (`-e NAME`) or, for mongo, in the --config file at mongoConfig.
-func buildBackupDumpArgs(engine, container string, creds map[string]string, mongoConfig string) (dockerExec, error) {
+//
+// mysqlDump is the detected MySQL-family dump tool (see
+// detectMySQLDumpTool); the zero value is MySQL's mysqldump.
+func buildBackupDumpArgs(engine, container string, creds map[string]string, mongoConfig string, mysqlDump mysqlDumpTool) (dockerExec, error) {
 	switch engine {
 	case "postgres":
 		user := creds["user"]
@@ -486,10 +500,7 @@ func buildBackupDumpArgs(engine, container string, creds map[string]string, mong
 			return dockerExec{}, fmt.Errorf("mysql/mariadb creds incomplete (rootPassword required)")
 		}
 		return newDockerExec(false, container, map[string]string{"MYSQL_PWD": root},
-			"mysqldump", "-u", "root",
-			"--single-transaction", "--routines", "--triggers",
-			"--set-gtid-purged=OFF",
-			dbName,
+			mysqlDump.argv(dbName)...,
 		), nil
 	case "mongo":
 		user := creds["user"]

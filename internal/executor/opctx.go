@@ -66,3 +66,28 @@ func opCommandContext(ctx context.Context, name string, args ...string) *exec.Cm
 	setKillProcessGroup(cmd)
 	return cmd
 }
+
+// cleanupTimeout bounds a best-effort cleanup command (docker rm -f, docker
+// stop, removing a scratch file inside a container).
+const cleanupTimeout = 30 * time.Second
+
+// cleanupCommand runs a best-effort cleanup command under its own deadline,
+// detached from the op context. Cleanup typically runs on a failure path,
+// often because the op deadline already expired; binding it to the op
+// context would make it fail immediately and leave containers behind.
+// Returns the combined output.
+func cleanupCommand(timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := opCommandContext(ctx, name, args...).CombinedOutput()
+	return string(out), err
+}
+
+// stopCleanupTimeout is the deadline for `docker stop --time=graceSec`:
+// the grace window plus the usual cleanup budget.
+func stopCleanupTimeout(graceSec int) time.Duration {
+	if graceSec < 0 {
+		graceSec = 0
+	}
+	return time.Duration(graceSec)*time.Second + cleanupTimeout
+}

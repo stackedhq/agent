@@ -245,3 +245,16 @@ func TestResolveDokployAttachNetwork(t *testing.T) {
 		t.Fatal("must never attach to the gate network")
 	}
 }
+
+func TestCheckContainerName(t *testing.T) {
+	for _, ok := range []string{"stk-db-1", "dokploy-postgres-abc.1.xyz", "a"} {
+		if err := checkContainerName("database", ok); err != nil {
+			t.Errorf("checkContainerName(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "-it", "--privileged", "a b", "a;rm", "$(id)"} {
+		if err := checkContainerName("database", bad); err == nil {
+			t.Errorf("checkContainerName(%q) accepted", bad)
+		}
+	}
+}

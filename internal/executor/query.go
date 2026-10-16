@@ -15,6 +15,10 @@ import (
 const (
 	maxQueryRows  = 1000
 	maxQueryBytes = 1_000_000
+	// queryWallTimeout bounds the whole `docker exec psql` call. The
+	// script's statement_timeout (10s) normally fires first; this is the
+	// backstop for connection or exec stalls.
+	queryWallTimeout = 12 * time.Second
 )
 
 // QueryDatabase runs one SELECT in a read-only transaction. SQL is passed to
@@ -32,6 +36,9 @@ func (e *Executor) QueryDatabase(op client.Operation) (map[string]interface{}, e
 	if query.ContainerName == "" || user == "" || dbName == "" {
 		return nil, fmt.Errorf("query credentials incomplete")
 	}
+	if err := checkContainerName("database", query.ContainerName); err != nil {
+		return nil, err
+	}
 	return runReadOnlyQuery(query.ContainerName, user, dbName, query.Query)
 }
 
@@ -44,7 +51,7 @@ func runReadOnlyQuery(container, user, dbName, sql string) (map[string]interface
 	// COPY yields machine-readable CSV only; BEGIN/ROLLBACK are quiet. A
 	// read-only transaction, lock timeout, and wall timeout bound impact even
 	// if a syntactically valid SELECT is unexpectedly expensive.
-	ctx, cancel := context.WithTimeout(currentOpContext(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(currentOpContext(), queryWallTimeout)
 	defer cancel()
 	cmd := opCommandContext(ctx, "docker", readOnlyQueryArgs(container, user, dbName)...)
 	cmd.Env = append(os.Environ(), readOnlyPGOptions)
@@ -73,8 +80,11 @@ func runReadOnlyQuery(container, user, dbName, sql string) (map[string]interface
 	_, _ = io.Copy(io.Discard, stdout)
 	stderrBytes := <-stderrCh
 	waitErr := cmd.Wait()
-	if ctx.Err() == context.DeadlineExceeded {
-		return nil, fmt.Errorf("query timed out after 10 seconds")
+	if ctx.Err() != nil {
+		if currentOpContext().Err() != nil {
+			return nil, fmt.Errorf("query stopped: operation deadline reached")
+		}
+		return nil, fmt.Errorf("query timed out after %s", queryWallTimeout)
 	}
 	if parseErr != nil {
 		return nil, parseErr
