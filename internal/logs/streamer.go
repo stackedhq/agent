@@ -2,10 +2,13 @@ package logs
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
 	"regexp"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 )
@@ -13,6 +16,16 @@ import (
 const (
 	flushInterval = 1 * time.Second
 	maxBatchSize  = 50
+
+	// MaxLineBytes caps one log line. The server keeps only the last
+	// ~512 KiB of an operation's log, so longer lines are noise.
+	MaxLineBytes = 64 << 10
+	// readChunkBytes is the bufio buffer used by ReadLines.
+	readChunkBytes = 64 << 10
+	// maxBufferedLines bounds memory while the server is slow; further
+	// streamed lines are dropped (and counted) instead of blocking the
+	// child process.
+	maxBufferedLines = 10000
 )
 
 // tokenURLPattern matches the `x-access-token:<token>@github.com` shape
@@ -35,12 +48,22 @@ func redactLine(s string) string {
 }
 
 // Streamer reads lines from an io.Reader and batches them to the Stacked API.
+//
+// Reading never waits on the network: Stream only appends to an in-memory
+// buffer (bounded, see maxBufferedLines) and a separate goroutine does the
+// HTTP sends. A child process writing to the pipe therefore never blocks
+// because the server is slow, and an over-long line is truncated instead of
+// stopping the reader.
 type Streamer struct {
 	client      *client.Client
 	operationID string
 	mu          sync.Mutex
 	buffer      []string
 	progress    *int
+	// dropped counts streamed lines discarded because the buffer was full.
+	dropped int
+	// sendMu serialises sends so batches reach the server in order.
+	sendMu sync.Mutex
 }
 
 func NewStreamer(c *client.Client, operationID string) *Streamer {
@@ -66,19 +89,21 @@ func (s *Streamer) AddLine(msg string) {
 }
 
 // Stream reads lines from r, batching and sending them to the server.
-// Blocks until r is closed/EOF. Call Flush() after to send remaining lines.
+// Blocks until r is closed/EOF (or fails, in which case the rest of r is
+// drained). Call Flush() after to send remaining lines.
 func (s *Streamer) Stream(r io.Reader) {
-	scanner := bufio.NewScanner(r)
-
-	ticker := time.NewTicker(flushInterval)
-	defer ticker.Stop()
-
-	// Flush on timer in background
+	kick := make(chan struct{}, 1)
 	done := make(chan struct{})
+	flusherDone := make(chan struct{})
 	go func() {
+		defer close(flusherDone)
+		ticker := time.NewTicker(flushInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
+				s.flush()
+			case <-kick:
 				s.flush()
 			case <-done:
 				return
@@ -86,19 +111,30 @@ func (s *Streamer) Stream(r io.Reader) {
 		}
 	}()
 
-	for scanner.Scan() {
-		line := "[" + time.Now().UTC().Format("15:04:05") + "] " + redactLine(scanner.Text())
+	_ = ReadLines(r, MaxLineBytes, func(text string) {
+		line := "[" + time.Now().UTC().Format("15:04:05") + "] " + redactLine(text)
 		s.mu.Lock()
+		if len(s.buffer) >= maxBufferedLines {
+			s.dropped++
+			s.mu.Unlock()
+			return
+		}
 		s.buffer = append(s.buffer, line)
 		shouldFlush := len(s.buffer) >= maxBatchSize
 		s.mu.Unlock()
 
 		if shouldFlush {
-			s.flush()
+			// Never block the reader on a send: the flusher picks
+			// this up as soon as its current send finishes.
+			select {
+			case kick <- struct{}{}:
+			default:
+			}
 		}
-	}
+	})
 
 	close(done)
+	<-flusherDone
 }
 
 // Flush sends any remaining buffered lines to the server.
@@ -107,7 +143,15 @@ func (s *Streamer) Flush() {
 }
 
 func (s *Streamer) flush() {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
 	s.mu.Lock()
+	if s.dropped > 0 {
+		s.buffer = append(s.buffer, fmt.Sprintf("[%s] [stacked] %d log lines dropped: output arrived faster than it could be uploaded",
+			time.Now().UTC().Format("15:04:05"), s.dropped))
+		s.dropped = 0
+	}
 	if len(s.buffer) == 0 && s.progress == nil {
 		s.mu.Unlock()
 		return
@@ -119,6 +163,76 @@ func (s *Streamer) flush() {
 	s.progress = nil
 	s.mu.Unlock()
 
+	if s.client == nil {
+		return
+	}
 	// Best-effort send — don't block on failure
 	_ = s.client.SendLogs(s.operationID, lines, progress)
+}
+
+// ReadLines calls fn for every line of r (without the trailing "\n" or
+// "\r\n"). A line longer than maxLen bytes is cut at a UTF-8 boundary and
+// gets a truncation marker; the rest of it is discarded without being
+// buffered, so a child that prints megabytes without a newline can't make
+// the reader stop. If reading fails, the remainder of r is drained to
+// io.Discard so the writer is never left blocked on a full pipe, and the
+// read error is returned. EOF returns nil.
+func ReadLines(r io.Reader, maxLen int, fn func(string)) error {
+	if maxLen <= 0 {
+		maxLen = MaxLineBytes
+	}
+	br := bufio.NewReaderSize(r, readChunkBytes)
+	var line []byte
+	skipped := 0
+	emit := func() {
+		text := string(line)
+		if skipped > 0 {
+			text += fmt.Sprintf(" … [line truncated, %d more bytes]", skipped)
+		}
+		fn(text)
+		line = line[:0]
+		skipped = 0
+	}
+	for {
+		chunk, err := br.ReadSlice('\n')
+		complete := err == nil
+		if complete {
+			chunk = chunk[:len(chunk)-1]
+			if n := len(chunk); n > 0 && chunk[n-1] == '\r' {
+				chunk = chunk[:n-1]
+			}
+		}
+		if len(chunk) > 0 {
+			room := maxLen - len(line)
+			if skipped > 0 || room <= 0 {
+				skipped += len(chunk)
+			} else if len(chunk) <= room {
+				line = append(line, chunk...)
+			} else {
+				cut := room
+				for cut > 0 && !utf8.RuneStart(chunk[cut]) {
+					cut--
+				}
+				line = append(line, chunk[:cut]...)
+				skipped += len(chunk) - cut
+			}
+		}
+		switch {
+		case complete:
+			emit()
+		case errors.Is(err, bufio.ErrBufferFull):
+			// Mid-line; keep reading.
+		case errors.Is(err, io.EOF):
+			if len(line) > 0 || skipped > 0 {
+				emit()
+			}
+			return nil
+		default:
+			if len(line) > 0 || skipped > 0 {
+				emit()
+			}
+			_, _ = io.Copy(io.Discard, r)
+			return err
+		}
+	}
 }

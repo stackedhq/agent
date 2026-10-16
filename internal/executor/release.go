@@ -138,16 +138,20 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 
 	// `--rm` so the container doesn't pile up. `--network=stacked` lets
 	// the command reach managed databases. `sh -lc` so users can write
-	// shell pipelines / && chains naturally.
+	// shell pipelines / && chains naturally. Labels, resource caps and the
+	// 30-minute deadline come from jobs.go.
 	args := []string{
 		"run", "--rm",
 		"--network=stacked",
 	}
+	containerName := serviceID + "-release"
 	args = append(args, runEnv.Args(envPath)...)
-	args = append(args, "--name", serviceID+"-release")
+	args = append(args, "--name", containerName)
+	args = append(args, jobLabelArgs("release")...)
+	args = append(args, jobResourceArgs(op.Payload)...)
 	args = append(args, fileMountDockerArgs(fileMounts)...)
 	args = append(args, imageName, "sh", "-lc", releaseCmd)
-	if err := e.runCommandWithStreamerEnv(streamer, dir, runEnv.CommandEnv(), "docker", args...); err != nil {
+	if err := runJobContainer(streamer, dir, runEnv.CommandEnv(), containerName, ReleaseCommandTimeout, args); err != nil {
 		return fail(fmt.Errorf("release command failed: %w", err))
 	}
 

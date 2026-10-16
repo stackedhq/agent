@@ -1,11 +1,9 @@
 package executor
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -114,13 +112,26 @@ func (e *Executor) DBMigrate(op client.Operation) error {
 	return nil
 }
 
-// VolumeMigrate copies the contents of a Dokploy bind-mount host path into
-// a Stacked service's host path. Runs an `alpine` sidecar with `cp -a` so
-// we don't depend on rsync being installed on the host — alpine is small
-// (~5MB) and provides POSIX `cp` with archive semantics.
+// VolumeMigrate copies the contents of a Dokploy volume or config path into
+// a Stacked service's managed host path. The copy runs in a short-lived
+// alpine container with `cp -a`, so we don't depend on rsync on the host and
+// can read data the (non-root) agent user can't.
 //
-// Source contents are read-only (mounted ro). Target is recreated on every
-// run for idempotent retries.
+// Hardening:
+//   - the source must be under /etc/dokploy or a docker volume's _data dir
+//     (migrateSourceRoots); the target must be inside the managed root;
+//   - only the fixed allowlisted root is bind-mounted (read-only), and the
+//     path below it is walked inside the container, refusing any symlink
+//     component. Inside the container a symlink can only resolve within the
+//     container's own filesystem, never to arbitrary host paths, which a
+//     bind mount of the raw source path would allow (the daemon resolves
+//     symlinks on the host);
+//   - the container runs as root, because Dokploy data is typically owned
+//     by root or a container uid with 0700 dirs and `cp -a` must preserve
+//     ownership. It gets only the capabilities cp needs (CHOWN,
+//     DAC_OVERRIDE, FOWNER, FSETID), no network and no-new-privileges.
+//
+// Target contents are replaced on every run for idempotent retries.
 func (e *Executor) VolumeMigrate(op client.Operation) error {
 	srcPath := getStringPayload(op.Payload, "sourceVolumePath")
 	tgtPath := getStringPayload(op.Payload, "targetVolumePath")
@@ -138,66 +149,39 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 	}
 	srcPath = cleanSrcPath
 	tgtPath = cleanTgtPath
+	srcMount, srcRel, err := migrateSourceMount(srcPath)
+	if err != nil {
+		return fail(err)
+	}
 
 	streamer.SetProgress(0)
 	streamer.AddLine(fmt.Sprintf("Volume copy: %s → %s", srcPath, tgtPath))
 	streamer.Flush()
 
-	// Source must exist; missing source is a hard error (likely indicates
-	// the Dokploy mount path was guessed rather than read from a real
-	// bind mount).
-	srcInfo, err := os.Stat(srcPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fail(fmt.Errorf("source path %s does not exist on host; cannot migrate volume contents", srcPath))
-		}
-		return fail(fmt.Errorf("stat source %s: %w", srcPath, err))
+	// Host-side symlink checks. The source walk is best effort (the agent
+	// user often can't traverse /var/lib/docker); the in-container walk
+	// below is authoritative. The target is agent-owned, so it is strict.
+	if err := rejectSymlinksInPath(srcPath, true); err != nil {
+		return fail(fmt.Errorf("source %s: %w", srcPath, err))
 	}
-	if !srcInfo.IsDir() {
-		// Single-file mount: copy the file directly.
-		streamer.AddLine("Source is a single file; copying directly.")
-		streamer.Flush()
-		if err := ensureDir(filepath.Dir(tgtPath)); err != nil {
-			return fail(fmt.Errorf("ensure target parent dir: %w", err))
-		}
-		if err := copyFile(srcPath, tgtPath); err != nil {
-			return fail(fmt.Errorf("copy file: %w", err))
-		}
-		streamer.SetProgress(100)
-		streamer.AddLine("Volume file copy complete.")
-		streamer.Flush()
-		return nil
+	if err := rejectSymlinksInPath(tgtPath, false); err != nil {
+		return fail(fmt.Errorf("target %s: %w", tgtPath, err))
 	}
-
-	// Reset target dir before copying so retries always start clean.
-	streamer.SetProgress(10)
-	if _, err := os.Stat(tgtPath); err == nil {
-		streamer.AddLine("Clearing existing target directory…")
-		streamer.Flush()
-		if err := os.RemoveAll(tgtPath); err != nil {
-			return fail(fmt.Errorf("clear target %s: %w", tgtPath, err))
-		}
+	tgtParent := filepath.Dir(tgtPath)
+	if err := ensureDir(tgtParent); err != nil {
+		return fail(fmt.Errorf("create target parent dir: %w", err))
 	}
-	if err := ensureDir(tgtPath); err != nil {
-		return fail(fmt.Errorf("create target dir: %w", err))
+	if err := rejectSymlinksInPath(tgtParent, false); err != nil {
+		return fail(fmt.Errorf("target %s: %w", tgtParent, err))
 	}
 
 	streamer.SetProgress(25)
-	streamer.AddLine("Running alpine sidecar with `cp -a` to preserve perms/ownership…")
+	streamer.AddLine("Copying with `cp -a` to preserve perms/ownership…")
 	streamer.Flush()
 
-	// `cp -a` preserves mode, ownership, timestamps, symlinks. The `/.`
-	// at the end of the source ensures we copy *contents* not the dir
-	// itself (idempotent against re-runs).
-	args := []string{
-		"run", "--rm",
-		"-v", srcPath + ":/src:ro",
-		"-v", tgtPath + ":/dst",
-		"alpine:3.20",
-		"sh", "-c", "cp -a /src/. /dst/",
-	}
+	args := volumeMigrateDockerArgs(srcMount, srcRel, tgtParent, filepath.Base(tgtPath))
 	if err := e.runCommandWithStreamer(streamer, "", "docker", args...); err != nil {
-		return fail(fmt.Errorf("alpine cp: %w", err))
+		return fail(fmt.Errorf("volume copy: %w", err))
 	}
 
 	streamer.SetProgress(100)
@@ -206,12 +190,136 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 	return nil
 }
 
+// migrateHelperImage runs the volume copy. Pinned by digest.
+// Tag: alpine:3.20 (multi-arch index digest).
+const migrateHelperImage = "alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+
+// volumeMigrateScript runs inside the helper container. $1 is the source
+// path relative to /src ("." for /src itself), $2 the target name inside
+// /dst. Every source component is checked with `-L` before use; `set -f`
+// stops the IFS split from globbing.
+const volumeMigrateScript = `set -euf
+rel="$1"
+name="$2"
+src=/src
+if [ "$rel" != "." ]; then
+  IFS=/
+  for part in $rel; do
+    [ -n "$part" ] || continue
+    src="$src/$part"
+    if [ -L "$src" ]; then
+      echo "stacked: refusing to copy: source path component '$part' is a symlink" >&2
+      exit 3
+    fi
+  done
+  unset IFS
+fi
+dst="/dst/$name"
+if [ -d "$src" ]; then
+  rm -rf -- "$dst"
+  mkdir -- "$dst"
+  cp -a -- "$src/." "$dst/"
+elif [ -f "$src" ]; then
+  rm -rf -- "$dst"
+  cp -a -- "$src" "$dst"
+else
+  echo "stacked: source path does not exist on host (or is not a file or directory); cannot migrate volume contents" >&2
+  exit 4
+fi
+`
+
+// volumeMigrateDockerArgs builds the helper `docker run`. The source root is
+// mounted read-only; the target's parent is the only writable mount.
+func volumeMigrateDockerArgs(srcMount, srcRel, tgtParent, tgtName string) []string {
+	return []string{
+		"run", "--rm",
+		"--network", "none",
+		"--cap-drop", "ALL",
+		"--cap-add", "CHOWN",
+		"--cap-add", "DAC_OVERRIDE",
+		"--cap-add", "FOWNER",
+		"--cap-add", "FSETID",
+		"--security-opt", "no-new-privileges",
+		"--label", "com.stacked.kind=job",
+		"--label", "com.stacked.job=volume-migrate",
+		"--mount", "type=bind,source=" + srcMount + ",target=/src,readonly",
+		"--mount", "type=bind,source=" + tgtParent + ",target=/dst",
+		migrateHelperImage,
+		"sh", "-c", volumeMigrateScript, "sh", srcRel, tgtName,
+	}
+}
+
+// migrateSourceRoots are the only places volume_migrate copies from: Dokploy's
+// config/files tree and docker named-volume data.
+const (
+	dokployConfigRoot = "/etc/dokploy"
+	dockerVolumesRoot = "/var/lib/docker/volumes"
+)
+
+// migrateSourceMount splits a cleaned source path into the fixed directory
+// to bind-mount and the path below it. Docker volumes mount their `_data`
+// dir (`<root>/<name>/_data`), which only root on the host can replace;
+// Dokploy paths mount /etc/dokploy.
+func migrateSourceMount(src string) (mount, rel string, err error) {
+	switch {
+	case pathStrictlyUnder(src, dockerVolumesRoot):
+		parts := strings.Split(strings.TrimPrefix(src, dockerVolumesRoot+"/"), "/")
+		if len(parts) < 2 || parts[1] != "_data" || parts[0] == "" {
+			return "", "", fmt.Errorf("volume_migrate source %s must be inside a docker volume's _data directory", src)
+		}
+		mount = filepath.Join(dockerVolumesRoot, parts[0], "_data")
+		rel = strings.Join(parts[2:], "/")
+	case pathStrictlyUnder(src, dokployConfigRoot):
+		mount = dokployConfigRoot
+		rel = strings.TrimPrefix(src, dokployConfigRoot+"/")
+	default:
+		return "", "", fmt.Errorf("volume_migrate source %s is outside the allowed roots (%s, %s/<volume>/_data)", src, dokployConfigRoot, dockerVolumesRoot)
+	}
+	if rel == "" {
+		rel = "."
+	}
+	return mount, rel, nil
+}
+
+func pathStrictlyUnder(path, root string) bool {
+	return strings.HasPrefix(path, root+"/") && len(path) > len(root)+1
+}
+
+// rejectSymlinksInPath Lstat-walks every existing component of an absolute
+// path and fails on a symlink. A missing component ends the walk (it will be
+// created, or the copy reports it). With bestEffort, a component the agent
+// may not stat (EACCES) also ends the walk instead of failing.
+func rejectSymlinksInPath(path string, bestEffort bool) error {
+	current := "/"
+	for _, part := range strings.Split(strings.TrimPrefix(filepath.Clean(path), "/"), "/") {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			if bestEffort && os.IsPermission(err) {
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path component %s is a symlink", current)
+		}
+	}
+	return nil
+}
+
 // validateMigratePaths returns cleaned source and target paths after
 // enforcing the agent-side security boundary for volume migrations. The
-// source is read-only, so it only needs to be a sane absolute path. The
-// target is destructive (RemoveAll + writable docker mount), so it must stay
-// inside Stacked's managed volume namespace both lexically and after resolving
-// symlinks in the existing path prefix.
+// source must sit under an allowlisted root (migrateSourceMount). The
+// target is destructive (replaced + writable docker mount), so it must stay
+// inside Stacked's managed volume namespace, at least one level below a
+// service dir, both lexically and after resolving symlinks in the existing
+// path prefix.
 func validateMigratePaths(srcPath, tgtPath string) (string, string, error) {
 	return validateMigratePathsWithRoot(srcPath, tgtPath, managedVolumeRoot)
 }
@@ -221,6 +329,9 @@ func validateMigratePathsWithRoot(srcPath, tgtPath, managedRoot string) (string,
 	if err != nil {
 		return "", "", err
 	}
+	if _, _, err := migrateSourceMount(cleanSrc); err != nil {
+		return "", "", err
+	}
 	cleanTgt, err := cleanMigratePath("target", tgtPath)
 	if err != nil {
 		return "", "", err
@@ -228,6 +339,10 @@ func validateMigratePathsWithRoot(srcPath, tgtPath, managedRoot string) (string,
 
 	if !isPathUnderManagedRoot(cleanTgt, managedRoot) {
 		return "", "", fmt.Errorf("volume_migrate target path %s is outside managed volume root %s", cleanTgt, filepath.Clean(managedRoot))
+	}
+	rel, err := filepath.Rel(filepath.Clean(managedRoot), cleanTgt)
+	if err != nil || len(strings.Split(rel, string(os.PathSeparator))) < 2 {
+		return "", "", fmt.Errorf("volume_migrate target path %s must be a volume inside a service directory", cleanTgt)
 	}
 
 	resolvedTarget, err := resolveExistingPathPrefix(cleanTgt)
@@ -321,7 +436,7 @@ func dumpToolsForEngine(engine string) (string, string) {
 // assertContainerRunning confirms a container exists and is in `running` state.
 // Returns a typed error message the pre-flight surface can show verbatim.
 func assertContainerRunning(name string) error {
-	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", name).CombinedOutput()
+	out, err := opCommand("docker", "inspect", "-f", "{{.State.Running}}", name).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker inspect %s: %s", name, strings.TrimSpace(string(out)))
 	}
@@ -338,7 +453,7 @@ func assertToolInContainer(container, tool string) error {
 	if tool == "" {
 		return nil
 	}
-	cmd := exec.Command("docker", "exec", container, "which", tool)
+	cmd := opCommand("docker", "exec", container, "which", tool)
 	out, err := cmd.CombinedOutput()
 	if err != nil || strings.TrimSpace(string(out)) == "" {
 		return fmt.Errorf("`%s` not found inside %s (which exit: %v)", tool, container, err)
@@ -362,17 +477,18 @@ func resetTarget(streamer *logs.Streamer, engine, container string, creds map[st
 		// nuke the target DB itself. Force-drop terminates open conns
 		// (none should be open since the target was just provisioned,
 		// but apps could have raced in).
-		drop := []string{"exec", "-e", "PGPASSWORD=" + password, container,
-			"psql", "-U", user, "-d", "postgres", "-c",
-			fmt.Sprintf(`DROP DATABASE IF EXISTS "%s" WITH (FORCE)`, sqlIdentEscape(dbName))}
-		if out, err := exec.Command("docker", drop...).CombinedOutput(); err != nil {
+		secrets := map[string]string{"PGPASSWORD": password}
+		drop := newDockerExec(false, container, secrets,
+			"psql", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", "postgres", "-c",
+			fmt.Sprintf(`DROP DATABASE IF EXISTS "%s" WITH (FORCE)`, sqlIdentEscape(dbName)))
+		if out, err := drop.Command().CombinedOutput(); err != nil {
 			streamer.AddLine(string(out))
 			return fmt.Errorf("drop database: %w", err)
 		}
-		create := []string{"exec", "-e", "PGPASSWORD=" + password, container,
-			"psql", "-U", user, "-d", "postgres", "-c",
-			fmt.Sprintf(`CREATE DATABASE "%s"`, sqlIdentEscape(dbName))}
-		if out, err := exec.Command("docker", create...).CombinedOutput(); err != nil {
+		create := newDockerExec(false, container, secrets,
+			"psql", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", "postgres", "-c",
+			fmt.Sprintf(`CREATE DATABASE "%s"`, sqlIdentEscape(dbName)))
+		if out, err := create.Command().CombinedOutput(); err != nil {
 			streamer.AddLine(string(out))
 			return fmt.Errorf("create database: %w", err)
 		}
@@ -387,9 +503,9 @@ func resetTarget(streamer *logs.Streamer, engine, container string, creds map[st
 		// MySQL `DROP DATABASE` doesn't have a FORCE; new target should
 		// have zero connections so this is fine.
 		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`; CREATE DATABASE `%s`;", mysqlIdentEscape(dbName), mysqlIdentEscape(dbName))
-		args := []string{"exec", "-e", "MYSQL_PWD=" + root, container,
-			"mysql", "-u", "root", "-e", stmt}
-		if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
+		reset := newDockerExec(false, container, map[string]string{"MYSQL_PWD": root},
+			"mysql", "-u", "root", "-e", stmt)
+		if out, err := reset.Command().CombinedOutput(); err != nil {
 			streamer.AddLine(string(out))
 			return fmt.Errorf("drop+create mysql database: %w", err)
 		}
@@ -410,13 +526,23 @@ func resetTarget(streamer *logs.Streamer, engine, container string, creds map[st
 // io.Pipe and run both halves as goroutines, capturing stderr from each
 // side into the streamer.
 func runMigrationPipe(streamer *logs.Streamer, engine, srcContainer, tgtContainer string, src, tgt map[string]string) error {
-	dumpArgs, restoreArgs, err := buildPipeArgs(engine, srcContainer, tgtContainer, src, tgt)
+	srcMongoConfig, cleanupSrc, err := prepareMongoConfig(engine, srcContainer, src)
+	if err != nil {
+		return err
+	}
+	defer cleanupSrc()
+	tgtMongoConfig, cleanupTgt, err := prepareMongoConfig(engine, tgtContainer, tgt)
+	if err != nil {
+		return err
+	}
+	defer cleanupTgt()
+	dump, restore, err := buildPipeArgs(engine, srcContainer, tgtContainer, src, tgt, srcMongoConfig, tgtMongoConfig)
 	if err != nil {
 		return err
 	}
 
-	dumpCmd := exec.Command("docker", dumpArgs...)
-	restoreCmd := exec.Command("docker", restoreArgs...)
+	dumpCmd := dump.Command()
+	restoreCmd := restore.Command()
 
 	// Connect dump.Stdout → restore.Stdin via OS pipe (cheaper than io.Pipe
 	// because no extra goroutine copy is needed; docker writes directly to
@@ -434,12 +560,22 @@ func runMigrationPipe(streamer *logs.Streamer, engine, srcContainer, tgtContaine
 	restoreStderr, _ := restoreCmd.StderrPipe()
 
 	if err := dumpCmd.Start(); err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
 		return fmt.Errorf("start dump: %w", err)
 	}
+	// The dump child has its own copy of the write end; closing ours now
+	// means restore sees EOF as soon as dump exits.
+	_ = pw.Close()
 	if err := restoreCmd.Start(); err != nil {
+		_ = pr.Close()
 		_ = dumpCmd.Process.Kill()
+		_ = dumpCmd.Wait()
 		return fmt.Errorf("start restore: %w", err)
 	}
+	// Likewise the read end: if restore dies, dump gets EPIPE instead of
+	// blocking on a pipe nobody reads.
+	_ = pr.Close()
 
 	// Stream stderr from both to the log. Tagged so users can tell which
 	// side complained. We use AddLine (not Stream) so the two stderr
@@ -456,12 +592,11 @@ func runMigrationPipe(streamer *logs.Streamer, engine, srcContainer, tgtContaine
 		tailStderr(streamer, "[restore]", restoreStderr)
 	}()
 
-	// IMPORTANT: close the write end after dump finishes so restore sees EOF.
-	dumpErr := dumpCmd.Wait()
-	_ = pw.Close()
-	restoreErr := restoreCmd.Wait()
-	_ = pr.Close()
+	// Readers finish when both processes exit; Wait only after that
+	// (Wait closes the stderr pipes).
 	wg.Wait()
+	dumpErr := dumpCmd.Wait()
+	restoreErr := restoreCmd.Wait()
 
 	// Disambiguate the common SIGPIPE case: when the restore side exits
 	// first (bad creds, target unreachable, OOM, etc.), the OS sends
@@ -482,92 +617,50 @@ func runMigrationPipe(streamer *logs.Streamer, engine, srcContainer, tgtContaine
 	return nil
 }
 
-// buildPipeArgs returns the `docker exec ...` arg lists for the source-side
-// dump and the target-side restore for a given engine.
-func buildPipeArgs(engine, srcContainer, tgtContainer string, src, tgt map[string]string) ([]string, []string, error) {
+// buildPipeArgs returns the `docker exec ...` invocations for the
+// source-side dump and the target-side restore for a given engine. For mongo
+// the passwords are in --config files already written into each container.
+func buildPipeArgs(engine, srcContainer, tgtContainer string, src, tgt map[string]string, srcMongoConfig, tgtMongoConfig string) (dockerExec, dockerExec, error) {
 	switch engine {
 	case "postgres":
-		srcUser := src["user"]
-		srcPw := src["password"]
-		srcDB := src["dbName"]
-		tgtUser := tgt["user"]
-		tgtPw := tgt["password"]
-		tgtDB := tgt["dbName"]
-		if srcUser == "" || srcDB == "" || tgtUser == "" || tgtDB == "" {
-			return nil, nil, fmt.Errorf("postgres creds incomplete")
+		if src["user"] == "" || src["dbName"] == "" || tgt["user"] == "" || tgt["dbName"] == "" {
+			return dockerExec{}, dockerExec{}, fmt.Errorf("postgres creds incomplete")
 		}
-		dump := []string{
-			"exec", "-e", "PGPASSWORD=" + srcPw, srcContainer,
-			"pg_dump", "-U", srcUser, "-d", srcDB, "-Fc", "--no-owner", "--no-privileges",
-		}
-		restore := []string{
-			"exec", "-i", "-e", "PGPASSWORD=" + tgtPw, tgtContainer,
-			"pg_restore", "-U", tgtUser, "-d", tgtDB, "--no-owner", "--no-privileges",
-		}
-		return dump, restore, nil
-
 	case "mysql", "mariadb":
 		// Auth as root on both sides because Dokploy's standard user
 		// often lacks permissions for `--routines --triggers`.
-		srcRoot := src["rootPassword"]
-		srcDB := src["dbName"]
-		tgtRoot := tgt["rootPassword"]
-		tgtDB := tgt["dbName"]
-		if srcRoot == "" || srcDB == "" || tgtRoot == "" || tgtDB == "" {
-			return nil, nil, fmt.Errorf("mysql/mariadb creds incomplete (rootPassword required on both sides)")
+		if src["rootPassword"] == "" || src["dbName"] == "" || tgt["rootPassword"] == "" || tgt["dbName"] == "" {
+			return dockerExec{}, dockerExec{}, fmt.Errorf("mysql/mariadb creds incomplete (rootPassword required on both sides)")
 		}
-		dump := []string{
-			"exec", "-e", "MYSQL_PWD=" + srcRoot, srcContainer,
-			"mysqldump", "-u", "root",
-			"--single-transaction", "--routines", "--triggers",
-			"--set-gtid-purged=OFF",
-			srcDB,
-		}
-		restore := []string{
-			"exec", "-i", "-e", "MYSQL_PWD=" + tgtRoot, tgtContainer,
-			"mysql", "-u", "root", tgtDB,
-		}
-		return dump, restore, nil
-
 	case "mongo":
-		srcUser := src["user"]
-		srcPw := src["password"]
-		tgtUser := tgt["user"]
-		tgtPw := tgt["password"]
-		if srcUser == "" || tgtUser == "" {
-			return nil, nil, fmt.Errorf("mongo creds incomplete")
+		if src["user"] == "" || tgt["user"] == "" {
+			return dockerExec{}, dockerExec{}, fmt.Errorf("mongo creds incomplete")
 		}
-		// --archive (no file arg) emits a single binary archive on stdout.
-		// CRITICAL: no `-t` on docker exec — pseudo-TTY corrupts the archive
-		// bytes. We pass `-i` only.
-		dump := []string{
-			"exec", srcContainer,
-			"mongodump", "--archive",
-			"--username=" + srcUser,
-			"--password=" + srcPw,
-			"--authenticationDatabase=admin",
-		}
-		restore := []string{
-			"exec", "-i", tgtContainer,
-			"mongorestore", "--archive", "--drop",
-			"--username=" + tgtUser,
-			"--password=" + tgtPw,
-			"--authenticationDatabase=admin",
-		}
-		return dump, restore, nil
+	default:
+		return dockerExec{}, dockerExec{}, fmt.Errorf("unsupported engine: %s", engine)
 	}
-	return nil, nil, fmt.Errorf("unsupported engine: %s", engine)
+	// The halves are the same commands the backup path uses. For mongo,
+	// --archive (no file arg) streams a single binary archive; there is
+	// no `-t` on docker exec, a pseudo-TTY would corrupt it.
+	dump, err := buildBackupDumpArgs(engine, srcContainer, src, srcMongoConfig)
+	if err != nil {
+		return dockerExec{}, dockerExec{}, err
+	}
+	restore, err := buildBackupRestoreArgs(engine, tgtContainer, tgt, tgtMongoConfig)
+	if err != nil {
+		return dockerExec{}, dockerExec{}, err
+	}
+	return dump, restore, nil
 }
 
-// tailStderr scans stderr line-by-line and forwards each line to the
-// streamer with a side tag (`[dump]` / `[restore]`) so failures point at
-// the right half of the pipeline.
+// tailStderr forwards stderr line by line to the streamer with a side tag
+// (`[dump]` / `[restore]`) so failures point at the right half of the
+// pipeline. Long lines are truncated and a read error drains the rest, so
+// the child never blocks on a full stderr pipe.
 func tailStderr(streamer *logs.Streamer, tag string, r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		streamer.AddLine(tag + " " + scanner.Text())
-	}
+	_ = logs.ReadLines(r, logs.MaxLineBytes, func(line string) {
+		streamer.AddLine(tag + " " + line)
+	})
 }
 
 // sqlIdentEscape escapes a Postgres identifier for use inside double quotes.
@@ -580,27 +673,4 @@ func sqlIdentEscape(s string) string {
 // mysqlIdentEscape escapes a MySQL identifier for use inside backticks.
 func mysqlIdentEscape(s string) string {
 	return strings.ReplaceAll(s, "`", "``")
-}
-
-// copyFile copies a single file preserving mode. Used by VolumeMigrate
-// when the source is a regular file rather than a directory.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return nil
 }
