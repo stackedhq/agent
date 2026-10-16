@@ -67,7 +67,7 @@ func proxyCompose() string {
 	// host entry but Caddy still starts. We accept that fallback.
 	return fmt.Sprintf(`services:
   caddy:
-    image: caddy:2-alpine
+    image: %[8]s
     restart: unless-stopped
     ports:
       - "80:80"
@@ -82,7 +82,7 @@ func proxyCompose() string {
       - stacked
       - gate
   %[1]s:
-    image: caddy:2-alpine
+    image: %[8]s
     container_name: %[1]s
     entrypoint: ["/stacked-agent", "gate"]
     user: "%[2]d:%[3]d"
@@ -118,5 +118,5 @@ networks:
   gate:
     name: %[7]s
     internal: true
-`, gateServiceName, os.Getuid(), os.Getgid(), heartbeat.Version, agentBinaryPath, gateDir, gateNetworkName)
+`, gateServiceName, os.Getuid(), os.Getgid(), heartbeat.Version, agentBinaryPath, gateDir, gateNetworkName, CaddyImage)
 }

@@ -67,11 +67,11 @@ func TestResolveNetworkAliasesFailsClosedOnDockerError(t *testing.T) {
 }
 
 func TestRenderersSkipReservedAliases(t *testing.T) {
-	nets := renderServiceNetworks([]string{"api", "stacked-gate", "caddy"})
-	if strings.Contains(nets, "stacked-gate") || strings.Contains(nets, "caddy") || !strings.Contains(nets, "- api") {
+	nets := renderYAML(yMap{{Key: "networks", Value: serviceNetworks([]string{"api", "stacked-gate", "caddy"})}})
+	if strings.Contains(nets, "stacked-gate") || strings.Contains(nets, "caddy") || !strings.Contains(nets, `- "api"`) {
 		t.Fatalf("compose networks:\n%s", nets)
 	}
-	args := rollingContainerArgs("svc-blue", "svc", "blue", "img", "/env", resourceLimits{restartPolicy: "unless-stopped"}, []string{"api", "gate"}, "")
+	args := rollingContainerArgs("svc-blue", "svc", "blue", "img", []string{"--env-file", "/env"}, resourceLimits{restartPolicy: "unless-stopped"}, []string{"api", "gate"}, "")
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, "--network-alias=gate") || !strings.Contains(joined, "--network-alias=api") {
 		t.Fatalf("docker run args: %s", joined)
