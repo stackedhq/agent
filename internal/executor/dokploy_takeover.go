@@ -192,20 +192,15 @@ func detectDokployNetwork() string {
 //
 //	{ "network": "<network-name>" }
 //
-// The dashboard sources `network` from a prior probe result so we
-// don't have to redetect here. If the payload omits it we fall back
-// to detection for safety.
+// The dashboard sources `network` from a prior probe result. The agent
+// re-detects the Dokploy network and only attaches Caddy when the
+// payload names exactly that network (or omits it), so the op can't be
+// used to join Caddy to an arbitrary network on the host.
 func (e *Executor) DokployCaddyAttachNetwork(op client.Operation) error {
-	network, _ := op.Payload["network"].(string)
-	network = strings.TrimSpace(network)
-	if network == "" {
-		network = detectDokployNetwork()
-	}
-	if network == "" {
-		return fmt.Errorf("no dokploy overlay network detected on this host")
-	}
-	if !isSafeNetworkName(network) {
-		return fmt.Errorf("unsafe network name: %q", network)
+	requested, _ := op.Payload["network"].(string)
+	network, err := resolveDokployAttachNetwork(strings.TrimSpace(requested), detectDokployNetwork())
+	if err != nil {
+		return err
 	}
 	container, err := stackedCaddyContainerID()
 	if err != nil {
@@ -241,6 +236,9 @@ func (e *Executor) DokployCaddyDetachNetwork(op client.Operation) error {
 	if !isSafeNetworkName(network) {
 		return fmt.Errorf("unsafe network name: %q", network)
 	}
+	if network == "stacked" || network == gateNetworkName {
+		return fmt.Errorf("refusing to detach caddy from its own network %q", network)
+	}
 	container, err := stackedCaddyContainerID()
 	if err != nil {
 		return err
@@ -254,6 +252,25 @@ func (e *Executor) DokployCaddyDetachNetwork(op client.Operation) error {
 	}
 	log.Printf("dokploy_caddy_detach_network: detached caddy from %s", network)
 	return nil
+}
+
+// resolveDokployAttachNetwork picks the network to attach Caddy to.
+// detected is what detectDokployNetwork found on Dokploy's Traefik
+// container; requested is the payload value (may be empty).
+func resolveDokployAttachNetwork(requested, detected string) (string, error) {
+	if detected == "" {
+		return "", fmt.Errorf("no dokploy overlay network detected on this host")
+	}
+	if !isSafeNetworkName(detected) {
+		return "", fmt.Errorf("unsafe network name: %q", detected)
+	}
+	if detected == "stacked" || detected == gateNetworkName {
+		return "", fmt.Errorf("detected dokploy network %q is a stacked network", detected)
+	}
+	if requested != "" && requested != detected {
+		return "", fmt.Errorf("requested network %q is not the dokploy network detected on this host (%q)", requested, detected)
+	}
+	return detected, nil
 }
 
 // stackedCaddyContainerID resolves the Stacked Caddy container ID via

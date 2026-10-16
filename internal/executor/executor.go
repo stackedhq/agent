@@ -30,6 +30,8 @@ func New(c *client.Client) *Executor {
 
 // Execute dispatches an operation to the correct handler based on type.
 func (e *Executor) Execute(op client.Operation) {
+	NoteMachineID(op.MachineID)
+
 	// Report running
 	if err := e.Client.UpdateStatus(op.ID, &client.StatusUpdate{Status: "running"}); err != nil {
 		log.Printf("Failed to report running status for %s: %v", op.ID, err)

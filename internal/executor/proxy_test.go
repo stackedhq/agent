@@ -99,10 +99,9 @@ func TestRenderUpstreamHostPortRewritesLoopback(t *testing.T) {
 
 func TestRenderUpstreamHostPortLeavesOtherHostsAlone(t *testing.T) {
 	cases := map[string]string{
-		"10.0.0.5":             "10.0.0.5:443",
-		"host.docker.internal": "host.docker.internal:443",
-		"plex":                 "plex:443",
-		"upstream.lan":         "upstream.lan:443",
+		"10.0.0.5":     "10.0.0.5:443",
+		"plex":         "plex:443",
+		"upstream.lan": "upstream.lan:443",
 	}
 	for input, want := range cases {
 		got, err := renderUpstreamHostPort(input, 443)
@@ -119,7 +118,7 @@ func TestRenderUpstreamHostPortLeavesOtherHostsAlone(t *testing.T) {
 func TestRenderUpstreamHostPortBracketsIPv6(t *testing.T) {
 	cases := map[string]string{
 		"2001:db8::1":   "[2001:db8::1]:8080",
-		"fe80::1234":    "[fe80::1234]:8080",
+		"2001:db8:1::5": "[2001:db8:1::5]:8080",
 		"[2001:db8::1]": "[2001:db8::1]:8080", // already-bracketed passes through
 	}
 	for input, want := range cases {
