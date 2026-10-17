@@ -213,8 +213,15 @@ func TestDockerMariaDBOps(t *testing.T) {
 }
 
 func TestDockerMySQLOps(t *testing.T) {
+	// The official mysql image's entrypoint pastes MYSQL_*PASSWORD into init
+	// SQL unescaped, so quotes or backslashes break container init. Stacked
+	// generates base64url passwords, so initialise with plain ones; the
+	// rotation below still uses testNewPw, which exercises every special
+	// character through our own escaping.
+	const initPw = "s3cret-Pw-init$x"
+	const initRootPw = "r00t-Pw-init$x"
 	my := startDBContainer(t, "mysql:8.4",
-		map[string]string{"MYSQL_ROOT_PASSWORD": testRootPw, "MYSQL_DATABASE": "appdb", "MYSQL_USER": "app", "MYSQL_PASSWORD": testPw},
+		map[string]string{"MYSQL_ROOT_PASSWORD": initRootPw, "MYSQL_DATABASE": "appdb", "MYSQL_USER": "app", "MYSQL_PASSWORD": initPw},
 		// TCP only answers once the entrypoint's init server (which runs
 		// with --skip-networking) has been replaced by the real one.
 		[]string{"sh", "-c", `mysql -h127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" -e 'select 1' appdb`})
@@ -222,6 +229,8 @@ func TestDockerMySQLOps(t *testing.T) {
 		t.Fatalf("detectMySQLDumpTool(mysql:8.4) = %+v, %v", tool, err)
 	}
 	creds := testCreds()
+	creds["password"] = initPw
+	creds["rootPassword"] = initRootPw
 	sql := func(pw, q string) string {
 		cmd := exec.Command("docker", "exec", "-e", "MYSQL_PWD", my, "mysql", "-uroot", "-N", "-e", q, "appdb")
 		cmd.Env = append(os.Environ(), "MYSQL_PWD="+pw)
@@ -231,9 +240,9 @@ func TestDockerMySQLOps(t *testing.T) {
 		}
 		return strings.TrimSpace(string(out))
 	}
-	sql(testRootPw, "create table t(id int); insert into t values (1),(2);")
-	roundTrip(t, "mysql", my, creds, func() { sql(testRootPw, "delete from t") })
-	if got := sql(testRootPw, "select count(*) from t"); got != "2" {
+	sql(initRootPw, "create table t(id int); insert into t values (1),(2);")
+	roundTrip(t, "mysql", my, creds, func() { sql(initRootPw, "delete from t") })
+	if got := sql(initRootPw, "select count(*) from t"); got != "2" {
 		t.Fatalf("restore lost rows: %q", got)
 	}
 	newRoot := testNewPw + "-root"
