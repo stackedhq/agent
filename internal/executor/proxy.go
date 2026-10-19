@@ -713,7 +713,10 @@ func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot
 			// sidecar (login page, form POST, logout), then forward_auth
 			// everything else through the gate's /check endpoint.
 			b.WriteString("    handle /__stacked/* {\n")
-			b.WriteString("        reverse_proxy gate:9876\n")
+			b.WriteString("        reverse_proxy gate:9876 {\n")
+			b.WriteString("            header_up X-Real-IP {remote_host}\n")
+			b.WriteString("            header_up X-Forwarded-For {remote_host}\n")
+			b.WriteString("        }\n")
 			b.WriteString("    }\n")
 			b.WriteString("    handle {\n")
 			b.WriteString("        forward_auth gate:9876 {\n")
