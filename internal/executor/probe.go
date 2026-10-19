@@ -429,7 +429,10 @@ func containsInt(xs []int, n int) bool {
 // Failures here do not abort the deploy — the container may have started
 // successfully but be listening on a different port. The dashboard turns
 // the result into actionable guidance.
-func (e *Executor) HealthProbe(streamer *logs.Streamer, serviceID string, port int) ProbeResult {
+func (e *Executor) HealthProbe(streamer *logs.Streamer, serviceID, network string, port int) ProbeResult {
+	if network == "" {
+		network = probeNetworkFor(serviceID)
+	}
 	res := ProbeResult{ExposedPorts: []int{}}
 
 	// 1. Read declared ExposedPorts (best-effort).
@@ -463,10 +466,10 @@ func (e *Executor) HealthProbe(streamer *logs.Streamer, serviceID string, port i
 	}
 
 	// 2. TCP-probe the configured port via the container's bridge IP.
-	streamer.AddLine(fmt.Sprintf("Health: probing %s:%d on the stacked network...", serviceID, port))
+	streamer.AddLine(fmt.Sprintf("Health: probing %s:%d on network %s...", serviceID, port, network))
 	streamer.Flush()
 
-	ip, err := containerIPOnNetwork(serviceID, "stacked")
+	ip, err := containerIPOnNetwork(serviceID, network)
 	if err != nil {
 		res.Ok = false
 		res.Error = err.Error()

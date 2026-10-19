@@ -272,6 +272,9 @@ func ensureProxy() error {
 		return fmt.Errorf("start caddy: %s: %w", out, err)
 	}
 
+	// Compose recreate drops extra network attachments. Re-join every
+	// per-service network so Caddy can still reach isolated backends.
+	reconnectProxyServiceNetworks()
 	return nil
 }
 

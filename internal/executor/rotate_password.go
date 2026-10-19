@@ -68,7 +68,7 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 
 	// Step 2: Rewrite docker-compose.yml with new credentials so a future
 	// container restart picks them up from env.
-	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, newCreds, accessMode, bindHost)
+	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, newCreds, accessMode, bindHost, databaseID)
 	if err != nil {
 		return fail(fmt.Errorf("generate compose: %w", err))
 	}

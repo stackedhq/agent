@@ -128,26 +128,17 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		return fail(err)
 	}
 
-	// Make sure the stacked network exists — the migration command may
-	// need to reach the user's database container, which sits on it.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	iso := isolationFromPayload(op.Payload)
+	nets := networkPlanFromPayload(serviceID, op.Payload, creds.NetworkAliases)
 
 	streamer.SetProgress(70)
 	streamer.AddLine("Running release command: " + releaseCmd)
 	streamer.Flush()
 
-	// `--rm` so the container doesn't pile up. `--network=stacked` lets
-	// the command reach managed databases. `sh -lc` so users can write
-	// shell pipelines / && chains naturally.
-	args := []string{
-		"run", "--rm",
-		"--network=stacked",
-		"--env-file=" + envPath,
-		"--name", serviceID + "-release",
-	}
-	args = append(args, fileMountDockerArgs(fileMounts)...)
-	args = append(args, imageName, "sh", "-lc", releaseCmd)
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", args...); err != nil {
+	// One-shot on the service's isolation networks so migrations reach
+	// the same databases as the app. `sh -lc` so users can write shell
+	// pipelines / && chains naturally.
+	if err := e.runOneShotContainer(streamer, dir, serviceID+"-release", imageName, envPath, iso, nets, fileMountDockerArgs(fileMounts), []string{"sh", "-lc", releaseCmd}); err != nil {
 		return fail(fmt.Errorf("release command failed: %w", err))
 	}
 

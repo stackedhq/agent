@@ -75,7 +75,7 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	streamer.AddLine(fmt.Sprintf("Provisioning %s database (%s)", dbType, dockerImage))
 	streamer.Flush()
 
-	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost)
+	compose, err := generateDatabaseCompose(dbType, port, containerName, dockerImage, credentials, accessMode, bindHost, databaseID)
 	if err != nil {
 		return nil, fail(err)
 	}
@@ -84,9 +84,7 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
 
-	// Ensure the stacked network exists. Same idempotent call services use,
-	// so a fresh-host provision works even if `setup` hasn't been re-run.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	ensureNetworkPlan(databaseNetworkPlan(databaseID))
 
 	streamer.SetProgress(20)
 	streamer.AddLine("Pulling image " + dockerImage + "...")
@@ -138,8 +136,7 @@ func (e *Executor) StartDB(op client.Operation) error {
 
 	log.Printf("Starting database %s", databaseID)
 
-	// Ensure the stacked network exists — it vanishes on Docker/machine restart.
-	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
+	ensureNetworkPlan(databaseNetworkPlan(databaseID))
 
 	// `compose start` errors out if the container doesn't exist yet (e.g.
 	// after a manual `docker rm`); fall back to `up -d` which creates it.
@@ -290,8 +287,9 @@ func renderDatabasePorts(accessMode, bindHost string, hostPort, nativePort int) 
 	}
 }
 
-func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string, accessMode, bindHost string) (string, error) {
+func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string, accessMode, bindHost, databaseID string) (string, error) {
 	portsBlock := renderDatabasePorts(accessMode, bindHost, port, databaseNativePort(dbType))
+	tail := renderDatabaseComposeTail(databaseID, portsBlock)
 	switch dbType {
 	case "postgres":
 		user := creds["user"]
@@ -311,19 +309,7 @@ func generateDatabaseCompose(dbType string, port int, containerName, image strin
       POSTGRES_DB: %s
     volumes:
       - data:/var/lib/postgresql/data
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), portsBlock), nil
+%s`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), tail), nil
 
 	case "mysql":
 		user := creds["user"]
@@ -345,19 +331,7 @@ networks:
       MYSQL_PASSWORD: %s
     volumes:
       - data:/var/lib/mysql
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(rootPw), yamlEscape(dbName), yamlEscape(user), yamlEscape(password), portsBlock), nil
+%s`, image, containerName, yamlEscape(rootPw), yamlEscape(dbName), yamlEscape(user), yamlEscape(password), tail), nil
 
 	case "mongo":
 		user := creds["user"]
@@ -377,19 +351,7 @@ networks:
       MONGO_INITDB_DATABASE: %s
     volumes:
       - data:/data/db
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), portsBlock), nil
+%s`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), tail), nil
 
 	case "redis":
 		password := creds["password"]
@@ -407,21 +369,23 @@ networks:
     command: ["redis-server", "--requirepass", %s]
     volumes:
       - data:/data
-%s    networks:
-      - stacked
-    labels:
+%s`, image, containerName, yamlQuote(password), tail), nil
+	}
+	return "", fmt.Errorf("unsupported database type: %s", dbType)
+}
+
+func renderDatabaseComposeTail(databaseID, portsBlock string) string {
+	nets := databaseNetworkPlan(databaseID)
+	return portsBlock +
+		renderComposeIsolation(databaseIsolation()) +
+		renderComposeServiceNetworks(nets) +
+		`    labels:
       com.stacked.kind: database
 
 volumes:
   data:
 
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlQuote(password), portsBlock), nil
-	}
-	return "", fmt.Errorf("unsupported database type: %s", dbType)
+` + renderComposeNetworkDefs(nets)
 }
 
 // yamlEscape returns a YAML-safe form for an environment value. Postgres

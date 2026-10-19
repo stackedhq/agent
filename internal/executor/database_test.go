@@ -38,20 +38,27 @@ func TestGenerateDatabaseComposeAccessModes(t *testing.T) {
 	}
 
 	// internal → compose carries no `ports:` block.
-	internal, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, "internal", "")
+	internal, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, "internal", "", "db-1")
 	if err != nil {
 		t.Fatalf("internal compose: %v", err)
 	}
 	if strings.Contains(internal, "ports:") {
 		t.Errorf("internal database must not publish ports:\n%s", internal)
 	}
-	// Still on the stacked network so links + docker exec keep working.
-	if !strings.Contains(internal, "- stacked") {
+	// Shared `stacked` stays attached so isolationRelaxed services and
+	// docker exec keep working; isolated apps reach DBs via stacked-data.
+	if !strings.Contains(internal, "stacked:") && !strings.Contains(internal, "- stacked") {
 		t.Errorf("expected stacked network membership:\n%s", internal)
+	}
+	if !strings.Contains(internal, "stacked-data") {
+		t.Errorf("expected stacked-data membership:\n%s", internal)
+	}
+	if !strings.Contains(internal, "stacked-db-db-1") {
+		t.Errorf("expected per-database network:\n%s", internal)
 	}
 
 	// public → publishes on 0.0.0.0.
-	public, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, "public", "")
+	public, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, "public", "", "db-1")
 	if err != nil {
 		t.Fatalf("public compose: %v", err)
 	}
@@ -60,7 +67,7 @@ func TestGenerateDatabaseComposeAccessModes(t *testing.T) {
 	}
 
 	// tailnet → bound to the tailscale IP.
-	tailnet, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, "tailnet", "100.64.0.5")
+	tailnet, err := generateDatabaseCompose("postgres", 15432, "postgres-x", "postgres:16", creds, "tailnet", "100.64.0.5", "db-1")
 	if err != nil {
 		t.Fatalf("tailnet compose: %v", err)
 	}
