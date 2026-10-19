@@ -34,9 +34,9 @@ import (
 // inside it (SQLite vs. uploads dir vs. RO config) to know if sharing
 // would be safe.
 func (e *Executor) deployRolling(op client.Operation, streamer *logs.Streamer) (map[string]interface{}, error) {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return nil, fmt.Errorf("rolling deploy requires serviceId in payload")
+	serviceID, err := requireServiceID(op.Payload, "rolling deploy")
+	if err != nil {
+		return nil, err
 	}
 
 	// Parse once — the slice length picks the sub-strategy, and the
@@ -65,7 +65,10 @@ func requiresFastRestart(hasVolumes, hasFileMounts bool) bool {
 // Caddy upstream to the new slot, drains the old slot, and removes it.
 // Failures pre-flip leave the old slot serving untouched.
 func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer, serviceID string) (map[string]interface{}, error) {
-	dir := serviceDir(serviceID)
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return nil, err
+	}
 	if err := ensureDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}
@@ -287,7 +290,10 @@ func blueGreenHeadroomError(liveUsageMB, limitMB int, availMB uint64) error {
 // Failure leaves the user on the new container; if it's broken, they
 // see a clear failure log and can redeploy a known-good image.
 func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streamer, serviceID string) (map[string]interface{}, error) {
-	dir := serviceDir(serviceID)
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return nil, err
+	}
 	if err := ensureDir(dir); err != nil {
 		return nil, fmt.Errorf("create service dir: %w", err)
 	}

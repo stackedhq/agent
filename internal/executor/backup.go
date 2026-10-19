@@ -26,9 +26,12 @@ import (
 // straight to R2 because a presigned single PUT needs a Content-Length up
 // front, and database dumps can be large. The temp file is always removed.
 func (e *Executor) Backup(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_backup")
+	if err != nil {
+		return err
+	}
 	backupID := getStringPayload(op.Payload, "backupId")
-	if databaseID == "" || backupID == "" {
+	if backupID == "" {
 		return fmt.Errorf("db_backup requires databaseId and backupId")
 	}
 
@@ -83,10 +86,13 @@ func (e *Executor) Backup(op client.Operation) error {
 // Same-container restore only: the dump goes back into the same DB it came
 // from. Cross-database restore is intentionally out of scope.
 func (e *Executor) Restore(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_restore")
+	if err != nil {
+		return err
+	}
 	restoreBackupID := getStringPayload(op.Payload, "restoreBackupId")
 	safetyBackupID := getStringPayload(op.Payload, "safetyBackupId")
-	if databaseID == "" || restoreBackupID == "" {
+	if restoreBackupID == "" {
 		return fmt.Errorf("db_restore requires databaseId and restoreBackupId")
 	}
 

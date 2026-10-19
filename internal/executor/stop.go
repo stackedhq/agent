@@ -16,12 +16,15 @@ import (
 // Mirrors StopDB. A missing compose file is treated as success — nothing is
 // running and a later Restart will surface the real error if the dir is gone.
 func (e *Executor) Stop(op client.Operation) error {
-	serviceID := getStringPayload(op.Payload, "serviceId")
-	if serviceID == "" {
-		return fmt.Errorf("stop requires serviceId in payload")
+	serviceID, err := requireServiceID(op.Payload, "stop")
+	if err != nil {
+		return err
 	}
 
-	dir := serviceDir(serviceID)
+	dir, err := serviceDir(serviceID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
 		log.Printf("Stop: no compose file for %s, treating as no-op", serviceID)
 		return nil

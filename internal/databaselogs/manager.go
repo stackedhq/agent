@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/ids"
 )
 
 // Manager owns the set of active Forwarders, one per running Stacked-managed
@@ -130,9 +131,13 @@ func listDatabaseContainers() []containerRow {
 		if len(parts) < 3 {
 			continue
 		}
+		databaseID := parts[1]
+		if !ids.Valid(databaseID) {
+			continue
+		}
 		rows = append(rows, containerRow{
 			id:         parts[0],
-			databaseID: parts[1],
+			databaseID: databaseID,
 			state:      parts[2],
 		})
 	}

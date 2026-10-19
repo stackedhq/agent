@@ -22,7 +22,10 @@ import (
 // (identical to what db_provision/db_set_access produce) and `compose up -d`
 // to reconcile the env vars. The data volume is preserved.
 func (e *Executor) RotatePassword(op client.Operation) error {
-	databaseID := getStringPayload(op.Payload, "databaseId")
+	databaseID, err := requireDatabaseID(op.Payload, "db_rotate_password")
+	if err != nil {
+		return err
+	}
 	dbType := getStringPayload(op.Payload, "dbType")
 	containerName := getStringPayload(op.Payload, "containerName")
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
@@ -32,9 +35,6 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 	oldCreds := getMapPayload(op.Payload, "oldCredentials")
 	newCreds := getMapPayload(op.Payload, "newCredentials")
 
-	if databaseID == "" {
-		return fmt.Errorf("db_rotate_password requires databaseId")
-	}
 	if dbType == "" {
 		return fmt.Errorf("db_rotate_password requires dbType")
 	}
@@ -72,7 +72,10 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 	if err != nil {
 		return fail(fmt.Errorf("generate compose: %w", err))
 	}
-	dir := databaseDir(databaseID)
+	dir, err := databaseDir(databaseID)
+	if err != nil {
+		return fail(err)
+	}
 	composePath := filepath.Join(dir, "docker-compose.yml")
 	if err := writeFile(composePath, compose); err != nil {
 		return fail(fmt.Errorf("write docker-compose.yml: %w", err))

@@ -30,6 +30,8 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+
+	"github.com/stackedapp/stacked/agent/internal/ids"
 )
 
 // Slot is the stable identifier for one of the two rolling-deploy slots.
@@ -169,6 +171,9 @@ func All() map[string]Slot {
 // time, after Caddy has been reloaded onto the new upstream and the new
 // container has passed health gating. Idempotent.
 func SetActive(serviceID string, slot Slot) error {
+	if err := ids.Validate(serviceID); err != nil {
+		return fmt.Errorf("invalid serviceId: %w", err)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	m, err := readAll()
@@ -183,6 +188,9 @@ func SetActive(serviceID string, slot Slot) error {
 // or when the user flips a service back from rolling to recreate (so the
 // next deploy resumes the legacy <serviceID> container_name shape).
 func Clear(serviceID string) error {
+	if err := ids.Validate(serviceID); err != nil {
+		return fmt.Errorf("invalid serviceId: %w", err)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	m, err := readAll()
