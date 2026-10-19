@@ -1,0 +1,26 @@
+[Unit]
+Description=Stacked Agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=stacked
+Group=stacked
+WorkingDirectory=/opt/stacked
+ExecStart=/usr/local/bin/stacked-agent
+Restart=always
+RestartSec=5
+Environment=STACKED_CONFIG=/opt/stacked/agent.toml
+UMask=0077
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/stacked
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

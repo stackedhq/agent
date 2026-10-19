@@ -73,8 +73,11 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 		return fail(fmt.Errorf("generate compose: %w", err))
 	}
 	dir := databaseDir(databaseID)
+	if err := ensureSecretDir(dir); err != nil {
+		return fail(fmt.Errorf("create database dir: %w", err))
+	}
 	composePath := filepath.Join(dir, "docker-compose.yml")
-	if err := writeFile(composePath, compose); err != nil {
+	if err := writeSecretFile(composePath, compose); err != nil {
 		return fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
 

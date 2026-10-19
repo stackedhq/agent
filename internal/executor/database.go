@@ -60,7 +60,7 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	}
 
 	dir := databaseDir(databaseID)
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return nil, fmt.Errorf("create database dir: %w", err)
 	}
 
@@ -80,7 +80,7 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 		return nil, fail(err)
 	}
 	composePath := filepath.Join(dir, "docker-compose.yml")
-	if err := writeFile(composePath, compose); err != nil {
+	if err := writeSecretFile(composePath, compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
 	}
 

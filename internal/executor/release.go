@@ -73,7 +73,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 	// the build is identical to what the deploy op will do, and docker's
 	// layer cache makes the second build (in the deploy op) ~instant.
 	dir := serviceDir(serviceID)
-	if err := ensureDir(dir); err != nil {
+	if err := ensureSecretDir(dir); err != nil {
 		return fail(fmt.Errorf("create service dir: %w", err))
 	}
 
@@ -117,7 +117,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
 	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
+	if err := writeSecretFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
 		return fail(fmt.Errorf("write .env: %w", err))
 	}
 
