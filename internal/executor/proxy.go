@@ -2,14 +2,17 @@ package executor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"unicode"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -273,6 +276,80 @@ func ensureProxy() error {
 	}
 
 	return nil
+}
+
+// probePort attempts a transient listen on the given port and immediately
+// closes. The original net.Listen error is wrapped with the port so callers
+// can both classify (errors.Is) and print a useful message.
+// Swappable in tests so EACCES / generic paths do not need a privileged bind.
+var probePort = func(port int) error {
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return fmt.Errorf("probe port %d: %w", port, err)
+	}
+	return l.Close()
+}
+
+// checkPortConflict tries to bind 80 and 443 briefly. Unlike the original
+// implementation, a listen failure is classified: EADDRINUSE keeps the
+// historical 'in use' wording + holder lookup; EACCES is called out as a
+// privilege problem; everything else keeps the underlying error string.
+//
+// This is not a blocking preflight for ensureProxy. An unprivileged agent
+// gets EACCES on ports <1024 even when Docker (root) can still bind them,
+// so treating any probe failure as fatal falsely blocked Caddy. Docker
+// compose remains the authoritative bind check; these helpers exist so a
+// probe error is never reported as 'already in use' unless it actually is.
+func checkPortConflict() *ProxyConfigError {
+	for _, port := range []int{80, 443} {
+		if err := probePort(port); err != nil {
+			return portListenError(port, err)
+		}
+	}
+	return nil
+}
+
+// portListenError maps a probe/listen failure onto a typed ProxyConfigError.
+func portListenError(port int, err error) *ProxyConfigError {
+	if err == nil {
+		return nil
+	}
+	if isAddrInUse(err) {
+		holder := lookupPortHolderContainer(port)
+		msg := fmt.Sprintf("port %d is already in use on this machine", port)
+		if holder != "" {
+			msg = fmt.Sprintf("port %d is held by container '%s'", port, holder)
+		}
+		return &ProxyConfigError{
+			Code:    "port_in_use",
+			Port:    port,
+			Holder:  holder,
+			Message: msg,
+		}
+	}
+	if isPermissionDenied(err) {
+		return &ProxyConfigError{
+			Code: "port_permission_denied",
+			Port: port,
+			Message: fmt.Sprintf(
+				"port %d: permission denied (missing CAP_NET_BIND_SERVICE?): %v",
+				port, err,
+			),
+		}
+	}
+	return &ProxyConfigError{
+		Code:    "port_probe_failed",
+		Port:    port,
+		Message: fmt.Sprintf("port %d: listen failed: %v", port, err),
+	}
+}
+
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
+}
+
+func isPermissionDenied(err error) bool {
+	return errors.Is(err, syscall.EACCES) || errors.Is(err, os.ErrPermission)
 }
 
 // lookupPortHolderContainer asks docker which container publishes the
