@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,14 +34,10 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	containerName := getStringPayload(op.Payload, "containerName")
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
 	credentials := getMapPayload(op.Payload, "credentials")
-	// External exposure. Absent → "public" to preserve historical behavior
-	// for older servers that don't send the field (the new server always
-	// sends "internal" for freshly-provisioned databases). bindHost carries
-	// the machine's Tailscale IP and is only consulted in tailnet mode.
-	accessMode := getStringPayload(op.Payload, "accessMode")
-	if accessMode == "" {
-		accessMode = "public"
-	}
+	// External exposure. Missing or unknown accessMode fails closed to
+	// internal — a host publish on 0.0.0.0 requires an explicit "public".
+	// bindHost is the machine's Tailscale IP and is only used in tailnet mode.
+	accessMode := resolveAccessMode(getStringPayload(op.Payload, "accessMode"))
 	bindHost := getStringPayload(op.Payload, "tailscaleIp")
 
 	if databaseID == "" {
@@ -49,8 +46,11 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	if dbType == "" {
 		return nil, fmt.Errorf("db_provision requires dbType")
 	}
-	if port == 0 {
-		return nil, fmt.Errorf("db_provision requires port")
+	if err := validateDatabasePort(port); err != nil {
+		return nil, fmt.Errorf("db_provision: %w", err)
+	}
+	if err := validateBindHost(bindHost); err != nil {
+		return nil, fmt.Errorf("db_provision: %w", err)
 	}
 	if dockerImage == "" {
 		return nil, fmt.Errorf("db_provision requires dockerImage")
@@ -249,6 +249,47 @@ func (e *Executor) DestroyDB(op client.Operation) error {
 // databaseNativePort is the port the engine listens on inside its container —
 // the target of the host port mapping and the port siblings reach over the
 // `stacked` network.
+
+// resolveAccessMode fails closed: only explicit public/tailnet/internal are
+// honored. Empty and unknown values become internal so a malformed or legacy
+// payload never publishes a host port.
+func resolveAccessMode(mode string) string {
+	switch mode {
+	case "public", "tailnet", "internal":
+		return mode
+	default:
+		return "internal"
+	}
+}
+
+func validateDatabasePort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port must be in 1..65535, got %d", port)
+	}
+	return nil
+}
+
+func validateBindHost(bindHost string) error {
+	if bindHost == "" {
+		return nil
+	}
+	if net.ParseIP(bindHost) == nil {
+		return fmt.Errorf("invalid bind address %q", bindHost)
+	}
+	return nil
+}
+
+func publishesHostPort(accessMode, bindHost string) bool {
+	switch accessMode {
+	case "public":
+		return true
+	case "tailnet":
+		return bindHost != ""
+	default:
+		return false
+	}
+}
+
 func databaseNativePort(dbType string) int {
 	switch dbType {
 	case "postgres":
@@ -274,8 +315,9 @@ func databaseNativePort(dbType string) int {
 //     reachable only over the tailnet. If bindHost is empty (Tailscale not
 //     ready) we publish nothing rather than fall back to 0.0.0.0 — failing
 //     closed is the safe choice.
-//   - public:   bind 0.0.0.0. Source-IP restriction is enforced separately as
-//     DOCKER-USER firewall rules (see firewall.go), not here.
+//   - public:   bind 0.0.0.0. The agent does not manage a host firewall;
+//     lock this down with the machine's cloud security group / external
+//     firewall. Public requires the explicit accessMode value "public".
 func renderDatabasePorts(accessMode, bindHost string, hostPort, nativePort int) string {
 	switch accessMode {
 	case "tailnet":
@@ -291,6 +333,15 @@ func renderDatabasePorts(accessMode, bindHost string, hostPort, nativePort int) 
 }
 
 func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string, accessMode, bindHost string) (string, error) {
+	accessMode = resolveAccessMode(accessMode)
+	if err := validateBindHost(bindHost); err != nil {
+		return "", err
+	}
+	if publishesHostPort(accessMode, bindHost) {
+		if err := validateDatabasePort(port); err != nil {
+			return "", err
+		}
+	}
 	portsBlock := renderDatabasePorts(accessMode, bindHost, port, databaseNativePort(dbType))
 	switch dbType {
 	case "postgres":

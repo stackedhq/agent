@@ -47,8 +47,9 @@ func (e *Executor) RotatePassword(op client.Operation) error {
 	if len(oldCreds) == 0 || len(newCreds) == 0 {
 		return fmt.Errorf("db_rotate_password requires oldCredentials and newCredentials")
 	}
-	if accessMode == "" {
-		accessMode = "internal"
+	accessMode = resolveAccessMode(accessMode)
+	if err := validateBindHost(bindHost); err != nil {
+		return fmt.Errorf("db_rotate_password: %w", err)
 	}
 
 	streamer := logs.NewStreamer(e.Client, op.ID)
