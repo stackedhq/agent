@@ -163,6 +163,7 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 		if err := copyFile(srcPath, tgtPath); err != nil {
 			return fail(fmt.Errorf("copy file: %w", err))
 		}
+		lockManagedParentIfAny(tgtPath)
 		streamer.SetProgress(100)
 		streamer.AddLine("Volume file copy complete.")
 		streamer.Flush()
@@ -199,6 +200,8 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 	if err := e.runCommandWithStreamer(streamer, "", "docker", args...); err != nil {
 		return fail(fmt.Errorf("alpine cp: %w", err))
 	}
+
+	lockManagedParentIfAny(tgtPath)
 
 	streamer.SetProgress(100)
 	streamer.AddLine("Volume migration complete.")

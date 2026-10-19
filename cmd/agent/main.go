@@ -65,6 +65,9 @@ func main() {
 	if err := executor.ReconcileProxy(); err != nil {
 		log.Printf("Startup proxy reconcile skipped: %v", err)
 	}
+	if err := executor.ReconcileManagedVolumeParents(); err != nil {
+		log.Printf("Startup volume parent reconcile skipped: %v", err)
+	}
 
 	stop := make(chan struct{})
 

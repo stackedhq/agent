@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -14,13 +13,10 @@ import (
 )
 
 const (
-	managedServiceDataRoot = "/opt/stacked/data/services"
-	maxFileMountContent    = 64 * 1024
-	maxFileMountTotal      = 512 * 1024
-	maxManagedFileMounts   = 20
+	maxFileMountContent  = 64 * 1024
+	maxFileMountTotal    = 512 * 1024
+	maxManagedFileMounts = 20
 )
-
-var fileMountIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type managedFileMount struct {
 	ID            string
@@ -60,14 +56,22 @@ func (e *Executor) prepareFileMounts(op client.Operation, serviceID string) ([]v
 }
 
 func materializeFileMounts(serviceID string, mounts []client.FileMount) ([]volumeMount, error) {
-	if !fileMountIDPattern.MatchString(serviceID) {
+	if !isStackedUUID(serviceID) {
 		return nil, fmt.Errorf("invalid service ID for managed file mounts")
 	}
 	root := filepath.Join(managedServiceDataRoot, serviceID, "files")
 	if err := rejectSymlinkPathComponents(managedServiceDataRoot, root); err != nil {
 		return nil, err
 	}
-	return materializeFileMountsAt(root, mounts)
+	result, err := materializeFileMountsAt(root, mounts)
+	if err != nil {
+		return nil, err
+	}
+	parent := filepath.Join(managedServiceDataRoot, serviceID)
+	if err := chmodDirNoFollow(parent, 0o700); err != nil {
+		return nil, fmt.Errorf("lock service parent %s: %w", parent, err)
+	}
+	return result, nil
 }
 
 // materializeFileMountsAt validates every response before writing it, then
@@ -107,7 +111,7 @@ func validateFileMounts(mounts []client.FileMount) ([]managedFileMount, error) {
 	paths := make(map[string]struct{}, len(mounts))
 	totalBytes := 0
 	for _, mount := range mounts {
-		if !fileMountIDPattern.MatchString(mount.ID) {
+		if !isStackedUUID(mount.ID) {
 			return nil, fmt.Errorf("managed file mount has invalid ID")
 		}
 		if !validContainerFilePath(mount.ContainerPath) {
