@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -39,12 +41,14 @@ func (e *Executor) RunJob(op client.Operation) (map[string]interface{}, error) {
 	return e.runCommandJob(op)
 }
 
-// runHTTPJob makes an HTTP request from the agent host. Runs on the same
-// network as the user's containers, so internal URLs (e.g.
-// http://my-service:3000/api/cron) work.
+// runHTTPJob makes an HTTP request from the agent host. The agent itself
+// isn't attached to the `stacked` network, so the client dials through
+// stackedNetworkDialer: container names and network aliases (e.g.
+// http://<serviceID>:3000/api/cron) resolve to the container's bridge IP,
+// and anything else falls back to normal DNS.
 func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, error) {
-	url := getStringPayload(op.Payload, "httpUrl")
-	if url == "" {
+	jobURL := getStringPayload(op.Payload, "httpUrl")
+	if jobURL == "" {
 		return nil, fmt.Errorf("cron_run http mode requires httpUrl")
 	}
 	method := getStringPayload(op.Payload, "httpMethod")
@@ -60,7 +64,7 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 	}
 
 	streamer.SetProgress(0)
-	streamer.AddLine(fmt.Sprintf("HTTP job: %s %s", method, url))
+	streamer.AddLine(fmt.Sprintf("HTTP job: %s %s", method, jobURL))
 	streamer.Flush()
 
 	var bodyReader io.Reader
@@ -68,7 +72,7 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 		bodyReader = strings.NewReader(body)
 	}
 
-	req, err := http.NewRequest(method, url, bodyReader)
+	req, err := http.NewRequest(method, jobURL, bodyReader)
 	if err != nil {
 		return fail(fmt.Errorf("build request: %w", err))
 	}
@@ -81,7 +85,9 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 		}
 	}
 
-	httpClient := &http.Client{Timeout: 5 * time.Minute}
+	httpClient := newJobHTTPClient(func(host string, ips []string) {
+		streamer.AddLine(fmt.Sprintf("Resolved %s on the stacked network: %s", host, strings.Join(ips, ", ")))
+	})
 	streamer.SetProgress(50)
 
 	resp, err := httpClient.Do(req)
@@ -211,6 +217,25 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 	streamer.AddLine("Job completed successfully.")
 	streamer.Flush()
 	return map[string]interface{}{"exitCode": 0}, nil
+}
+
+// newJobHTTPClient builds the client HTTP-mode jobs use: the default
+// transport settings with a dialer that understands `stacked` network
+// names. Proxy env vars still apply to public URLs, but never to network
+// names: an outbound proxy can't resolve those either.
+func newJobHTTPClient(onResolve func(host string, ips []string)) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		host := req.URL.Hostname()
+		if net.ParseIP(host) == nil {
+			if ips, err := resolveDockerHost(host, "stacked"); err == nil && len(ips) > 0 {
+				return nil, nil
+			}
+		}
+		return http.ProxyFromEnvironment(req)
+	}
+	transport.DialContext = stackedNetworkDialer("stacked", onResolve)
+	return &http.Client{Timeout: 5 * time.Minute, Transport: transport}
 }
 
 // parseJSONHeaders parses a JSON object string into a flat string map.
