@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/gatehost"
 	"github.com/stackedapp/stacked/agent/internal/slots"
 )
 
@@ -913,26 +914,37 @@ type gateDomainEntry struct {
 	ServiceName  string `json:"serviceName"`
 }
 
-// reconcileGate writes the gate config.json and ensures the gate
-// container is running when at least one domain has an auth gate,
-// or stopped when none do.
-func reconcileGate(parsed []cachedDomain) error {
+// buildGateConfig maps gated domains onto canonical host keys so the
+// sidecar's lookups match Caddy's case-insensitive {host} forwarding.
+func buildGateConfig(parsed []cachedDomain) gateConfig {
 	cfg := gateConfig{Domains: make(map[string]gateDomainEntry)}
 	for _, d := range parsed {
 		if d.AuthGateMode == "" {
 			continue
 		}
+		key := gatehost.CanonicalHost(d.Domain)
+		if key == "" {
+			continue
+		}
 		name := d.ServiceName
 		if name == "" {
-			name = d.Domain
+			name = key
 		}
-		cfg.Domains[d.Domain] = gateDomainEntry{
+		cfg.Domains[key] = gateDomainEntry{
 			Mode:         d.AuthGateMode,
 			Username:     d.AuthGateUsername,
 			PasswordHash: d.AuthGatePasswordHash,
 			ServiceName:  name,
 		}
 	}
+	return cfg
+}
+
+// reconcileGate writes the gate config.json and ensures the gate
+// container is running when at least one domain has an auth gate,
+// or stopped when none do.
+func reconcileGate(parsed []cachedDomain) error {
+	cfg := buildGateConfig(parsed)
 
 	needsGate := len(cfg.Domains) > 0
 
