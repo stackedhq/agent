@@ -59,6 +59,22 @@ Get your token from the Stacked dashboard under **Machines → Add Machine**.
 | `proxy_config` | Regenerate Caddyfile, reload Caddy |
 | `self_update` | Download new binary, replace, restart |
 
+## Custom host bind mounts
+
+Managed volumes under `/opt/stacked/data/services/` are always allowed.
+
+Any other `hostPath` is rejected unless this machine explicitly allowlists the host root. Dashboard settings cannot widen that set.
+
+```toml
+# /opt/stacked/agent.toml
+[volumes]
+allowed_host_roots = ["/srv/stacked", "/mnt/data"]
+```
+
+Or set `STACKED_ALLOWED_VOLUME_ROOTS=/srv/stacked:/mnt/data` in the systemd unit. Then restart the agent.
+
+Critical paths (`/`, `/etc`, `/proc`, `/sys`, `/dev`, `/run`, Docker/containerd sockets and state, `/opt/stacked` control files) stay blocked even if you allowlist `/`. Allowlisting `/` is treated as root-equivalent and is logged as a warning.
+
 ## Managing the service
 
 ```bash

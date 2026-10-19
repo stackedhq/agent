@@ -10,7 +10,7 @@ Go binary that runs on VPS machines, polls the Stacked server for operations (de
 cmd/agent/main.go          # Entry point, starts heartbeat + poller goroutines
 internal/
 ├── client/client.go       # HTTP client for Stacked API (heartbeat, poll, logs, credentials)
-├── config/config.go       # TOML config loader (/opt/stacked/agent.toml)
+├── config/config.go       # TOML config loader (/opt/stacked/agent.toml, including volumes.allowed_host_roots)
 ├── executor/
 │   ├── executor.go        # Operation dispatcher + runCommand helpers
 │   ├── deploy.go          # Deploy: git clone → nixpacks build → docker compose up
