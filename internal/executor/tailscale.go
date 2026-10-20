@@ -36,7 +36,11 @@ var tailscaleAuthURLRe = regexp.MustCompile(`https://login\.tailscale\.com/a/[A-
 // TailscaleSetup brings the machine onto the user's tailnet via the
 // interactive auth-URL flow:
 //
-//  1. Install `tailscale` if not present (idempotent apt install).
+//  1. Require a host-installed `tailscale` binary. The agent never
+//     fetches or executes remote installers — it runs as `stacked`
+//     (often under NoNewPrivileges), so a privileged install cannot
+//     succeed cleanly and a curl|sh child would inherit Docker-group
+//     access.
 //  2. Start `tailscale up --hostname=... --accept-dns=true --ssh=false`
 //     as a child of a detached goroutine.
 //  3. Scan stderr for the auth URL within a short window. Report it via
@@ -47,29 +51,16 @@ var tailscaleAuthURLRe = regexp.MustCompile(`https://login\.tailscale\.com/a/[A-
 //     server side.
 //
 // Failure modes that happen BEFORE the URL is seen (binary missing,
-// install error, immediate exit) return a normal error and the
-// executor reports `failed` as usual.
+// immediate exit) return a normal error and the executor reports
+// `failed` as usual.
 func (e *Executor) TailscaleSetup(op client.Operation) error {
 	hostname := getStringPayload(op.Payload, "hostname")
 	if hostname == "" {
 		return fmt.Errorf("tailscale_setup requires hostname in payload")
 	}
 
-	// Idempotent install. On Debian/Ubuntu hosts (the only thing we
-	// officially support today) the official upstream installer is the
-	// simplest, most-reliable choice; it handles the apt key + repo
-	// list and is itself idempotent. We never run it if the binary is
-	// already present so we don't redo network work on every Enable.
-	if _, err := exec.LookPath("tailscale"); err != nil {
-		log.Println("Tailscale not installed; running upstream installer")
-		install := exec.Command("sh", "-c", "curl -fsSL https://tailscale.com/install.sh | sh")
-		out, instErr := install.CombinedOutput()
-		if instErr != nil {
-			return fmt.Errorf("tailscale install failed: %s: %w", strings.TrimSpace(string(out)), instErr)
-		}
-		if _, err := exec.LookPath("tailscale"); err != nil {
-			return fmt.Errorf("tailscale install succeeded but binary not on PATH: %w", err)
-		}
+	if err := requireTailscale(); err != nil {
+		return err
 	}
 
 	// `tailscale up` prints the auth URL to stderr and then BLOCKS until
@@ -207,12 +198,22 @@ func scanForAuthURL(r io.Reader, out chan<- string) {
 	}
 }
 
+// requireTailscale reports a deterministic error when the host has no
+// `tailscale` binary. Installation is a documented prerequisite — see
+// README — not something the agent performs at runtime.
+func requireTailscale() error {
+	if _, err := exec.LookPath("tailscale"); err != nil {
+		return fmt.Errorf("tailscale is not installed on this host; install the official Tailscale package before enabling it from Stacked")
+	}
+	return nil
+}
+
 // TailscaleDisable runs `tailscale down`. Fast, blocking, no goroutine
 // gymnastics needed — the CLI returns within a second or two.
 //
-// We do NOT uninstall the binary on disable. Keeping it around makes
-// re-enable instant and avoids a second apt run on every toggle. The
-// `machines.tailscale*` columns are cleared server-side on op success.
+// We do NOT uninstall the binary on disable. Re-enable just runs
+// `tailscale up` again. The `machines.tailscale*` columns are cleared
+// server-side on op success.
 func (e *Executor) TailscaleDisable(op client.Operation) error {
 	if _, err := exec.LookPath("tailscale"); err != nil {
 		// Already not installed → nothing to disable. Reporting
