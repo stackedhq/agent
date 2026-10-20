@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -15,15 +17,149 @@ type Client struct {
 	server     string
 	token      string
 	httpClient *http.Client
+	// serverErr is set when the server URL fails ValidateServerURL.
+	// Every request then fails with it instead of sending the token
+	// over an insecure transport. config.Load rejects such URLs at
+	// startup; this is the second line of defence.
+	serverErr error
 }
 
 func New(server, token string) *Client {
-	return &Client{
-		server: server,
-		token:  token,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+	c := &Client{
+		server:    server,
+		token:     token,
+		serverErr: ValidateServerURL(server),
+	}
+	c.httpClient = &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: c.checkRedirect,
+	}
+	return c
+}
+
+// maxAPIRedirects bounds how many same-origin redirects an API call
+// follows.
+const maxAPIRedirects = 3
+
+// checkRedirect follows a redirect only when it stays on https and on
+// the configured server's host (e.g. a path normalization on the same
+// origin), up to maxAPIRedirects. Anything else (a downgrade to http,
+// another host, too many hops) stops with the 3xx response, which
+// doRequest turns into an error: the bearer token and request body must
+// never go to another origin. Go's client keeps the Authorization header
+// on same-host redirects, which is the only case allowed here.
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > maxAPIRedirects {
+		return http.ErrUseLastResponse
+	}
+	if !sameHTTPSOrigin(c.server, req.URL) {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}
+
+// sameHTTPSOrigin reports whether target is https and on the same host
+// and effective port as the server URL.
+func sameHTTPSOrigin(server string, target *url.URL) bool {
+	base, err := url.Parse(server)
+	if err != nil || target == nil || target.Scheme != "https" {
+		return false
+	}
+	if !strings.EqualFold(base.Hostname(), target.Hostname()) {
+		return false
+	}
+	return effectivePort(base) == effectivePort(target)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
+}
+
+// NormalizeServerURL upgrades a plain http:// server URL on a
+// non-loopback host to https:// and reports whether it did. Every other
+// URL is returned unchanged (ValidateServerURL decides whether it's
+// acceptable). Used by config loading so a legacy http:// config keeps
+// the agent running (and able to self-update) instead of exiting in a
+// systemd restart loop, without ever sending the token over plain http.
+func NormalizeServerURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.Hostname() == "" || isLoopbackHost(u.Hostname()) {
+		return raw, false
+	}
+	u.Scheme = "https"
+	return u.String(), true
+}
+
+// ValidateServerURL requires an https:// server URL. Plain http:// is
+// allowed only for loopback hosts (localhost, 127.0.0.1, [::1]) so local
+// development against `bun dev` keeps working.
+func ValidateServerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid server URL %q: %w", raw, err)
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("invalid server URL %q: missing host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("invalid server URL %q: credentials in the URL are not allowed", u.Redacted())
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid server URL %q: query strings and fragments are not allowed", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("server URL %q must use https:// (http:// is only allowed for localhost, 127.0.0.1 and [::1])", raw)
+	default:
+		return fmt.Errorf("server URL %q must use https://", raw)
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.Equal(net.IPv4(127, 0, 0, 1)) || ip.Equal(net.IPv6loopback))
+}
+
+// Response body caps. The ops poll can carry several operations with
+// compose/proxy payloads, so it gets the largest budget; endpoints that
+// return secrets or file contents (env vars, managed files capped at
+// 512 KB total, query text) get a middle one; everything else returns
+// small JSON envelopes.
+const (
+	maxOpsResponseBytes     = 16 << 20
+	maxSecretsResponseBytes = 4 << 20
+	maxDefaultResponseBytes = 1 << 20
+)
+
+func responseLimit(path string) int64 {
+	switch {
+	case path == "/api/agent/operations":
+		return maxOpsResponseBytes
+	case strings.HasPrefix(path, "/api/agent/credentials/"),
+		strings.HasPrefix(path, "/api/agent/migration-credentials/"),
+		strings.HasPrefix(path, "/api/agent/database-query/"),
+		strings.HasPrefix(path, "/api/agent/backup-credentials/"),
+		strings.HasPrefix(path, "/api/agent/operations/") && strings.HasSuffix(path, "/file-mounts"):
+		return maxSecretsResponseBytes
+	default:
+		return maxDefaultResponseBytes
 	}
 }
 
@@ -323,10 +459,21 @@ type LogArchiveConfirm struct {
 // rather than spamming requests every minute.
 var ErrArchivalDisabled = fmt.Errorf("log archival disabled on server")
 
+// uploadSizeRequest declares the exact byte size of an upload before the
+// server presigns it. The server signs Content-Length into the URL, so the
+// PUT must send exactly this many bytes.
+type uploadSizeRequest struct {
+	SizeBytes int64 `json:"sizeBytes"`
+}
+
 // RequestLogArchiveURL asks the server for a presigned PUT URL the agent
 // can use to upload a gzipped NDJSON chunk directly to R2.
-func (c *Client) RequestLogArchiveURL(serviceID string) (*LogArchiveURL, error) {
-	body, err := c.doRequest("POST", "/api/agent/logs/"+serviceID+"/archive-url", nil)
+func (c *Client) RequestLogArchiveURL(serviceID string, sizeBytes int64) (*LogArchiveURL, error) {
+	req, err := json.Marshal(uploadSizeRequest{SizeBytes: sizeBytes})
+	if err != nil {
+		return nil, fmt.Errorf("marshal archive URL request: %w", err)
+	}
+	body, err := c.doRequest("POST", "/api/agent/logs/"+serviceID+"/archive-url", bytes.NewReader(req))
 	if err != nil {
 		// Surface ARCHIVAL_DISABLED as a typed error. The body of a 503
 		// response is folded into err.Error() by doRequest — a string
@@ -456,6 +603,10 @@ type backupUploadURLResponse struct {
 type BackupDownloadURL struct {
 	URL string `json:"url"`
 	Key string `json:"key"`
+	// Sha256 is the hex digest recorded when the backup was confirmed.
+	// Optional: when present the agent verifies the download against it
+	// before touching the database.
+	Sha256 string `json:"sha256,omitempty"`
 }
 
 type backupDownloadURLResponse struct {
@@ -485,8 +636,12 @@ func (c *Client) GetBackupCredentials(databaseID string) (*BackupCredentials, er
 
 // RequestBackupUploadURL asks the server for a presigned PUT URL for a
 // backup row's (server-owned) key. Marks the backup row running.
-func (c *Client) RequestBackupUploadURL(backupID string) (*BackupUploadURL, error) {
-	body, err := c.doRequest("POST", "/api/agent/backups/"+backupID+"/upload-url", nil)
+func (c *Client) RequestBackupUploadURL(backupID string, sizeBytes int64) (*BackupUploadURL, error) {
+	req, err := json.Marshal(uploadSizeRequest{SizeBytes: sizeBytes})
+	if err != nil {
+		return nil, fmt.Errorf("marshal backup upload URL request: %w", err)
+	}
+	body, err := c.doRequest("POST", "/api/agent/backups/"+backupID+"/upload-url", bytes.NewReader(req))
 	if err != nil {
 		if strings.Contains(err.Error(), "BACKUPS_DISABLED") {
 			return nil, ErrBackupsDisabled
@@ -602,6 +757,9 @@ func (c *Client) doJSON(method, path string, payload interface{}) ([]byte, error
 }
 
 func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, error) {
+	if c.serverErr != nil {
+		return nil, c.serverErr
+	}
 	req, err := http.NewRequest(method, c.server+path, body)
 	if err != nil {
 		return nil, err
@@ -616,9 +774,17 @@ func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, error) 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	limit := responseLimit(path)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if int64(len(respBody)) > limit {
+		return nil, fmt.Errorf("response from %s exceeds %d bytes", path, limit)
+	}
+
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("server answered %s with redirect HTTP %d to %q; agent API calls only follow up to %d redirects that stay on https and the configured server host, check agent.server in the config", path, resp.StatusCode, resp.Header.Get("Location"), maxAPIRedirects)
 	}
 
 	if resp.StatusCode >= 400 {

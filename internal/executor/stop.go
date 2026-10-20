@@ -28,7 +28,7 @@ func (e *Executor) Stop(op client.Operation) error {
 	}
 
 	log.Printf("Stopping service %s", serviceID)
-	if err := e.runCommand(op.ID, dir, "docker", "compose", "stop"); err != nil {
+	if err := e.runCommand(op.ID, dir, "docker", composeArgs(dir, "stop")...); err != nil {
 		return fmt.Errorf("docker compose stop: %w", err)
 	}
 

@@ -1,5 +1,15 @@
 name: Release
 
+# Supply-chain notes (see README "Verifying releases"):
+# - Every action is pinned to a full commit SHA (tag in the trailing comment).
+# - Default token permissions are empty; each job opts into the minimum.
+# - No job that holds a secret or a write token runs repo code: the signing
+#   key lives in the `release` Environment (required reviewer) and is only
+#   exposed to the `sign` job; `publish` (contents: write) never checks out.
+# - The AI release notes job is untrusted output: it reaches `publish` only
+#   through `env:` and is written with printf, never interpolated into a
+#   script.
+
 on:
   push:
     branches:
@@ -10,60 +20,220 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to regenerate release notes for (e.g. v0.6.18)'
+        description: 'Existing tag to regenerate release notes for (e.g. v0.6.18). Binaries and signatures are not rebuilt.'
         required: true
 
-jobs:
-  build:
-    name: Build & Vet
-    runs-on: ubuntu-latest
+permissions: {}
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Vet, test & build
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
 
       - name: Run go vet
         run: go vet ./...
 
-      - name: Build (linux/amd64)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/stacked-agent-linux-amd64 ./cmd/agent
+      - name: Run tests
+        run: go test ./...
 
-      - name: Build (linux/arm64)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/stacked-agent-linux-arm64 ./cmd/agent
+      - name: Build (linux/amd64 + linux/arm64)
+        run: make build
 
-  release:
-    name: Release
-    needs: build
+  meta:
+    name: Resolve version
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Determine tag and version
+        id: v
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          # Same shape the agent's self-update accepts (it refuses anything else).
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::Tag is not vX.Y.Z[-prerelease]"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build release binaries
+    needs: [check, meta]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # No shared module cache on the release path (cache poisoning).
+          cache: false
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Makefile sets CGO_ENABLED=0 -trimpath -buildvcs=false.
+          make build VERSION="$VERSION"
+
+      - name: Write VERSION and SHA256SUMS
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # VERSION binds the signed SHA256SUMS to this release: the agent
+          # refuses an update whose signed VERSION isn't exactly the target.
+          printf '%s\n' "$VERSION" > VERSION
+          sha256sum stacked-agent-linux-amd64 stacked-agent-linux-arm64 VERSION > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-binaries
+          path: |
+            dist/stacked-agent-linux-amd64
+            dist/stacked-agent-linux-arm64
+            dist/VERSION
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: Sign SHA256SUMS
+    needs: [meta, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Protected Environment: required reviewer, holds AGENT_SIGNING_KEY.
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      # Checked out only to read the embedded public key(s); no repo code runs here.
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-binaries
+          path: dist
+
+      - name: Check SHA256SUMS matches the binaries and VERSION
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict SHA256SUMS
+          grep -qE '^[0-9a-f]{64}  VERSION$' SHA256SUMS
+          test "$(cat VERSION)" = "$VERSION"
+          test "$(wc -c < VERSION)" -eq "$(( ${#VERSION} + 1 ))"
+
+      - name: Sign
+        env:
+          AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEY="$(mktemp "$RUNNER_TEMP/agent-signing-key.XXXXXX")"
+          trap 'shred -u "$KEY" 2>/dev/null || rm -f "$KEY"' EXIT
+          printf '%s\n' "$AGENT_SIGNING_KEY" > "$KEY"
+          openssl pkeyutl -sign -inkey "$KEY" -rawin -in dist/SHA256SUMS -out dist/SHA256SUMS.sig
+          test "$(stat -c %s dist/SHA256SUMS.sig)" -eq 64
+
+      - name: Verify with the embedded public key
+        run: |
+          set -euo pipefail
+          # Extract every PEM block from internal/executor/release_keys.go;
+          # accept if any verifies (mirrors the agent's check).
+          awk -v dir="$RUNNER_TEMP" '
+            /-----BEGIN PUBLIC KEY-----/ { n++; f = sprintf("%s/release-pub-%d.pem", dir, n) }
+            f != "" { line = $0; sub(/^[ \t]*`?/, "", line); sub(/`,?[ \t]*$/, "", line); print line > f }
+            /-----END PUBLIC KEY-----/ { close(f); f = "" }
+          ' internal/executor/release_keys.go
+          ok=0
+          for pub in "$RUNNER_TEMP"/release-pub-*.pem; do
+            [ -e "$pub" ] || continue
+            if openssl pkeyutl -verify -pubin -inkey "$pub" -rawin -in dist/SHA256SUMS -sigfile dist/SHA256SUMS.sig; then
+              ok=1
+            fi
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::SHA256SUMS.sig does not verify with any key embedded in the agent"
+            exit 1
+          fi
+
+      - name: Upload signature
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-signature
+          path: dist/SHA256SUMS.sig
+          if-no-files-found: error
+          retention-days: 7
+
+  notes:
+    name: Release notes
+    needs: meta
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-
+      contents: read
+      pull-requests: read
+    outputs:
+      body: ${{ steps.notes.outputs.body }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
+          ref: refs/tags/${{ needs.meta.outputs.tag }}
+          persist-credentials: false
 
       - name: Determine tag range
         id: tags
+        env:
+          CURRENT: ${{ needs.meta.outputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            CURRENT="${{ github.event.inputs.tag }}"
-          else
-            CURRENT="${GITHUB_REF_NAME}"
-          fi
           PREV=$(git tag --sort=-v:refname | grep -E '^v' | grep -v "^${CURRENT}$" | head -1)
           if [ -z "$PREV" ]; then
             PREV=$(git rev-list --max-parents=0 HEAD)
@@ -77,18 +247,13 @@ jobs:
         # the AI step has the up-to-date style guide regardless of which tag
         # we're regenerating.
         run: |
-          git fetch origin main --depth=1
+          git fetch origin main --depth=1 || true
           git checkout origin/main -- .github/release-notes-instructions.md || true
-
-      - name: Build binaries
-        run: make build VERSION=${TAG#v}
-        env:
-          TAG: ${{ steps.tags.outputs.current }}
 
       - name: Generate AI release notes
         id: ai_notes
         continue-on-error: true
-        uses: github/copilot-release-notes@main
+        uses: github/copilot-release-notes@6e478051bdb62b9f0f0fbe25809d8a7c0d11aa2e # main
         with:
           base-ref: ${{ steps.tags.outputs.previous }}
           head-ref: ${{ steps.tags.outputs.current }}
@@ -99,11 +264,16 @@ jobs:
 
       - name: Build release notes (with fallback)
         id: notes
+        env:
+          AI_NOTES: ${{ steps.ai_notes.outputs.release-notes }}
+          AI_OUTCOME: ${{ steps.ai_notes.outcome }}
+          PREV: ${{ steps.tags.outputs.previous }}
+          CURRENT: ${{ steps.tags.outputs.current }}
+          REPO: ${{ github.repository }}
         run: |
-          AI_NOTES=$(cat <<'AINOTES_EOF'
-          ${{ steps.ai_notes.outputs.release-notes }}
-          AINOTES_EOF
-          )
+          # No pipefail: `git log | grep -q` exits early and SIGPIPEs git log.
+          set -eu
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
 
           # Detect REQUIRES-REINSTALL across the commit range so it survives
           # even if the AI step failed or omitted it. The token only counts
@@ -112,40 +282,119 @@ jobs:
           # substring match catches negated mentions like
           # `No REQUIRES-REINSTALL: install.sh unchanged` and produces false
           # positives, so anchor to line boundaries here too.
-          PREV="${{ steps.tags.outputs.previous }}"
-          CURRENT="${{ steps.tags.outputs.current }}"
           if git log --format=%B "${PREV}..${CURRENT}" 2>/dev/null | grep -qE '^[[:space:]]*REQUIRES-REINSTALL[[:space:]]*$'; then
             REINSTALL=1
           else
             REINSTALL=0
           fi
 
-          if [ -n "$(echo "$AI_NOTES" | tr -d '[:space:]')" ] && [ "${{ steps.ai_notes.outcome }}" = "success" ]; then
+          if [ -n "$(printf '%s' "$AI_NOTES" | tr -d '[:space:]')" ] && [ "$AI_OUTCOME" = "success" ]; then
             echo "Using AI-generated notes"
-            printf '%s\n' "$AI_NOTES" > /tmp/release-notes.md
+            printf '%s\n' "$AI_NOTES" > "$NOTES_FILE"
           else
             echo "AI notes unavailable, falling back to commit list"
             if [ -z "$PREV" ]; then
-              git log --pretty=format:"- %s" HEAD > /tmp/release-notes.md
+              git log --pretty=format:"- %s" HEAD > "$NOTES_FILE"
             else
-              git log --pretty=format:"- %s" "${PREV}..${CURRENT}" > /tmp/release-notes.md
+              git log --pretty=format:"- %s" "${PREV}..${CURRENT}" > "$NOTES_FILE"
             fi
           fi
 
           # Ensure REQUIRES-REINSTALL token is present if any commit in range had it.
-          if [ "$REINSTALL" = "1" ] && ! grep -q "REQUIRES-REINSTALL" /tmp/release-notes.md; then
-            printf '\n\nREQUIRES-REINSTALL\n' >> /tmp/release-notes.md
+          if [ "$REINSTALL" = "1" ] && ! grep -q "REQUIRES-REINSTALL" "$NOTES_FILE"; then
+            printf '\n\nREQUIRES-REINSTALL\n' >> "$NOTES_FILE"
           fi
 
-          echo "" >> /tmp/release-notes.md
-          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV}...${CURRENT}" >> /tmp/release-notes.md
+          echo "" >> "$NOTES_FILE"
+          echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV}...${CURRENT}" >> "$NOTES_FILE"
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+          # Multi-line job output with an unguessable delimiter so note text
+          # can't terminate it early.
+          DELIM="NOTES_$(openssl rand -hex 16)"
+          {
+            echo "body<<${DELIM}"
+            cat "$NOTES_FILE"
+            echo
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish release
+    needs: [meta, build, sign, notes]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # Deliberately no checkout: this job holds a write token.
+      - name: Download binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          tag_name: ${{ steps.tags.outputs.current }}
-          name: ${{ steps.tags.outputs.current }}
-          body_path: /tmp/release-notes.md
-          files: |
+          name: release-binaries
+          path: dist
+
+      - name: Download signature
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-signature
+          path: dist
+
+      - name: Check SHA256SUMS matches the binaries and VERSION
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
             dist/stacked-agent-linux-amd64
             dist/stacked-agent-linux-arm64
+
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.notes.outputs.body }}
+        run: printf '%s' "$NOTES" > "$RUNNER_TEMP/notes.md"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          FILES=(
+            dist/stacked-agent-linux-amd64
+            dist/stacked-agent-linux-arm64
+            dist/VERSION
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-run of a tag: replace assets and notes in place.
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+            gh release edit "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$TAG" "${FILES[@]}" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+
+  update-notes:
+    name: Update release notes
+    needs: [meta, notes]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.notes.outputs.body }}
+        run: printf '%s' "$NOTES" > "$RUNNER_TEMP/notes.md"
+
+      - name: Update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

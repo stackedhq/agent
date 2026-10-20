@@ -31,7 +31,7 @@ func main() {
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "gate" {
-		gate.Run()
+		gate.Main(os.Args[2:])
 		return
 	}
 
@@ -50,6 +50,9 @@ func main() {
 	// before any op (or the startup proxy reconcile) can regenerate
 	// the Caddyfile.
 	executor.SetServerBaseURL(cfg.Agent.Server)
+	// Restore the machine ID learned from earlier ops so the startup
+	// Caddyfile already scopes the on-demand TLS ask URL (`?m=`).
+	executor.LoadMachineID()
 	exec := executor.New(c)
 	logMgr := runtimelogs.NewManager(c)
 	dbLogMgr := databaselogs.NewManager(c)
@@ -61,8 +64,9 @@ func main() {
 	// needing a manual reinstall or waiting for the next proxy_config op.
 	// A no-op on machines that haven't run Setup yet. Errors are logged
 	// and swallowed — the agent must always come up so the poller can
-	// recover via subsequent ops.
-	if err := executor.ReconcileProxy(); err != nil {
+	// recover via subsequent ops. Bounded so a hung docker daemon can't
+	// keep the poller from starting.
+	if err := executor.ReconcileProxyWithTimeout(executor.StartupProxyReconcileTimeout); err != nil {
 		log.Printf("Startup proxy reconcile skipped: %v", err)
 	}
 

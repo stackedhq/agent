@@ -1,9 +1,10 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"log"
-	"os/exec"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -118,21 +119,29 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	if err != nil {
 		return nil, fail(fmt.Errorf("get credentials: %w", err))
 	}
+	if creds.NetworkAliases, err = resolveNetworkAliases(creds.NetworkAliases); err != nil {
+		return nil, fail(err)
+	}
 	imageName, err := e.resolveImage(op, serviceID, dir, creds, streamer)
 	if err != nil {
 		return nil, fail(err)
 	}
 
-	// Phase 2: write env file (shared by both slots).
-	if creds.EnvVars == nil {
-		creds.EnvVars = map[string]string{}
+	// Phase 2: write env file (shared by both slots). Single-line values
+	// go in stacked.env (0600); multi-line values reach `docker run`
+	// through its process env (`-e KEY`), never argv.
+	env, envWarnings := serviceEnv(creds.EnvVars)
+	addEnvWarnings(streamer, envWarnings)
+	addLiteralEnvWarning(streamer, env)
+	runEnv, envPath, err := writeServiceEnvFile(dir, env)
+	if err != nil {
+		return nil, fail(err)
 	}
-	if _, ok := creds.EnvVars["HOST"]; !ok {
-		creds.EnvVars["HOST"] = "0.0.0.0"
-	}
-	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
-		return nil, fail(fmt.Errorf("write .env: %w", err))
+	// docker-compose.yml is only regenerated after the flip
+	// (refreshBlueGreenCompose), so until then an older one may still
+	// reference `.env`; keep it current (see syncLegacyEnvFile).
+	if err := syncLegacyEnvFile(dir, env); err != nil {
+		return nil, fail(fmt.Errorf("update legacy .env: %w", err))
 	}
 
 	// Phase 3: ensure the network exists.
@@ -150,9 +159,9 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 
 	// Defensive: if a previous failed deploy left a stopped container
 	// of the same name behind, remove it before starting fresh.
-	_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+	_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", newContainer)
 
-	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, envPath, op, creds.NetworkAliases); err != nil {
+	if err := runRollingContainer(streamer, newContainer, serviceID, string(newSlot), imageName, runEnv, envPath, op, creds.NetworkAliases); err != nil {
 		return nil, fail(err)
 	}
 
@@ -181,7 +190,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		streamer.Flush()
 		if err := HealthGate(streamer, newContainer, "stacked", probePort, healthPath, time.Duration(timeoutSec)*time.Second); err != nil {
 			// Tear down the failed slot so the next deploy starts clean.
-			_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+			_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", newContainer)
 			return nil, fail(fmt.Errorf("health gate: %w", err))
 		}
 	}
@@ -196,7 +205,7 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	streamer.Flush()
 	prevSlot := currentSlot
 	if err := slots.SetActive(serviceID, newSlot); err != nil {
-		_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+		_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", newContainer)
 		return nil, fail(fmt.Errorf("persist slot state: %w", err))
 	}
 	if err := RegenerateCaddyfile(); err != nil {
@@ -204,11 +213,20 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		// prevSlot is always non-empty here (Legacy on first rolling
 		// deploy, Blue/Green afterwards) so SetActive is enough.
 		_ = slots.SetActive(serviceID, prevSlot)
-		_, _ = runCommandSilent("", "docker", "rm", "-f", newContainer)
+		_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", newContainer)
 		return nil, fail(fmt.Errorf("caddy reload: %w", err))
 	}
 	streamer.AddLine("Caddy reloaded; traffic now on " + newContainer + ".")
 	streamer.Flush()
+
+	// Keep docker-compose.yml (if a recreate deploy left one) in step
+	// with what is now live, so a Restart that falls back to `compose up`
+	// doesn't start the service with stale env/settings. Traffic has
+	// already moved, so a failure here is a warning, not a failed deploy.
+	if err := refreshBlueGreenCompose(dir, serviceID, imageName, op.Payload, creds.NetworkAliases, env); err != nil {
+		streamer.AddLine("WARN: failed to update docker-compose.yml: " + err.Error())
+		streamer.Flush()
+	}
 
 	// Phase 7: drain and remove the old slot. `docker stop --time=N`
 	// sends SIGTERM, waits up to N seconds for graceful shutdown, then
@@ -221,8 +239,12 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	// fine for the first rolling deploy of a service that never had a
 	// recreate-mode container running, or for retries where the old
 	// slot was already removed.
-	_, _ = runCommandSilent("", "docker", "stop", "--time="+strconv.Itoa(graceSec), oldContainer)
-	_, _ = runCommandSilent("", "docker", "rm", "-f", oldContainer)
+	//
+	// Traffic is already on the new slot, so draining the old one is
+	// cleanup: it runs on its own deadline even if the op deadline
+	// expired during the flip.
+	_, _ = cleanupCommand(stopCleanupTimeout(graceSec), "docker", "stop", "--time="+strconv.Itoa(graceSec), oldContainer)
+	_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", oldContainer)
 
 	// Phase 8: post-flip probe (informational, matches recreate's
 	// post-deploy probe so the dashboard's port-mismatch banner still
@@ -243,6 +265,32 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		result["probeError"] = probeRes.Error
 	}
 	return result, nil
+}
+
+// refreshBlueGreenCompose regenerates <dir>/docker-compose.yml after a
+// blue/green deploy with the current image, env and settings, using the
+// same renderer as the recreate path. Compose is not run: the slot
+// containers are managed with `docker run`; the file only matters to a
+// later Restart that falls back to `compose up -d`. Without this, a
+// compose file written by an earlier recreate deploy keeps its old
+// `environment:` map forever. Written atomically (0600, it holds env
+// values). A service that never had a compose file is left without one,
+// so Restart's "redeploy required" behaviour for pure blue/green services
+// is unchanged. Once the new file is in place, a legacy `.env` that only
+// an older template referenced is removed (see cleanupLegacyEnvFile).
+// Blue/green never has volumes or file mounts (requiresFastRestart).
+func refreshBlueGreenCompose(dir, serviceID, imageName string, payload map[string]interface{}, aliases []string, env map[string]string) error {
+	composePath := filepath.Join(dir, "docker-compose.yml")
+	if _, err := os.Lstat(composePath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	compose := generateCompose(serviceID, imageName, nil, resourceLimitsFromPayload(payload), aliases, dockerCommandOverride(payload), env)
+	if err := writeFileAtomic(composePath, []byte(compose), 0o600); err != nil {
+		return err
+	}
+	return cleanupLegacyEnvFile(dir)
 }
 
 // blueGreenMemoryNeedMB is the extra RAM a second slot is expected to
@@ -302,16 +350,18 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	if err != nil {
 		return nil, fail(fmt.Errorf("get credentials: %w", err))
 	}
+	if creds.NetworkAliases, err = resolveNetworkAliases(creds.NetworkAliases); err != nil {
+		return nil, fail(err)
+	}
 	if creds.EnvVars == nil {
 		creds.EnvVars = map[string]string{}
 	}
 	if _, ok := creds.EnvVars["HOST"]; !ok {
 		creds.EnvVars["HOST"] = "0.0.0.0"
 	}
-	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
-		return nil, fail(fmt.Errorf("write .env: %w", err))
-	}
+	env, envWarnings := serviceEnv(creds.EnvVars)
+	addEnvWarnings(streamer, envWarnings)
+	addLiteralEnvWarning(streamer, env)
 
 	// Pre-pull / pre-build BEFORE stopping the old container so the
 	// outage window doesn't include a slow registry fetch. The deploy
@@ -326,8 +376,8 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 	// `<serviceID>` so volumes mount exclusively (only one writer at
 	// a time). Reuses the existing compose template — the recreate
 	// path's container shape — so logs/metrics keying is unchanged.
-	volumeMounts := parseVolumes(op.Payload)
-	if err := ensureVolumeHostDirs(volumeMounts); err != nil {
+	volumeMounts, err := prepareVolumeHostDirs(serviceID, parseVolumes(op.Payload))
+	if err != nil {
 		return nil, fail(err)
 	}
 	fileMounts, err := e.prepareFileMounts(op, serviceID)
@@ -339,9 +389,12 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 		return nil, fail(err)
 	}
 	startCommand := dockerCommandOverride(op.Payload)
-	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand)
+	compose := generateCompose(serviceID, imageName, mounts, resourceLimitsFromPayload(op.Payload), creds.NetworkAliases, startCommand, env)
 	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), compose); err != nil {
 		return nil, fail(fmt.Errorf("write docker-compose.yml: %w", err))
+	}
+	if err := cleanupLegacyEnvFile(dir); err != nil {
+		log.Printf("cleanup legacy .env for %s: %v", serviceID, err)
 	}
 
 	_, _ = runCommandSilent("", "docker", "network", "create", "stacked")
@@ -359,7 +412,7 @@ func (e *Executor) deployFastRestart(op client.Operation, streamer *logs.Streame
 
 	streamer.AddLine("Starting new container...")
 	streamer.Flush()
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--force-recreate", "--remove-orphans"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "up", "-d", "--force-recreate", "--remove-orphans")...); err != nil {
 		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
 
@@ -422,7 +475,7 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 		streamer.Flush()
 
 		if creds.RegistryToken != "" {
-			cmd := exec.Command("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
+			cmd := opCommand("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
 			cmd.Stdin = strings.NewReader(creds.RegistryToken)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				log.Printf("ghcr login failed (non-fatal): %s", string(out))
@@ -453,10 +506,11 @@ func (e *Executor) resolveImage(op client.Operation, serviceID, dir string, cred
 // them (standard scaled-service behaviour, both are healthy by then);
 // steady state resolves to the single running slot. recreate /
 // fast-restart already get this for free via `container_name`.
-func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName, envPath string, op client.Operation, aliases []string) error {
+func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot, imageName string, runEnv dockerRunEnv, envPath string, op client.Operation, aliases []string) error {
 	startCommand := dockerCommandOverride(op.Payload)
-	args := rollingContainerArgs(containerName, serviceID, slot, imageName, envPath, resourceLimitsFromPayload(op.Payload), aliases, startCommand)
-	cmd := exec.Command("docker", args...)
+	args := rollingContainerArgs(containerName, serviceID, slot, imageName, runEnv.Args(envPath), resourceLimitsFromPayload(op.Payload), aliases, startCommand)
+	cmd := opCommand("docker", args...)
+	cmd.Env = runEnv.CommandEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		streamer.AddLine(strings.TrimSpace(string(out)))
@@ -468,7 +522,7 @@ func runRollingContainer(streamer *logs.Streamer, containerName, serviceID, slot
 // rollingContainerArgs builds the `docker run` argv for a rolling slot
 // container. Pure (no side effects) so the flag contract — notably the
 // stable `--network-alias` — can be unit-tested without invoking docker.
-func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath string, limits resourceLimits, aliases []string, startCommand string) []string {
+func rollingContainerArgs(containerName, serviceID, slot, imageName string, envArgs []string, limits resourceLimits, aliases []string, startCommand string) []string {
 	startCommand = strings.TrimSpace(startCommand)
 	args := []string{
 		"run", "-d",
@@ -485,8 +539,8 @@ func rollingContainerArgs(containerName, serviceID, slot, imageName, envPath str
 			args = append(args, "--network-alias="+a)
 		}
 	}
+	args = append(args, envArgs...)
 	args = append(args,
-		"--env-file="+envPath,
 		"--label", "com.docker.compose.project="+serviceID,
 		"--label", "com.stacked.kind=service",
 		"--label", "com.stacked.slot="+slot,
@@ -558,8 +612,8 @@ func reconcileUnslotted(streamer *logs.Streamer, serviceID string, graceSec int)
 	// and remove them. `docker stop`/`rm` return nonzero when the target
 	// is absent — expected for whichever slot isn't present; ignored.
 	for _, name := range []string{blueContainer, greenContainer} {
-		_, _ = runCommandSilent("", "docker", "stop", "--time="+strconv.Itoa(graceSec), name)
-		_, _ = runCommandSilent("", "docker", "rm", "-f", name)
+		_, _ = cleanupCommand(stopCleanupTimeout(graceSec), "docker", "stop", "--time="+strconv.Itoa(graceSec), name)
+		_, _ = cleanupCommand(cleanupTimeout, "docker", "rm", "-f", name)
 	}
 }
 

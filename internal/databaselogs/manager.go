@@ -130,6 +130,13 @@ func listDatabaseContainers() []containerRow {
 		if len(parts) < 3 {
 			continue
 		}
+		if !isUUID(parts[1]) {
+			// Database projects are always the database UUID. Anything
+			// else (another compose project, or an image that ships its
+			// own com.stacked.kind label) is not ours; its label must
+			// never reach a filesystem path or the API.
+			continue
+		}
 		rows = append(rows, containerRow{
 			id:         parts[0],
 			databaseID: parts[1],
@@ -137,4 +144,24 @@ func listDatabaseContainers() []containerRow {
 		})
 	}
 	return rows
+}
+
+// isUUID is a shape check for the 8-4-4-4-12 hex form.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }

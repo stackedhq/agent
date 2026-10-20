@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -54,6 +52,10 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		return err
 	}
 
+	if err := validateDeployPayload(serviceID, op.Payload); err != nil {
+		return fail(err)
+	}
+
 	streamer.SetProgress(0)
 	streamer.AddLine("Release phase: fetching credentials...")
 	streamer.Flush()
@@ -87,7 +89,7 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		streamer.Flush()
 
 		if creds.RegistryToken != "" {
-			cmd := exec.Command("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
+			cmd := opCommand("docker", "login", "ghcr.io", "-u", "x-access-token", "--password-stdin")
 			cmd.Stdin = strings.NewReader(creds.RegistryToken)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				log.Printf("ghcr login (release) failed (non-fatal): %s", string(out))
@@ -108,17 +110,14 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 		imageName = built
 	}
 
-	// Write the env file the one-shot container will read. Same shape
-	// the deploy executor writes for the running container.
-	if creds.EnvVars == nil {
-		creds.EnvVars = map[string]string{}
-	}
-	if _, ok := creds.EnvVars["HOST"]; !ok {
-		creds.EnvVars["HOST"] = "0.0.0.0"
-	}
-	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
-		return fail(fmt.Errorf("write .env: %w", err))
+	// Write the env file the one-shot container will read. Same env the
+	// deploy executor gives the running container; multi-line values go
+	// through the docker CLI's process env (`-e KEY`), never argv.
+	env, envWarnings := serviceEnv(creds.EnvVars)
+	addEnvWarnings(streamer, envWarnings)
+	runEnv, envPath, err := writeServiceEnvFile(dir, env)
+	if err != nil {
+		return fail(err)
 	}
 
 	// Release containers see the same managed files as the deploy target, so
@@ -138,16 +137,20 @@ func (e *Executor) ReleaseCommand(op client.Operation) error {
 
 	// `--rm` so the container doesn't pile up. `--network=stacked` lets
 	// the command reach managed databases. `sh -lc` so users can write
-	// shell pipelines / && chains naturally.
+	// shell pipelines / && chains naturally. Labels, resource caps and the
+	// 30-minute deadline come from jobs.go.
 	args := []string{
 		"run", "--rm",
 		"--network=stacked",
-		"--env-file=" + envPath,
-		"--name", serviceID + "-release",
 	}
+	containerName := serviceID + "-release"
+	args = append(args, runEnv.Args(envPath)...)
+	args = append(args, "--name", containerName)
+	args = append(args, jobLabelArgs("release")...)
+	args = append(args, jobResourceArgs(op.Payload, defaultReleaseMemoryMB)...)
 	args = append(args, fileMountDockerArgs(fileMounts)...)
 	args = append(args, imageName, "sh", "-lc", releaseCmd)
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", args...); err != nil {
+	if err := runJobContainer(streamer, dir, runEnv.CommandEnv(), containerName, ReleaseCommandTimeout, args); err != nil {
 		return fail(fmt.Errorf("release command failed: %w", err))
 	}
 

@@ -37,7 +37,7 @@ make build
 # -X github.com/stackedapp/stacked/agent/internal/heartbeat.Version=X.Y.Z
 ```
 
-**Releasing:** Tag with `vX.Y.Z` and push — GitHub Actions builds binaries and creates a release.
+**Releasing:** Tag with `vX.Y.Z` and push. `release.yml` builds both binaries, signs `SHA256SUMS` in the `release` Environment (needs approval; secret `AGENT_SIGNING_KEY`), and publishes binaries + `VERSION` + `SHA256SUMS` + `SHA256SUMS.sig` with build provenance (`SHA256SUMS` covers `VERSION`). Every action is SHA-pinned; keep it that way when bumping.
 
 ```bash
 git tag v0.7.0
@@ -91,8 +91,11 @@ If a release changes an embedded template and you want it to land on existing in
 
 - **Log streaming**: Commands run via `runCommand` or `runCommandWithStreamer`, output goes through `logs.Streamer` which batches lines and POSTs to the server every 1s or 50 lines
 - **Progress reporting**: `streamer.SetProgress(N)` + `streamer.AddLine("==> Phase...")` at deploy phase boundaries
-- **Self-update**: Downloads new binary → replaces in-place → `os.Exit(0)` → systemd restarts with new binary
+- **Self-update**: Fetches `SHA256SUMS` + `SHA256SUMS.sig` for `v<targetVersion>` from the fixed GitHub release URL, verifies the ed25519 signature against the keys in `internal/executor/release_keys.go`, checks the signed `VERSION` asset equals the target version, streams the binary to a temp file next to the agent while hashing it, then renames over → `os.Exit(0)` → systemd restarts. Refuses same-version and downgrades. There is no server-supplied download URL.
 - **All operations are sequential**: Poller claims pending ops and executes them one at a time
+- **Per-op deadlines**: `poller.opTimeout` picks a deadline by op type (deploy 45m, backup/restore/migrate 2h, most others 10m). On expiry the op is reported `failed` (`code: OP_TIMEOUT`) and every command started through `opCommand` (which `runCommand*` / `runCommandSilent*` use) is killed with its whole process group. Start new long-running commands through those helpers, not bare `exec.Command`, or they won't be stopped. Killing `docker exec` does not stop the process inside the container; one-shot job containers go through `runJobContainer`, which `docker kill`s them.
+- **Job containers** (`cron_run`, `release_command`): stamped `com.stacked.kind=job` with inherited compose/slot labels cleared, capped at the payload's `cpuLimit` / `memoryLimitMb` when > 0, else 1 CPU and 512 MB (cron) or 1 GB (release), timed out (cron: payload `timeoutSeconds` or 1h; release: 30m). See `internal/executor/jobs.go`.
+- **No secrets in argv**: process args are world-readable on the host, including those of processes inside containers. DB passwords go to `docker exec` as `-e NAME` with the value in the CLI's env (`newDockerExec`), over stdin, or (mongo tools) in a 0600 `--config` file written inside the container (`writeMongoToolConfig`).
 
 ## State Files
 
@@ -100,6 +103,8 @@ The agent persists a small amount of state on disk under `/opt/stacked/`:
 
 - `active-slots.json` — owned by `internal/slots`. Maps `serviceID → "blue"|"green"|"legacy"` for services in rolling deploy mode. Read by the deploy executor (slot picking), proxy executor (Caddyfile upstream resolution), runtimelogs and heartbeat (filtering containers to the active slot during a rolling overlap). Recreate-mode services have no entry; `slots.Active(id)` returning `""` is the back-compat signal. File is flock-protected and atomically rewritten on every `slots.SetActive` / `slots.Clear`.
 - `proxy/domains.json` — owned by `internal/executor/proxy.go`. Cached snapshot of the most recent `proxy_config` payload from the server, so `RegenerateCaddyfile()` (called after a rolling-deploy slot flip) can rewrite the Caddyfile without round-tripping to the server.
+- `proxy/caddy-networks.json` — owned by `internal/executor/caddy_networks.go`. Networks attached to Caddy at runtime (`dokploy_caddy_attach_network`); `ensureProxy` re-connects them after every `compose up`, since a recreate drops runtime attachments. Before `compose up` it also records any non-compose network found on the current Caddy (migration for machines attached before the file existed).
+- `machine-id` — this machine's server-side ID (0600), learned from claimed ops and loaded at startup so the startup Caddyfile's on-demand TLS `ask` URL already carries `?m=`.
 - `proxy/Caddyfile` and `proxy/Caddyfile.candidate` — the live Caddy config and the validate-before-swap candidate. Always validated inside the running Caddy container before being swapped into place; reload failure restores the previous bytes.
 
 ## Server Repo

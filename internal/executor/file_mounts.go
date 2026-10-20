@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -19,8 +18,6 @@ const (
 	maxFileMountTotal      = 512 * 1024
 	maxManagedFileMounts   = 20
 )
-
-var fileMountIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type managedFileMount struct {
 	ID            string
@@ -60,7 +57,7 @@ func (e *Executor) prepareFileMounts(op client.Operation, serviceID string) ([]v
 }
 
 func materializeFileMounts(serviceID string, mounts []client.FileMount) ([]volumeMount, error) {
-	if !fileMountIDPattern.MatchString(serviceID) {
+	if !isUUID(serviceID) {
 		return nil, fmt.Errorf("invalid service ID for managed file mounts")
 	}
 	root := filepath.Join(managedServiceDataRoot, serviceID, "files")
@@ -107,7 +104,7 @@ func validateFileMounts(mounts []client.FileMount) ([]managedFileMount, error) {
 	paths := make(map[string]struct{}, len(mounts))
 	totalBytes := 0
 	for _, mount := range mounts {
-		if !fileMountIDPattern.MatchString(mount.ID) {
+		if !isUUID(mount.ID) {
 			return nil, fmt.Errorf("managed file mount has invalid ID")
 		}
 		if !validContainerFilePath(mount.ContainerPath) {

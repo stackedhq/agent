@@ -1,0 +1,25 @@
+services:
+  database:
+    image: "postgres:16"
+    container_name: "stk-db-pg"
+    restart: "unless-stopped"
+    environment:
+      POSTGRES_USER: "app"
+      POSTGRES_PASSWORD: "pa ss:word"
+      POSTGRES_DB: "appdb"
+    volumes:
+      - "data:/var/lib/postgresql/data"
+    ports:
+      - "15432:5432"
+    networks:
+      - "stacked"
+    labels:
+      com.stacked.kind: "database"
+
+volumes:
+  data:
+
+networks:
+  stacked:
+    name: "stacked"
+    external: true

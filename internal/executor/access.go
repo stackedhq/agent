@@ -84,7 +84,7 @@ func (e *Executor) SetAccess(op client.Operation) error {
 	// explicit. internal/tailnet never reach a public interface at all.
 	streamer.AddLine("Applying network binding...")
 	streamer.Flush()
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "up", "-d", "--remove-orphans")...); err != nil {
 		return fail(fmt.Errorf("docker compose up: %w", err))
 	}
 

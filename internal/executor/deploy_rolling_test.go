@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -9,7 +11,7 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 	serviceID := "svc-123"
 	args := rollingContainerArgs(
 		serviceID+"-blue", serviceID, "blue",
-		"registry/app:tag", "/opt/stacked/services/svc-123/.env",
+		"registry/app:tag", []string{"--env-file=/opt/stacked/services/svc-123/stacked.env"},
 		resourceLimits{restartPolicy: "unless-stopped"},
 		nil, "",
 	)
@@ -35,7 +37,7 @@ func TestRollingContainerArgsStableAlias(t *testing.T) {
 
 func TestRollingContainerArgsFriendlyAliases(t *testing.T) {
 	args := rollingContainerArgs(
-		"svc-1-blue", "svc-1", "blue", "img", "/env",
+		"svc-1-blue", "svc-1", "blue", "img", []string{"--env-file=/env"},
 		resourceLimits{restartPolicy: "unless-stopped"},
 		[]string{"api", "old-name", "BAD ALIAS", ""}, "",
 	)
@@ -62,7 +64,7 @@ func TestRollingContainerArgsFriendlyAliases(t *testing.T) {
 
 func TestRollingContainerArgsAppliesLimits(t *testing.T) {
 	args := rollingContainerArgs(
-		"svc-1-green", "svc-1", "green", "img", "/env",
+		"svc-1-green", "svc-1", "green", "img", []string{"--env-file=/env"},
 		resourceLimits{cpuMillicores: 1500, memoryMB: 512, restartPolicy: "on-failure"},
 		nil, "",
 	)
@@ -79,7 +81,7 @@ func TestRollingContainerArgsAppliesLimits(t *testing.T) {
 
 func TestRollingContainerArgsOmitsUnsetLimits(t *testing.T) {
 	args := rollingContainerArgs(
-		"svc-1-blue", "svc-1", "blue", "img", "/env",
+		"svc-1-blue", "svc-1", "blue", "img", []string{"--env-file=/env"},
 		resourceLimits{restartPolicy: "unless-stopped"},
 		nil, "",
 	)
@@ -146,7 +148,7 @@ func TestRequiresFastRestartForAnyAttachedStorage(t *testing.T) {
 }
 
 func TestRollingContainerArgsAppliesDockerImageCommand(t *testing.T) {
-	args := rollingContainerArgs("svc-blue", "svc", "blue", "image", "/env",
+	args := rollingContainerArgs("svc-blue", "svc", "blue", "image", []string{"--env-file=/env"},
 		resourceLimits{restartPolicy: "unless-stopped"}, nil, "node server.js && echo ready")
 	want := []string{"image", "sh", "-lc", "node server.js && echo ready"}
 	if len(args) < len(want) {
@@ -208,5 +210,91 @@ func TestBlueGreenHeadroomError(t *testing.T) {
 	// live, 400 MB free. Caps are not reservations.
 	if err := blueGreenHeadroomError(180, 1024, 400); err != nil {
 		t.Fatalf("400 MB free for a 180 MB live container must pass: %v", err)
+	}
+}
+
+// A blue/green deploy after a recreate deploy must rewrite the compose
+// file's `environment:` map (and settings), or a Restart that falls back
+// to `compose up -d` starts the service with stale env.
+func TestRefreshBlueGreenComposeUpdatesEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "docker-compose.yml")
+	oldEnv := map[string]string{"API_KEY": "old", "GONE": "x", "HOST": "0.0.0.0"}
+	old := generateCompose(goldenServiceID, "img:1", nil, resourceLimits{restartPolicy: "unless-stopped"}, nil, "", oldEnv)
+	if err := writeFile(composePath, old); err != nil {
+		t.Fatal(err)
+	}
+
+	newEnv := map[string]string{"API_KEY": "new", "HOST": "0.0.0.0", "PEM": "a\nb"}
+	payload := map[string]interface{}{"memoryLimitMb": float64(256), "restartPolicy": "always"}
+	if err := refreshBlueGreenCompose(dir, goldenServiceID, "img:2", payload, []string{"api"}, newEnv); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := generateCompose(goldenServiceID, "img:2", nil, resourceLimitsFromPayload(payload), []string{"api"}, "", newEnv)
+	if string(got) != want {
+		t.Fatalf("compose not regenerated:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(string(got), "GONE") || strings.Contains(string(got), `"old"`) {
+		t.Fatalf("stale env left in compose:\n%s", got)
+	}
+	info, err := os.Stat(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("compose mode = %v, want 0600", info.Mode().Perm())
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("leftover files after atomic write: %v", entries)
+	}
+}
+
+// The legacy `.env` is kept in sync while an old template references it,
+// and removed once the compose file has been regenerated.
+func TestRefreshBlueGreenComposeReplacesLegacyTemplate(t *testing.T) {
+	dir := t.TempDir()
+	legacy, err := os.ReadFile(filepath.Join("testdata", "compose_legacy", "service-min.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), string(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(filepath.Join(dir, ".env"), "API_KEY=old\n"); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"API_KEY": "new", "HOST": "0.0.0.0"}
+	if err := syncLegacyEnvFile(dir, env); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, ".env")); !strings.Contains(string(b), "API_KEY=new") {
+		t.Fatalf("legacy .env not synced: %q", b)
+	}
+	if err := refreshBlueGreenCompose(dir, goldenServiceID, "img:2", nil, nil, env); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	if composeReferencesLegacyEnv(string(got)) || !strings.Contains(string(got), `API_KEY: "new"`) {
+		t.Fatalf("compose not regenerated:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".env")); !os.IsNotExist(err) {
+		t.Fatalf("legacy .env not removed: %v", err)
+	}
+}
+
+// A service that only ever deployed blue/green has no compose file; one
+// isn't invented (Restart keeps reporting "redeploy required").
+func TestRefreshBlueGreenComposeSkipsMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := refreshBlueGreenCompose(dir, goldenServiceID, "img:2", nil, nil, map[string]string{"A": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); !os.IsNotExist(err) {
+		t.Fatalf("compose file created: %v", err)
 	}
 }

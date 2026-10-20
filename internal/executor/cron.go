@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -72,7 +71,7 @@ func (e *Executor) runHTTPJob(op client.Operation) (map[string]interface{}, erro
 		bodyReader = strings.NewReader(body)
 	}
 
-	req, err := http.NewRequest(method, jobURL, bodyReader)
+	req, err := http.NewRequestWithContext(currentOpContext(), method, jobURL, bodyReader)
 	if err != nil {
 		return fail(fmt.Errorf("build request: %w", err))
 	}
@@ -142,6 +141,11 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 	// the git-build image name the deploy path produced.
 	dockerImage := getStringPayload(op.Payload, "dockerImage")
 	imageName := dockerImage
+	if dockerImage != "" {
+		if err := validateImageReference(dockerImage); err != nil {
+			return fail(err)
+		}
+	}
 	if imageName == "" {
 		imageName = "stacked-" + serviceID
 	}
@@ -170,15 +174,14 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		return fail(fmt.Errorf("get credentials: %w", err))
 	}
 
-	if creds.EnvVars == nil {
-		creds.EnvVars = map[string]string{}
-	}
-	if _, ok := creds.EnvVars["HOST"]; !ok {
-		creds.EnvVars["HOST"] = "0.0.0.0"
-	}
-	envPath := filepath.Join(dir, ".env")
-	if err := writeFile(envPath, buildEnvFile(creds.EnvVars)); err != nil {
-		return fail(fmt.Errorf("write .env: %w", err))
+	// Same env plumbing as the release and rolling paths: single-line
+	// values in stacked.env (0600), multi-line values through the docker
+	// CLI's process env with `-e KEY`, never argv.
+	env, envWarnings := serviceEnv(creds.EnvVars)
+	addEnvWarnings(streamer, envWarnings)
+	runEnv, envPath, err := writeServiceEnvFile(dir, env)
+	if err != nil {
+		return fail(err)
 	}
 
 	// Make sure the stacked network exists — the job may need to reach the
@@ -191,7 +194,7 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 
 	runID := getStringPayload(op.Payload, "runId")
 	containerName := serviceID + "-cron"
-	if runID != "" {
+	if isUUID(runID) {
 		// Short suffix keeps concurrent manual + scheduled runs from
 		// colliding on the container name.
 		suffix := runID
@@ -201,15 +204,17 @@ func (e *Executor) runCommandJob(op client.Operation) (map[string]interface{}, e
 		containerName = serviceID + "-cron-" + suffix
 	}
 
+	timeout := CronJobTimeout(op.Payload)
 	args := []string{
 		"run", "--rm",
 		"--network=stacked",
-		"--env-file=" + envPath,
-		"--name", containerName,
-		imageName,
-		"sh", "-lc", command,
 	}
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", args...); err != nil {
+	args = append(args, runEnv.Args(envPath)...)
+	args = append(args, "--name", containerName)
+	args = append(args, jobLabelArgs("cron")...)
+	args = append(args, jobResourceArgs(op.Payload, defaultCronMemoryMB)...)
+	args = append(args, imageName, "sh", "-lc", command)
+	if err := runJobContainer(streamer, dir, runEnv.CommandEnv(), containerName, timeout, args); err != nil {
 		return fail(fmt.Errorf("job command failed: %w", err))
 	}
 

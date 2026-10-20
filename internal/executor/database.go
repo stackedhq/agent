@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,6 +59,17 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	if containerName == "" {
 		return nil, fmt.Errorf("db_provision requires containerName")
 	}
+	if version := getStringPayload(op.Payload, "version"); version != "" && !validDBVersion(version) {
+		return nil, fmt.Errorf("db_provision: invalid version %q", truncateForError(version))
+	}
+	// generateDatabaseCompose validates the image and container name; check
+	// them before any directory is created.
+	if err := validateImageReference(dockerImage); err != nil {
+		return nil, fmt.Errorf("db_provision: %w", err)
+	}
+	if err := validateContainerName(containerName); err != nil {
+		return nil, fmt.Errorf("db_provision: %w", err)
+	}
 
 	dir := databaseDir(databaseID)
 	if err := ensureDir(dir); err != nil {
@@ -101,7 +113,7 @@ func (e *Executor) Provision(op client.Operation) (map[string]interface{}, error
 	streamer.Flush()
 
 	log.Printf("Provisioning database %s (%s)", databaseID, containerName)
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "up", "-d", "--remove-orphans")...); err != nil {
 		return nil, fail(fmt.Errorf("docker compose up: %w", err))
 	}
 
@@ -143,15 +155,15 @@ func (e *Executor) StartDB(op client.Operation) error {
 
 	// `compose start` errors out if the container doesn't exist yet (e.g.
 	// after a manual `docker rm`); fall back to `up -d` which creates it.
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "start"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "start")...); err != nil {
 		log.Printf("compose start failed for %s, falling back to up -d: %v", databaseID, err)
 		streamer.AddLine("compose start failed; recreating container with up -d")
 		streamer.Flush()
 		// Tear down the stale container (releases the port binding) but keep
 		// volumes so data survives. Without this, `up -d` fails with
 		// "port is already allocated" when a ghost container holds the port.
-		_ = e.runCommandWithStreamer(streamer, dir, "docker", "compose", "down")
-		if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "up", "-d"); err != nil {
+		_ = e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "down")...)
+		if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "up", "-d")...); err != nil {
 			streamer.AddLine("ERROR: " + err.Error())
 			streamer.Flush()
 			return fmt.Errorf("docker compose up: %w", err)
@@ -186,7 +198,7 @@ func (e *Executor) StopDB(op client.Operation) error {
 	streamer.Flush()
 
 	log.Printf("Stopping database %s", databaseID)
-	if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "stop"); err != nil {
+	if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "stop")...); err != nil {
 		streamer.AddLine("ERROR: " + err.Error())
 		streamer.Flush()
 		return fmt.Errorf("docker compose stop: %w", err)
@@ -207,6 +219,9 @@ func (e *Executor) DestroyDB(op client.Operation) error {
 		return fmt.Errorf("db_destroy requires databaseId")
 	}
 
+	if !isUUID(databaseID) {
+		return fmt.Errorf("db_destroy: invalid databaseId")
+	}
 	dir := databaseDir(databaseID)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		log.Printf("DestroyDB: dir %s already gone, treating as success", dir)
@@ -221,7 +236,7 @@ func (e *Executor) DestroyDB(op client.Operation) error {
 	// `down -v` errors out if the compose file is missing — at that point
 	// the container/volumes were already cleaned up so swallow the error.
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); err == nil {
-		if err := e.runCommandWithStreamer(streamer, dir, "docker", "compose", "down", "-v"); err != nil {
+		if err := e.runCommandWithStreamer(streamer, dir, "docker", composeArgs(dir, "down", "-v")...); err != nil {
 			streamer.AddLine("ERROR: " + err.Error())
 			streamer.Flush()
 			return fmt.Errorf("docker compose down: %w", err)
@@ -263,190 +278,165 @@ func databaseNativePort(dbType string) int {
 	return 0
 }
 
-// renderDatabasePorts builds the compose `ports:` block for a database based
-// on its access mode. The returned string is spliced directly into the
-// service definition (already indented, trailing newline) — or empty for
-// internal mode, which publishes no host port at all.
+// databasePortSpecs returns the compose `ports:` entries for a database
+// based on its access mode, or none.
 //
-//   - internal: "" — no host binding. Reachable only over the `stacked`
+//   - internal: none — no host binding. Reachable only over the `stacked`
 //     Docker network; closed to the host and internet by construction.
 //   - tailnet:  bind to the machine's Tailscale IP (bindHost) so the port is
 //     reachable only over the tailnet. If bindHost is empty (Tailscale not
 //     ready) we publish nothing rather than fall back to 0.0.0.0 — failing
-//     closed is the safe choice.
-//   - public:   bind 0.0.0.0. Source-IP restriction is enforced separately as
-//     DOCKER-USER firewall rules (see firewall.go), not here.
-func renderDatabasePorts(accessMode, bindHost string, hostPort, nativePort int) string {
+//     closed is the safe choice. A bindHost that isn't an IP address is an
+//     error.
+//   - public:   bind 0.0.0.0. Source-IP restriction is the user's
+//     responsibility at their cloud firewall (see access.go).
+func databasePortSpecs(accessMode, bindHost string, hostPort, nativePort int) ([]string, error) {
 	switch accessMode {
 	case "tailnet":
 		if bindHost == "" {
-			return ""
+			return nil, nil
 		}
-		return fmt.Sprintf("    ports:\n      - \"%s:%d:%d\"\n", bindHost, hostPort, nativePort)
+		addr, err := netip.ParseAddr(bindHost)
+		if err != nil || addr.Zone() != "" {
+			return nil, fmt.Errorf("invalid tailscale IP %q", truncateForError(bindHost))
+		}
+		host := addr.String()
+		if addr.Is6() && !addr.Is4In6() {
+			host = "[" + host + "]"
+		}
+		return []string{fmt.Sprintf("%s:%d:%d", host, hostPort, nativePort)}, nil
 	case "public":
-		return fmt.Sprintf("    ports:\n      - \"%d:%d\"\n", hostPort, nativePort)
+		return []string{fmt.Sprintf("%d:%d", hostPort, nativePort)}, nil
 	default: // internal (and any unknown value — fail closed)
-		return ""
+		return nil, nil
 	}
 }
 
+// redisConfigQuote renders s as a double-quoted redis.conf string with every
+// byte hex-escaped, so any password survives redis's config parser intact.
+func redisConfigQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		fmt.Fprintf(&b, `\x%02x`, s[i])
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// redisStartScript keeps the password out of every argv. The compose
+// `environment:` hands the container a pre-quoted `requirepass` value; the
+// script (running inside the container) writes it to a config file and
+// starts redis-server with that file. It re-enters the official image's
+// docker-entrypoint.sh when present so redis still drops to the `redis`
+// user and gets the image's protected-mode handling. Defaults are
+// otherwise unchanged (persistence to /data, the working directory).
+const redisStartScript = `set -e
+conf=/tmp/stacked-redis.conf
+umask 077
+printf 'requirepass %s\n' "$STACKED_REDIS_REQUIREPASS" > "$conf"
+chmod 0644 "$conf"
+if command -v docker-entrypoint.sh >/dev/null 2>&1; then
+  exec docker-entrypoint.sh redis-server "$conf"
+fi
+exec redis-server "$conf"
+`
+
+// generateDatabaseCompose returns a docker-compose.yml tailored to the DB
+// engine. Sets `com.stacked.kind=database` so the runtimelogs manager
+// correctly skips DB containers, and the databaselogs manager picks them
+// up. The volume is named `data` and is compose-managed (not a bind
+// mount) — `compose down -v` cleans it up on destroy, plain stop/start
+// preserves it.
+//
+// Every scalar goes through compose_yaml.go (JSON-quoted, `$` escaped), so
+// credentials are passed to the container verbatim, whatever they contain.
 func generateDatabaseCompose(dbType string, port int, containerName, image string, creds map[string]string, accessMode, bindHost string) (string, error) {
-	portsBlock := renderDatabasePorts(accessMode, bindHost, port, databaseNativePort(dbType))
+	if err := validateImageReference(image); err != nil {
+		return "", err
+	}
+	if err := validateContainerName(containerName); err != nil {
+		return "", err
+	}
+	ports, err := databasePortSpecs(accessMode, bindHost, port, databaseNativePort(dbType))
+	if err != nil {
+		return "", err
+	}
+
+	var env yMap
+	var command yNode
+	var dataPath string
 	switch dbType {
 	case "postgres":
-		user := creds["user"]
-		password := creds["password"]
-		dbName := creds["dbName"]
+		user, password, dbName := creds["user"], creds["password"], creds["dbName"]
 		if user == "" || password == "" || dbName == "" {
 			return "", fmt.Errorf("postgres credentials incomplete")
 		}
-		return fmt.Sprintf(`services:
-  database:
-    image: %s
-    container_name: %s
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: %s
-      POSTGRES_PASSWORD: %s
-      POSTGRES_DB: %s
-    volumes:
-      - data:/var/lib/postgresql/data
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), portsBlock), nil
-
+		env = yMap{
+			{Key: "POSTGRES_USER", Value: yStr(user)},
+			{Key: "POSTGRES_PASSWORD", Value: yStr(password)},
+			{Key: "POSTGRES_DB", Value: yStr(dbName)},
+		}
+		dataPath = "/var/lib/postgresql/data"
 	case "mysql":
-		user := creds["user"]
-		password := creds["password"]
-		dbName := creds["dbName"]
-		rootPw := creds["rootPassword"]
+		user, password, dbName, rootPw := creds["user"], creds["password"], creds["dbName"], creds["rootPassword"]
 		if user == "" || password == "" || dbName == "" || rootPw == "" {
 			return "", fmt.Errorf("mysql credentials incomplete")
 		}
-		return fmt.Sprintf(`services:
-  database:
-    image: %s
-    container_name: %s
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: %s
-      MYSQL_DATABASE: %s
-      MYSQL_USER: %s
-      MYSQL_PASSWORD: %s
-    volumes:
-      - data:/var/lib/mysql
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(rootPw), yamlEscape(dbName), yamlEscape(user), yamlEscape(password), portsBlock), nil
-
+		env = yMap{
+			{Key: "MYSQL_ROOT_PASSWORD", Value: yStr(rootPw)},
+			{Key: "MYSQL_DATABASE", Value: yStr(dbName)},
+			{Key: "MYSQL_USER", Value: yStr(user)},
+			{Key: "MYSQL_PASSWORD", Value: yStr(password)},
+		}
+		dataPath = "/var/lib/mysql"
 	case "mongo":
-		user := creds["user"]
-		password := creds["password"]
-		dbName := creds["dbName"]
+		user, password, dbName := creds["user"], creds["password"], creds["dbName"]
 		if user == "" || password == "" || dbName == "" {
 			return "", fmt.Errorf("mongo credentials incomplete")
 		}
-		return fmt.Sprintf(`services:
-  database:
-    image: %s
-    container_name: %s
-    restart: unless-stopped
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: %s
-      MONGO_INITDB_ROOT_PASSWORD: %s
-      MONGO_INITDB_DATABASE: %s
-    volumes:
-      - data:/data/db
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlEscape(user), yamlEscape(password), yamlEscape(dbName), portsBlock), nil
-
+		env = yMap{
+			{Key: "MONGO_INITDB_ROOT_USERNAME", Value: yStr(user)},
+			{Key: "MONGO_INITDB_ROOT_PASSWORD", Value: yStr(password)},
+			{Key: "MONGO_INITDB_DATABASE", Value: yStr(dbName)},
+		}
+		dataPath = "/data/db"
 	case "redis":
 		password := creds["password"]
 		if password == "" {
 			return "", fmt.Errorf("redis credentials incomplete")
 		}
-		// `command:` is a YAML sequence to keep the password out of a
-		// re-parsed shell string. The password is base64url so YAML-escape
-		// is still cheap insurance against future credential generators.
-		return fmt.Sprintf(`services:
-  database:
-    image: %s
-    container_name: %s
-    restart: unless-stopped
-    command: ["redis-server", "--requirepass", %s]
-    volumes:
-      - data:/data
-%s    networks:
-      - stacked
-    labels:
-      com.stacked.kind: database
-
-volumes:
-  data:
-
-networks:
-  stacked:
-    name: stacked
-    external: true
-`, image, containerName, yamlQuote(password), portsBlock), nil
+		env = yMap{{Key: "STACKED_REDIS_REQUIREPASS", Value: yStr(redisConfigQuote(password))}}
+		command = yStrList("sh", "-c", redisStartScript)
+		dataPath = "/data"
+	default:
+		return "", fmt.Errorf("unsupported database type: %s", dbType)
 	}
-	return "", fmt.Errorf("unsupported database type: %s", dbType)
-}
 
-// yamlEscape returns a YAML-safe form for an environment value. Postgres
-// passwords from base64url alphabet (A-Za-z0-9_-) don't need quoting, but
-// imported databases (e.g. via the Dokploy importer) can carry arbitrary
-// strings — quote when in doubt.
-func yamlEscape(s string) string {
-	if s == "" {
-		return `""`
+	svc := yMap{
+		{Key: "image", Value: yStr(image)},
+		{Key: "container_name", Value: yStr(containerName)},
+		{Key: "restart", Value: yStr("unless-stopped")},
 	}
-	if strings.ContainsAny(s, " \t\n\"'#:&*?{}[]|<>=!%@`,") {
-		return yamlQuote(s)
+	if command != nil {
+		svc = append(svc, yKV{Key: "command", Value: command})
 	}
-	// Numbers / booleans need quoting too, otherwise YAML parses them
-	// out of string context.
-	switch strings.ToLower(s) {
-	case "true", "false", "yes", "no", "null", "~":
-		return yamlQuote(s)
+	svc = append(svc,
+		yKV{Key: "environment", Value: env},
+		yKV{Key: "volumes", Value: yStrList("data:" + dataPath)},
+	)
+	if len(ports) > 0 {
+		svc = append(svc, yKV{Key: "ports", Value: yStrList(ports...)})
 	}
-	return s
-}
-
-// yamlQuote double-quotes and escapes a string for YAML.
-func yamlQuote(s string) string {
-	return `"` + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`) + `"`
+	svc = append(svc,
+		yKV{Key: "networks", Value: yStrList("stacked")},
+		yKV{Key: "labels", Value: yMap{{Key: "com.stacked.kind", Value: yStr("database")}}},
+	)
+	return renderYAML(yMap{
+		{Key: "services", Value: yMap{{Key: "database", Value: svc}}},
+		{Key: "volumes", Value: yMap{{Key: "data", Value: yNull{}}}},
+		{Key: "networks", Value: stackedNetworkDecl()},
+	}), nil
 }
 
 // getIntPayload pulls an int from a JSON-decoded payload. JSON numbers come

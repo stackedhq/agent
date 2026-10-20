@@ -1,0 +1,23 @@
+services:
+  database:
+    image: "mongo:7"
+    container_name: "stk-db-mo"
+    restart: "unless-stopped"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "app"
+      MONGO_INITDB_ROOT_PASSWORD: "p#w"
+      MONGO_INITDB_DATABASE: "appdb"
+    volumes:
+      - "data:/data/db"
+    networks:
+      - "stacked"
+    labels:
+      com.stacked.kind: "database"
+
+volumes:
+  data:
+
+networks:
+  stacked:
+    name: "stacked"
+    external: true

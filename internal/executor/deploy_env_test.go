@@ -2,12 +2,10 @@ package executor
 
 import "testing"
 
-// buildEnvFile writes a .env file consumed by docker compose's per-service
-// `env_file:` directive. Compose does NOT quote-strip values loaded that
-// way (unlike the project-root .env used for compose variable
-// substitution) — quote characters would be passed through as literal
-// content. Regression test for a bug where values containing spaces (or
-// other "special" characters) got wrapped in quotes here, baking literal
+// buildEnvFile writes a `docker run --env-file` file. The docker CLI does
+// NOT quote-strip values, so quote characters would be passed through as
+// literal content. Regression test for a bug where values containing spaces
+// (or other "special" characters) got wrapped in quotes here, baking literal
 // `"…"` characters into container env vars like
 // `SMTP_FROM="Riffado <noreply@riffado.com>"`.
 func TestBuildEnvFileDoesNotQuoteValues(t *testing.T) {

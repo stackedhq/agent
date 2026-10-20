@@ -1,15 +1,18 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 	"unicode"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
@@ -78,14 +81,67 @@ func SetServerBaseURL(u string) {
 	serverBaseURL = strings.TrimRight(u, "/")
 }
 
+// machineID is this machine's server-side ID, learned from the
+// `machineId` field every claimed operation carries (see NoteMachineID).
+// Empty until the first op. Read when rendering the on-demand TLS ask
+// URL so the server can scope authorization to this machine's domains.
+var machineID atomic.Value // string
+
+// machineIDPath persists the machine ID across restarts so the Caddyfile
+// rendered by the startup reconcile (before any op has been claimed)
+// already carries `?m=`. Package var for tests.
+var machineIDPath = filepath.Join(stackedDir, "machine-id")
+
+// NoteMachineID records the machine ID from an operation. Only
+// UUID-shaped values are accepted, since it's spliced into a URL in
+// the Caddyfile. A new value is persisted to machineIDPath (0600).
+func NoteMachineID(id string) {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if !uuidRe.MatchString(id) || id == currentMachineID() {
+		return
+	}
+	machineID.Store(id)
+	if err := writeFileAtomic(machineIDPath, []byte(id+"\n"), 0o600); err != nil {
+		log.Printf("persist machine id: %v", err)
+	}
+}
+
+// LoadMachineID restores the machine ID persisted by NoteMachineID.
+// Called at startup before the proxy reconcile; a missing or invalid
+// file just leaves the ID unknown until the first op.
+func LoadMachineID() {
+	data, err := os.ReadFile(machineIDPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("load machine id: %v", err)
+		}
+		return
+	}
+	id := strings.ToLower(strings.TrimSpace(string(data)))
+	if uuidRe.MatchString(id) {
+		machineID.Store(id)
+	}
+}
+
+func currentMachineID() string {
+	v, _ := machineID.Load().(string)
+	return v
+}
+
 // onDemandAskURL returns the full `ask` endpoint URL Caddy should call
 // before issuing an on-demand certificate, or "" when the server origin
 // is unknown (in which case the caller must not emit on_demand at all).
+// When the machine ID is known it's passed as `?m=<id>`; Caddy merges
+// its own `domain=<host>` into the query.
 func onDemandAskURL() string {
 	if serverBaseURL == "" {
 		return ""
 	}
-	return serverBaseURL + "/api/agent/tls/ask"
+	u := serverBaseURL + "/api/agent/tls/ask"
+	if id := currentMachineID(); id != "" {
+		u += "?m=" + id
+	}
+	return u
 }
 
 // cachedDomain is the on-disk representation of one entry in the
@@ -190,6 +246,27 @@ func (d cachedDomain) isPortBound() bool {
 // agent from booting — Docker may be slow to come up, the proxy may
 // be in a transient bad state, etc. The poller will recover via the
 // next proxy_config or Setup op.
+// StartupProxyReconcileTimeout bounds the startup proxy reconcile so a
+// hung docker daemon can't keep the poller from ever starting.
+const StartupProxyReconcileTimeout = 10 * time.Minute
+
+// ReconcileProxyWithTimeout runs ReconcileProxy as if it were an op with
+// the given deadline: every command it starts is bound to that context
+// and killed when it expires. Must not run concurrently with ops (it
+// installs the package-level op context), so call it before the poller
+// starts.
+func ReconcileProxyWithTimeout(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	restore := setOpContext(ctx)
+	defer restore()
+	err := ReconcileProxy()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("timed out after %s: %w", timeout, ctxErr)
+	}
+	return err
+}
+
 func ReconcileProxy() error {
 	composePath := filepath.Join(proxyDir, "docker-compose.yml")
 	if _, err := os.Stat(composePath); err != nil {
@@ -201,7 +278,33 @@ func ReconcileProxy() error {
 	if _, err := runCommandSilent("", "docker", "info"); err != nil {
 		return fmt.Errorf("docker not available")
 	}
-	return ensureProxy()
+	if err := ensureProxy(); err != nil {
+		return err
+	}
+	return migrateLegacyGateCaddyfile()
+}
+
+// migrateLegacyGateCaddyfile re-renders the live Caddyfile from the
+// cached domains when it still points forward_auth at the pre-rename
+// `gate:9876` sidecar (which ensureProxy just removed), so gated
+// domains recover on the restart after self-update instead of waiting
+// for the next proxy_config op. Goes through the same gate-first path
+// as proxy_config.
+func migrateLegacyGateCaddyfile() error {
+	live, err := os.ReadFile(filepath.Join(proxyDir, "Caddyfile"))
+	if err != nil || !strings.Contains(string(live), "forward_auth gate:9876") {
+		return nil
+	}
+	parsed, err := loadDomains()
+	if err != nil || parsed == nil {
+		return err
+	}
+	parsed = sanitizeDomains(parsed)
+	if err := applyGateConfig(buildGateConfig(parsed)); err != nil {
+		return fmt.Errorf("auth gate: %w", err)
+	}
+	log.Printf("proxy: migrating Caddyfile to %s", gateUpstream)
+	return writeAndReloadCaddyfile(parsed)
 }
 
 // ensureProxy ensures the Caddy proxy infrastructure is running.
@@ -221,6 +324,11 @@ func ReconcileProxy() error {
 func ensureProxy() error {
 	if err := ensureDir(proxyDir); err != nil {
 		return fmt.Errorf("create proxy dir: %w", err)
+	}
+	// The gate's bind-mount source must exist (owned by the agent)
+	// before compose runs, or docker creates it as root.
+	if err := ensureGateDir(); err != nil {
+		return err
 	}
 
 	// Ensure the stacked network exists
@@ -250,13 +358,25 @@ func ensureProxy() error {
 		return fmt.Errorf("ensure Caddyfile: %w", err)
 	}
 
+	// Record networks attached to the current Caddy at runtime (Dokploy
+	// takeover) before `compose up` can recreate the container without
+	// them. Best-effort: a failure here must not block routing.
+	if err := recordCaddyRuntimeNetworks(); err != nil {
+		log.Printf("proxy: record caddy runtime networks: %v", err)
+	}
+
 	// Start Caddy (no-op if already running). docker compose up -d is
 	// idempotent against a running container, and the docker daemon is
 	// the authoritative arbiter of port conflicts — if :80 or :443 is
 	// held by something else, the daemon returns a recognizable error
 	// string that parsePortInUseFromDocker turns into a typed
 	// ProxyConfigError for the server to surface.
-	if out, err := runCommandSilent(proxyDir, "docker", "compose", "up", "-d"); err != nil {
+	//
+	// Only Caddy is started here: a gate start failure must not take
+	// down routing for ungated domains. (Compose ignores
+	// --remove-orphans when a service is named, so the pre-rename
+	// `gate` container is removed explicitly below.)
+	if out, err := runCommandSilent(proxyDir, "docker", "compose", "up", "-d", "caddy"); err != nil {
 		if port, holder := parsePortInUseFromDocker(out); port != 0 {
 			msg := fmt.Sprintf("port %d is already in use on this machine", port)
 			if holder != "" {
@@ -271,16 +391,31 @@ func ensureProxy() error {
 		}
 		return fmt.Errorf("start caddy: %s: %w", out, err)
 	}
+	removeLegacyGateContainer()
+
+	// Re-attach runtime networks a recreate may have dropped.
+	if err := reconnectCaddyNetworks(); err != nil {
+		log.Printf("proxy: %v", err)
+	}
+
+	// Best-effort here; proxy_config requires the gate (and fails the
+	// op) only when a domain is actually gated (applyGateConfig).
+	if err := gateStartFn(); err != nil {
+		log.Printf("proxy: auth gate not started: %v", err)
+	}
 
 	return nil
 }
+
+// lookupPortHolder is lookupPortHolderContainer, swappable in tests.
+var lookupPortHolder = lookupPortHolderContainer
 
 // lookupPortHolderContainer asks docker which container publishes the
 // given port on the host, if any. Returns "" if no docker container
 // claims it (the holder might be a systemd service, nginx on the
 // host, etc., in which case we can't name it cheaply).
 func lookupPortHolderContainer(port int) string {
-	out, err := exec.Command("docker", "ps",
+	out, err := opCommand("docker", "ps",
 		"--filter", fmt.Sprintf("publish=%d", port),
 		"--format", "{{.Names}}").Output()
 	if err != nil {
@@ -315,7 +450,7 @@ func parsePortInUseFromDocker(out string) (int, string) {
 	if _, err := fmt.Sscanf(strings.SplitN(out, "0.0.0.0:", 2)[1], "%d", &port); err != nil || port == 0 {
 		return 0, ""
 	}
-	return port, lookupPortHolderContainer(port)
+	return port, lookupPortHolder(port)
 }
 
 // ProxyConfig signature returns a structured result alongside the
@@ -335,31 +470,56 @@ func (e *Executor) ProxyConfig(op client.Operation) error {
 		return fmt.Errorf("proxy_config domains must be an array")
 	}
 
-	if err := ensureProxy(); err != nil {
+	parsed := sanitizeDomains(parseDomains(domains))
+	gateCfg := buildGateConfig(parsed)
+
+	if err := ensureProxyFn(); err != nil {
 		return fmt.Errorf("ensure proxy: %w", err)
 	}
 
-	parsed := parseDomains(domains)
-	if err := validatePortBoundHosts(parsed); err != nil {
-		return err
+	// The gate must know every gated domain before Caddy starts sending
+	// forward_auth for it, so it is updated first. That also means a
+	// failure after the gate write (the gate not loading it, or Caddy
+	// rejecting or failing to reload its config) would leave Caddy on its
+	// old routes behind a gate that no longer knows their domains (403).
+	// So the previous gate config is kept and put back on any failure:
+	// the gate and Caddy both end in their old state.
+	prevGate, err := snapshotGateConfig()
+	if err != nil {
+		return fmt.Errorf("auth gate: read current config: %w", err)
 	}
+	rollbackGate := func(cause error) error {
+		if rerr := restoreGateConfig(prevGate); rerr != nil {
+			log.Printf("proxy_config: restore previous auth gate config: %v", rerr)
+			return fmt.Errorf("%w (restoring the previous auth gate config also failed: %v)", cause, rerr)
+		}
+		return cause
+	}
+	if err := applyGateConfig(gateCfg); err != nil {
+		return rollbackGate(fmt.Errorf("auth gate: %w", err))
+	}
+
+	if err := caddyApplyFn(parsed); err != nil {
+		return rollbackGate(err)
+	}
+
+	// Cache the domains only once Caddy runs them, so a later
+	// RegenerateCaddyfile (rolling flip) never installs a config whose
+	// gate entries were rolled back above.
 	if err := persistDomains(parsed); err != nil {
-		// Persistence failure shouldn't block the reload — the in-memory
-		// regen below still works. Log and continue.
+		// Caddy is already serving the new config; RegenerateCaddyfile
+		// just works from a staler cache until the next proxy_config.
 		log.Printf("proxy_config: persist domains.json failed (non-fatal): %v", err)
-	}
-
-	// Write gate config and manage the gate sidecar lifecycle.
-	if err := reconcileGate(parsed); err != nil {
-		log.Printf("proxy_config: gate reconcile failed (non-fatal): %v", err)
-	}
-
-	if err := writeAndReloadCaddyfile(parsed); err != nil {
-		return err
 	}
 	log.Printf("Caddy config updated for %d domain(s)", len(parsed))
 	return nil
 }
+
+// Test seams for ProxyConfig's docker-touching steps.
+var (
+	ensureProxyFn = ensureProxy
+	caddyApplyFn  = writeAndReloadCaddyfile
+)
 
 // RegenerateCaddyfile rewrites the Caddyfile from the persisted domains
 // list using current slot state, validates it, and reloads Caddy. Used
@@ -377,6 +537,7 @@ func RegenerateCaddyfile() error {
 		// Never saw a proxy_config op; nothing to regenerate.
 		return nil
 	}
+	parsed = sanitizeDomains(parsed)
 	if err := ensureProxy(); err != nil {
 		return fmt.Errorf("ensure proxy: %w", err)
 	}
@@ -422,7 +583,7 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 	// isn't portable across all Caddy versions.
 	composeFile := filepath.Join(proxyDir, "docker-compose.yml")
 	const candidateInContainer = "/tmp/Caddyfile.candidate"
-	writeCmd := exec.Command(
+	writeCmd := opCommand(
 		"docker", "compose", "-f", composeFile,
 		"exec", "-T", "caddy",
 		"sh", "-c", "cat > "+candidateInContainer,
@@ -434,14 +595,14 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 	// Best-effort cleanup; `/tmp` doesn't survive container restart
 	// anyway, but a tidy `rm` keeps `docker exec ls /tmp` boring.
 	defer func() {
-		_ = exec.Command(
+		_, _ = cleanupCommand(cleanupTimeout,
 			"docker", "compose", "-f", composeFile,
 			"exec", "-T", "caddy",
 			"rm", "-f", candidateInContainer,
-		).Run()
+		)
 	}()
 
-	if err := exec.Command(
+	if err := opCommand(
 		"docker", "compose", "-f", composeFile,
 		"exec", "-T", "caddy",
 		"caddy", "validate", "--config", candidateInContainer,
@@ -456,7 +617,7 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 		return fmt.Errorf("write Caddyfile: %w", err)
 	}
 
-	if err := exec.Command(
+	if err := opCommand(
 		"docker", "compose", "-f", composeFile,
 		"exec", "-T", "caddy",
 		"caddy", "reload", "--config", "/etc/caddy/Caddyfile",
@@ -465,7 +626,9 @@ func writeAndReloadCaddyfile(parsed []cachedDomain) error {
 		// (e.g. a runtime cert issue). Restore the previous file so
 		// the next boot reload sees known-good config.
 		if len(prev) > 0 {
-			_ = os.WriteFile(caddyfilePath, prev, 0644)
+			if werr := writeFile(caddyfilePath, string(prev)); werr != nil {
+				log.Printf("restore previous Caddyfile after failed reload: %v", werr)
+			}
 		}
 		return fmt.Errorf("caddy reload: %w", err)
 	}
@@ -563,16 +726,92 @@ func parseDomains(raw []interface{}) []cachedDomain {
 	return out
 }
 
-func validatePortBoundHosts(parsed []cachedDomain) error {
-	for _, d := range parsed {
-		if !d.isPortBound() {
-			continue
-		}
-		if err := validateUpstreamHost(d.Host); err != nil {
-			return fmt.Errorf("invalid port-bound upstream host for %s: %w", d.Domain, err)
+// caddyDomainRe is a strict hostname: lowercase LDH labels (no
+// wildcard; the server never sends one). Length is checked separately.
+var caddyDomainRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// caddyPathUnsafe are the characters (besides whitespace and control
+// characters) that could break a route path out of its Caddyfile token
+// or change how Caddy lexes it: `{`/`}` (blocks and placeholders), `"`
+// and backtick (quoting), `\` (escapes), `#` (comments). `?` and `*`
+// would change the matcher's meaning. Everything else the server
+// accepts (printable ASCII) is allowed; paths outside the bare-token
+// charset are rendered quoted (caddyPathToken).
+const caddyPathUnsafe = "{}\"`\\#?*"
+
+// caddyBareTokenRe is the charset that renders as an unquoted token.
+var caddyBareTokenRe = regexp.MustCompile(`^[A-Za-z0-9._~/-]+$`)
+
+const maxCaddyPathLen = 1024
+
+func validCaddyDomain(d string) bool {
+	return len(d) <= 253 && caddyDomainRe.MatchString(d)
+}
+
+func validCaddyPath(p string) bool {
+	if len(p) == 0 || len(p) > maxCaddyPathLen || p[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		// Printable ASCII only, no space (0x20): this also rejects
+		// every control character and non-ASCII byte.
+		if c <= 0x20 || c >= 0x7f || strings.IndexByte(caddyPathUnsafe, c) >= 0 {
+			return false
 		}
 	}
+	return true
+}
+
+// caddyPathMatcher renders a validated route path plus the trailing `*`
+// as a Caddyfile token, quoted when it contains anything outside the
+// bare-token charset. validCaddyPath has already excluded `"` and `\`,
+// so plain double quotes need no escaping.
+func caddyPathMatcher(path string) string {
+	if caddyBareTokenRe.MatchString(path) {
+		return path + "*"
+	}
+	return `"` + path + `*"`
+}
+
+// validateDomainRow checks that a row's domain and path are safe to
+// splice into the Caddyfile.
+func validateDomainRow(d cachedDomain) error {
+	if !validCaddyDomain(d.Domain) {
+		return fmt.Errorf("invalid domain %q", d.Domain)
+	}
+	if !validCaddyPath(d.effectivePath()) {
+		return fmt.Errorf("invalid path %q for domain %s", d.effectivePath(), d.Domain)
+	}
 	return nil
+}
+
+// sanitizeDomains lowercases domains and drops (with a logged error)
+// rows whose domain or path isn't a safe Caddyfile token, or whose
+// port-bound upstream host is rejected by validateUpstreamHost. Skipping
+// a row instead of failing the whole op keeps every other site on the
+// machine updatable (one bad row must not fail every proxy_config, or
+// RegenerateCaddyfile and with it a blue/green flip), and is safe
+// because the gate config and the Caddyfile are both derived from the
+// same filtered list: a dropped row simply isn't routed. The server
+// validates these fields too; this is defence in depth.
+func sanitizeDomains(parsed []cachedDomain) []cachedDomain {
+	out := make([]cachedDomain, 0, len(parsed))
+	for _, d := range parsed {
+		d.Domain = strings.ToLower(d.Domain)
+		if err := validateDomainRow(d); err != nil {
+			log.Printf("proxy: skipping domain row: %v", err)
+			continue
+		}
+		if d.isPortBound() {
+			if err := validateUpstreamHost(d.Host); err != nil {
+				log.Printf("proxy: skipping domain row: invalid port-bound upstream host for %s: %v", d.Domain, err)
+				continue
+			}
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 func persistDomains(parsed []cachedDomain) error {
@@ -640,6 +879,9 @@ func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot
 	// across the rows that share a hostname.
 	onDemandHost := make(map[string]bool)
 	for _, d := range parsed {
+		if err := validateDomainRow(d); err != nil {
+			return "", err
+		}
 		if _, seen := byHost[d.Domain]; !seen {
 			hostOrder = append(hostOrder, d.Domain)
 		}
@@ -712,14 +954,23 @@ func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot
 			// Gate-protected host: proxy /__stacked/* to the gate
 			// sidecar (login page, form POST, logout), then forward_auth
 			// everything else through the gate's /check endpoint.
+			//
+			// X-Stacked-Gate-Domain carries the configured domain
+			// literal (validated by validCaddyDomain, so it's a bare
+			// LDH token), not {host}: the gate keys on it, so Host
+			// case, trailing dots or ports can't select a different
+			// (or no) gate entry. header_up replaces any value the
+			// client sent.
 			b.WriteString("    handle /__stacked/* {\n")
-			b.WriteString("        reverse_proxy gate:9876\n")
+			fmt.Fprintf(&b, "        reverse_proxy %s {\n", gateUpstream)
+			fmt.Fprintf(&b, "            header_up X-Stacked-Gate-Domain %s\n", host)
+			b.WriteString("        }\n")
 			b.WriteString("    }\n")
 			b.WriteString("    handle {\n")
-			b.WriteString("        forward_auth gate:9876 {\n")
+			fmt.Fprintf(&b, "        forward_auth %s {\n", gateUpstream)
 			b.WriteString("            uri /check\n")
 			b.WriteString("            header_up X-Original-URI {uri}\n")
-			b.WriteString("            header_up X-Forwarded-Host {host}\n")
+			fmt.Fprintf(&b, "            header_up X-Stacked-Gate-Domain %s\n", host)
 			b.WriteString("        }\n")
 			// Emit upstream(s) inside the gated handle block
 			if len(sortedRows) == 1 && sortedRows[0].effectivePath() == "/" {
@@ -792,9 +1043,9 @@ func writePathHandle(b *strings.Builder, d cachedDomain, state map[string]slots.
 	if path == "/" {
 		fmt.Fprintf(b, "%shandle {\n", indent)
 	} else if d.effectiveStripPrefix() {
-		fmt.Fprintf(b, "%shandle_path %s* {\n", indent, path)
+		fmt.Fprintf(b, "%shandle_path %s {\n", indent, caddyPathMatcher(path))
 	} else {
-		fmt.Fprintf(b, "%shandle %s* {\n", indent, path)
+		fmt.Fprintf(b, "%shandle %s {\n", indent, caddyPathMatcher(path))
 	}
 	if err := writeUpstream(b, d, state, indent+"    "); err != nil {
 		return err
@@ -806,13 +1057,13 @@ func writePathHandle(b *strings.Builder, d cachedDomain, state map[string]slots.
 // renderUpstreamHostPort produces a Caddy-safe "host:port" token for a
 // port-bound upstream. Two non-obvious rewrites happen here:
 //
-//  1. Loopback rewrite. The Caddy container is on a docker bridge
-//     network, so the user-typed "127.0.0.1" and "localhost" resolve
-//     to the *container itself*, not the host. We rewrite both to
-//     "host.docker.internal", which the compose file pins to the
-//     host's gateway via `extra_hosts: host-gateway`. This is the
-//     only place the user's intent ("this VPS") matches what they
-//     typed without it.
+//  1. Loopback rewrite (loopbackRewrite). The Caddy container is on a
+//     docker bridge network, so the user-typed "127.0.0.1" and
+//     "localhost" resolve to the *container itself*, not the host. We
+//     rewrite them to "host.docker.internal", which the compose file
+//     pins to the host's gateway via `extra_hosts: host-gateway`. This
+//     is the only place the user's intent ("this VPS") matches what
+//     they typed without it.
 //
 //  2. IPv6 bracketing. Caddy expects `[2001:db8::1]:443` for IPv6
 //     literals. A bare `2001:db8::1:443` is ambiguous and rejected
@@ -822,9 +1073,8 @@ func renderUpstreamHostPort(host string, port int) (string, error) {
 	if err := validateUpstreamHost(host); err != nil {
 		return "", err
 	}
-	switch strings.ToLower(host) {
-	case "127.0.0.1", "localhost", "::1":
-		host = "host.docker.internal"
+	if rewritten, ok := loopbackRewrite(host); ok {
+		host = rewritten
 	}
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		return fmt.Sprintf("[%s]:%d", host, port), nil
@@ -832,6 +1082,34 @@ func renderUpstreamHostPort(host string, port int) (string, error) {
 	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
+// dockerHostAlias is the extra_hosts name for the VPS itself inside the
+// Caddy container (see proxyCompose).
+const dockerHostAlias = "host.docker.internal"
+
+// loopbackRewrite is the one intentional exception to "no loopback
+// upstreams": these exact spellings mean "a port on this VPS" and are
+// rewritten to the docker host alias. The alias itself is accepted too
+// (the dashboard allows typing it) and normalized to its canonical
+// spelling. Every other loopback address (127.0.0.2, ::ffff:127.0.0.1,
+// ...) is rejected by validateUpstreamHost.
+func loopbackRewrite(host string) (string, bool) {
+	switch strings.ToLower(host) {
+	case "127.0.0.1", "localhost", "::1", "[::1]", dockerHostAlias, dockerHostAlias + ".":
+		return dockerHostAlias, true
+	}
+	return "", false
+}
+
+// validateUpstreamHost checks a port-bound upstream host. Accepts IP
+// literals and RFC-1123 hostnames that are safe Caddyfile tokens, and
+// rejects addresses that would point Caddy somewhere the user can't
+// mean: loopback (other than the loopbackRewrite spellings),
+// unspecified, link-local (incl. cloud metadata 169.254.169.254) and
+// multicast, with IPv4-mapped IPv6 unmapped first. Also rejects
+// *.localhost and names reserved for Stacked infrastructure
+// (stacked-gate, caddy...). UUID-shaped names are allowed: they are
+// Stacked service container names on the shared network, which the
+// dashboard lets users target directly.
 func validateUpstreamHost(host string) error {
 	if host == "" {
 		return fmt.Errorf("host is empty")
@@ -844,28 +1122,62 @@ func validateUpstreamHost(host string) error {
 	if strings.ContainsAny(host, "{}\"'#/\\") {
 		return fmt.Errorf("host contains characters that are unsafe in Caddyfile upstream tokens")
 	}
+	if _, ok := loopbackRewrite(host); ok {
+		return nil
+	}
 
 	addrHost := host
-	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
+	bracketed := strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]")
+	if bracketed {
 		if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
 			return fmt.Errorf("invalid bracketed IPv6 host")
 		}
 		addrHost = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
-		addr, err := netip.ParseAddr(addrHost)
-		if err != nil || !addr.Is6() {
-			return fmt.Errorf("invalid bracketed IPv6 host")
-		}
-		return nil
 	}
 
-	if _, err := netip.ParseAddr(addrHost); err == nil {
-		return nil
+	if addr, err := netip.ParseAddr(addrHost); err == nil {
+		if bracketed && !addr.Is6() {
+			return fmt.Errorf("invalid bracketed IPv6 host")
+		}
+		if addr.Zone() != "" {
+			return fmt.Errorf("IPv6 zone identifiers are not supported")
+		}
+		return validateUpstreamAddr(addr.Unmap())
+	}
+	if bracketed {
+		return fmt.Errorf("invalid bracketed IPv6 host")
 	}
 	if strings.Contains(host, ":") {
 		return fmt.Errorf("invalid IP literal")
 	}
 	if !isRFC1123Hostname(host) {
 		return fmt.Errorf("host must be an IP literal or RFC-1123 hostname")
+	}
+	name := strings.TrimSuffix(strings.ToLower(host), ".")
+	if name == "localhost" || strings.HasSuffix(name, ".localhost") {
+		return fmt.Errorf("host %q is reserved; use 127.0.0.1 or localhost for a port on this machine", host)
+	}
+	if uuidRe.MatchString(name) {
+		return nil
+	}
+	if isReservedAlias(name) {
+		return fmt.Errorf("host %q is reserved for Stacked infrastructure", host)
+	}
+	return nil
+}
+
+func validateUpstreamAddr(addr netip.Addr) error {
+	switch {
+	case addr.IsLoopback():
+		return fmt.Errorf("loopback address %s is not allowed; use 127.0.0.1 or localhost for a port on this machine", addr)
+	case addr.IsUnspecified():
+		return fmt.Errorf("unspecified address %s is not allowed", addr)
+	case addr.IsLinkLocalUnicast():
+		return fmt.Errorf("link-local address %s is not allowed", addr)
+	case addr.IsMulticast(), addr.IsLinkLocalMulticast(), addr.IsInterfaceLocalMulticast():
+		return fmt.Errorf("multicast address %s is not allowed", addr)
+	case addr.Is4() && addr.As4()[0] == 255:
+		return fmt.Errorf("broadcast address %s is not allowed", addr)
 	}
 	return nil
 }
@@ -892,80 +1204,4 @@ func isRFC1123Hostname(host string) bool {
 		}
 	}
 	return true
-}
-
-// --- Auth gate sidecar lifecycle ---
-
-const (
-	gateDir        = "/opt/stacked/gate"
-	gateConfigPath = "/opt/stacked/gate/config.json"
-)
-
-// gateConfig mirrors cmd/gate's GateConfig for JSON serialization.
-type gateConfig struct {
-	Domains map[string]gateDomainEntry `json:"domains"`
-}
-
-type gateDomainEntry struct {
-	Mode         string `json:"mode"`
-	Username     string `json:"username"`
-	PasswordHash string `json:"passwordHash"`
-	ServiceName  string `json:"serviceName"`
-}
-
-// reconcileGate writes the gate config.json and ensures the gate
-// container is running when at least one domain has an auth gate,
-// or stopped when none do.
-func reconcileGate(parsed []cachedDomain) error {
-	cfg := gateConfig{Domains: make(map[string]gateDomainEntry)}
-	for _, d := range parsed {
-		if d.AuthGateMode == "" {
-			continue
-		}
-		name := d.ServiceName
-		if name == "" {
-			name = d.Domain
-		}
-		cfg.Domains[d.Domain] = gateDomainEntry{
-			Mode:         d.AuthGateMode,
-			Username:     d.AuthGateUsername,
-			PasswordHash: d.AuthGatePasswordHash,
-			ServiceName:  name,
-		}
-	}
-
-	needsGate := len(cfg.Domains) > 0
-
-	if needsGate {
-		if err := ensureDir(gateDir); err != nil {
-			return fmt.Errorf("create gate dir: %w", err)
-		}
-		data, err := json.MarshalIndent(cfg, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err := writeFile(gateConfigPath, string(data)); err != nil {
-			return fmt.Errorf("write gate config: %w", err)
-		}
-	}
-
-	// Reconcile the proxy compose to include/exclude the gate service.
-	composePath := filepath.Join(proxyDir, "docker-compose.yml")
-	want := proxyComposeWithGate(needsGate)
-	existing, _ := os.ReadFile(composePath)
-	if string(existing) != want {
-		if err := writeFile(composePath, want); err != nil {
-			return fmt.Errorf("write proxy compose: %w", err)
-		}
-		// Recreate containers to pick up the new compose file.
-		if out, err := runCommandSilent(proxyDir, "docker", "compose", "up", "-d"); err != nil {
-			return fmt.Errorf("compose up after gate change: %s: %w", out, err)
-		}
-	} else if needsGate {
-		// Config changed but compose didn't — restart the gate
-		// container so it re-reads config.json.
-		_, _ = runCommandSilent(proxyDir, "docker", "compose", "restart", "gate")
-	}
-
-	return nil
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os/exec"
 	"sort"
 	"strings"
 
@@ -192,20 +191,15 @@ func detectDokployNetwork() string {
 //
 //	{ "network": "<network-name>" }
 //
-// The dashboard sources `network` from a prior probe result so we
-// don't have to redetect here. If the payload omits it we fall back
-// to detection for safety.
+// The dashboard sources `network` from a prior probe result. The agent
+// re-detects the Dokploy network and only attaches Caddy when the
+// payload names exactly that network (or omits it), so the op can't be
+// used to join Caddy to an arbitrary network on the host.
 func (e *Executor) DokployCaddyAttachNetwork(op client.Operation) error {
-	network, _ := op.Payload["network"].(string)
-	network = strings.TrimSpace(network)
-	if network == "" {
-		network = detectDokployNetwork()
-	}
-	if network == "" {
-		return fmt.Errorf("no dokploy overlay network detected on this host")
-	}
-	if !isSafeNetworkName(network) {
-		return fmt.Errorf("unsafe network name: %q", network)
+	requested, _ := op.Payload["network"].(string)
+	network, err := resolveDokployAttachNetwork(strings.TrimSpace(requested), detectDokployNetwork())
+	if err != nil {
+		return err
 	}
 	container, err := stackedCaddyContainerID()
 	if err != nil {
@@ -216,13 +210,18 @@ func (e *Executor) DokployCaddyAttachNetwork(op client.Operation) error {
 		// docker errors with "already exists in network" when the
 		// container is already attached. That's the desired end
 		// state — treat as success.
-		if strings.Contains(out, "already exists in network") || strings.Contains(out, "is already attached") {
-			log.Printf("dokploy_caddy_attach_network: caddy already attached to %s", network)
-			return nil
+		if !isAlreadyAttached(out) {
+			return fmt.Errorf("network connect %s: %s: %w", network, strings.TrimSpace(out), err)
 		}
-		return fmt.Errorf("network connect %s: %s: %w", network, strings.TrimSpace(out), err)
+		log.Printf("dokploy_caddy_attach_network: caddy already attached to %s", network)
+	} else {
+		log.Printf("dokploy_caddy_attach_network: attached caddy to %s", network)
 	}
-	log.Printf("dokploy_caddy_attach_network: attached caddy to %s", network)
+	// Persist the attachment so ensureProxy re-applies it whenever
+	// compose recreates Caddy (see caddy_networks.go).
+	if err := rememberCaddyNetwork(network); err != nil {
+		return fmt.Errorf("record caddy network %s: %w", network, err)
+	}
 	return nil
 }
 
@@ -241,6 +240,14 @@ func (e *Executor) DokployCaddyDetachNetwork(op client.Operation) error {
 	if !isSafeNetworkName(network) {
 		return fmt.Errorf("unsafe network name: %q", network)
 	}
+	if network == "stacked" || network == gateNetworkName {
+		return fmt.Errorf("refusing to detach caddy from its own network %q", network)
+	}
+	// Forget first: even if the disconnect below fails, the next Caddy
+	// recreate must not re-attach a network the user asked to detach.
+	if err := forgetCaddyNetwork(network); err != nil {
+		return fmt.Errorf("forget caddy network %s: %w", network, err)
+	}
 	container, err := stackedCaddyContainerID()
 	if err != nil {
 		return err
@@ -254,6 +261,25 @@ func (e *Executor) DokployCaddyDetachNetwork(op client.Operation) error {
 	}
 	log.Printf("dokploy_caddy_detach_network: detached caddy from %s", network)
 	return nil
+}
+
+// resolveDokployAttachNetwork picks the network to attach Caddy to.
+// detected is what detectDokployNetwork found on Dokploy's Traefik
+// container; requested is the payload value (may be empty).
+func resolveDokployAttachNetwork(requested, detected string) (string, error) {
+	if detected == "" {
+		return "", fmt.Errorf("no dokploy overlay network detected on this host")
+	}
+	if !isSafeNetworkName(detected) {
+		return "", fmt.Errorf("unsafe network name: %q", detected)
+	}
+	if detected == "stacked" || detected == gateNetworkName {
+		return "", fmt.Errorf("detected dokploy network %q is a stacked network", detected)
+	}
+	if requested != "" && requested != detected {
+		return "", fmt.Errorf("requested network %q is not the dokploy network detected on this host (%q)", requested, detected)
+	}
+	return detected, nil
 }
 
 // stackedCaddyContainerID resolves the Stacked Caddy container ID via
@@ -595,9 +621,19 @@ func dokployTraefikExists() bool {
 // requiring a working directory — we operate on container names, not
 // compose projects.
 func runDockerSilent(args ...string) (string, error) {
-	cmd := exec.Command("docker", args...)
+	cmd := opCommand("docker", args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// checkContainerName rejects a server-supplied container name that is not
+// a plain docker name before it reaches a `docker exec` / `docker inspect`
+// argv (a leading `-` would be parsed as a flag).
+func checkContainerName(what, name string) error {
+	if !isSafeContainerName(name) {
+		return fmt.Errorf("invalid %s container name %q", what, name)
+	}
+	return nil
 }
 
 // isSafeContainerName matches docker's own naming rules:

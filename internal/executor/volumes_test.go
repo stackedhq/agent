@@ -84,55 +84,30 @@ func TestParseVolumes_SkipsMalformedEntries(t *testing.T) {
 	}
 }
 
-func TestRenderComposeVolumes_Empty(t *testing.T) {
-	if out := renderComposeVolumes(nil); out != "" {
-		t.Fatalf("expected empty string for nil, got %q", out)
+func TestComposeVolumeSpecs(t *testing.T) {
+	if got := composeVolumeSpecs(nil); len(got) != 0 {
+		t.Fatalf("expected no specs for nil, got %v", got)
 	}
-	if out := renderComposeVolumes([]volumeMount{}); out != "" {
-		t.Fatalf("expected empty string for empty slice, got %q", out)
-	}
-}
-
-func TestRenderComposeVolumes_RW(t *testing.T) {
-	out := renderComposeVolumes([]volumeMount{
-		{HostPath: "/host/a", ContainerPath: "/c/a"},
-	})
-	want := "    volumes:\n      - \"/host/a:/c/a\"\n"
-	if out != want {
-		t.Fatalf("mismatch:\ngot:  %q\nwant: %q", out, want)
-	}
-}
-
-func TestRenderComposeVolumes_RO(t *testing.T) {
-	out := renderComposeVolumes([]volumeMount{
-		{HostPath: "/host/a", ContainerPath: "/c/a", ReadOnly: true},
-	})
-	if !strings.Contains(out, ":/c/a:ro\"\n") {
-		t.Fatalf("expected :ro suffix in output, got %q", out)
-	}
-}
-
-func TestRenderComposeVolumes_Multiple(t *testing.T) {
-	out := renderComposeVolumes([]volumeMount{
+	got := composeVolumeSpecs([]volumeMount{
 		{HostPath: "/h1", ContainerPath: "/c1"},
 		{HostPath: "/h2", ContainerPath: "/c2", ReadOnly: true},
 	})
-	want := "    volumes:\n      - \"/h1:/c1\"\n      - \"/h2:/c2:ro\"\n"
-	if out != want {
-		t.Fatalf("mismatch:\ngot:  %q\nwant: %q", out, want)
+	want := yStrList("/h1:/c1", "/h2:/c2:ro")
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("specs = %v, want %v", got, want)
 	}
 }
 
 func TestGenerateCompose_NoVolumes_OmitsBlock(t *testing.T) {
-	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"}, nil, "")
+	out := generateCompose("svc-1", "img:latest", nil, resourceLimits{restartPolicy: "unless-stopped"}, nil, "", nil)
 	if strings.Contains(out, "volumes:") {
 		t.Fatalf("expected no volumes: block when mounts is nil, got:\n%s", out)
 	}
 	// Sanity-check the structural bits we rely on.
-	if !strings.Contains(out, "container_name: svc-1") {
+	if !strings.Contains(out, `container_name: "svc-1"`) {
 		t.Fatalf("missing container_name in compose:\n%s", out)
 	}
-	if !strings.Contains(out, "image: img:latest") {
+	if !strings.Contains(out, `image: "img:latest"`) {
 		t.Fatalf("missing image line in compose:\n%s", out)
 	}
 }
@@ -140,8 +115,9 @@ func TestGenerateCompose_NoVolumes_OmitsBlock(t *testing.T) {
 func TestGenerateCompose_WithVolumes_IncludesBlock(t *testing.T) {
 	out := generateCompose("svc-1", "img:latest", []volumeMount{
 		{HostPath: "/host", ContainerPath: "/container"},
-	}, resourceLimits{restartPolicy: "unless-stopped"}, nil, "")
-	if !strings.Contains(out, "    volumes:\n      - \"/host:/container\"\n") {
+		{HostPath: "/h2", ContainerPath: "/c2", ReadOnly: true},
+	}, resourceLimits{restartPolicy: "unless-stopped"}, nil, "", nil)
+	if !strings.Contains(out, "    volumes:\n      - \"/host:/container\"\n      - \"/h2:/c2:ro\"\n") {
 		t.Fatalf("expected volumes block in compose, got:\n%s", out)
 	}
 }
@@ -356,9 +332,7 @@ func TestEnsureVolumeHostDirs_CustomPath_NotChmoded(t *testing.T) {
 	customRoot := t.TempDir()
 	customPath := filepath.Join(customRoot, "my-app-data")
 
-	err := ensureVolumeHostDirs([]volumeMount{
-		{HostPath: customPath, ContainerPath: "/data"},
-	})
+	err := ensureCustomVolumeDir(customPath)
 	if err != nil {
 		t.Fatalf("ensure failed: %v", err)
 	}
@@ -374,5 +348,307 @@ func TestEnsureVolumeHostDirs_CustomPath_NotChmoded(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(customPath, permsHealSentinel)); !os.IsNotExist(err) {
 		t.Errorf("sentinel must not be written to custom paths, stat err = %v", err)
+	}
+}
+
+func TestCheckHostPathPolicy(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	const other = "99999999-2222-4333-8444-555555555555"
+	allowed := map[string]string{
+		"/srv/app/data": "/srv/app/data",
+		"/srv//app/":    "/srv/app",
+		"/mnt/volume_1": "/mnt/volume_1",
+		"/data":         "/data",
+		"/var/lib/app":  "/var/lib/app",
+		"/opt/myapp":    "/opt/myapp",
+		"/tmp/x":        "/tmp/x",
+		"/./srv/./a":    "/srv/a",
+		"/etcetera/x":   "/etcetera/x",
+		"/opt/stackedx": "/opt/stackedx",
+		"/home2/data":   "/home2/data",
+		"/var/lib/dock": "/var/lib/dock",
+		"/opt/stacked/data/services/" + id + "/data-abc123":  "/opt/stacked/data/services/" + id + "/data-abc123",
+		"/opt/stacked/data/services/" + id + "/a/b":          "/opt/stacked/data/services/" + id + "/a/b",
+		"/opt/stacked/data/services/" + id + "/files-abc123": "/opt/stacked/data/services/" + id + "/files-abc123",
+		"/opt/stacked/data/uptime-kuma":                      "/opt/stacked/data/uptime-kuma",
+		"/opt/stacked/data/n8n/sub":                          "/opt/stacked/data/n8n/sub",
+	}
+	for in, want := range allowed {
+		got, err := checkHostPathPolicy(id, in)
+		if err != nil || got != want {
+			t.Errorf("checkHostPathPolicy(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	denied := []string{
+		"", "relative/path", "/", "//", "/etc", "/etc/", "//etc", "/etc/ssh", "/root", "/home", "/home/user",
+		"/boot", "/usr", "/usr/local", "/bin", "/sbin", "/lib", "/lib64", "/var/run", "/var/run/docker.sock",
+		"/run", "/run/user", "/proc", "/sys", "/dev", "/var/lib/docker", "/var/lib/docker/volumes/x",
+		"/opt/stacked", "/opt/stacked/", "/opt/stacked/agent.toml", "/opt/stacked/services/" + id,
+		"/opt/stacked/proxy", "/opt/stacked/data", "/opt/stacked/data/services",
+		"/opt/stacked/data/services/" + id,
+		"/opt/stacked/data/services/" + other + "/data",
+		"/opt/stacked/data/services/" + id + "/files",
+		"/opt/stacked/data/services/" + id + "/files/" + other,
+		"/srv/../etc", "/srv/..", "/srv/$HOME", "/srv/${X}", "/srv/a:/etc", "/srv/a\nb", "/srv/a\x00",
+	}
+	for _, in := range denied {
+		if got, err := checkHostPathPolicy(id, in); err == nil {
+			t.Errorf("checkHostPathPolicy(%q) = %q, want error", in, got)
+		}
+	}
+	// Without a valid service ID nothing under the managed root is allowed.
+	if _, err := checkHostPathPolicy("../x", "/opt/stacked/data/services/../x/data"); err == nil {
+		t.Error("managed path accepted for invalid service ID")
+	}
+}
+
+func TestValidateVolumesRejectsOverlapAndBadContainerPaths(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	ok, err := validateVolumes(id, []volumeMount{
+		{HostPath: "/srv/a/", ContainerPath: "/a"},
+		{HostPath: "/srv/ab", ContainerPath: "/b"},
+	})
+	if err != nil {
+		t.Fatalf("siblings rejected: %v", err)
+	}
+	if ok[0].HostPath != "/srv/a" {
+		t.Fatalf("host path not cleaned: %q", ok[0].HostPath)
+	}
+	for _, mounts := range [][]volumeMount{
+		{{HostPath: "/srv/a", ContainerPath: "/a"}, {HostPath: "/srv/a/b", ContainerPath: "/b"}},
+		{{HostPath: "/srv/a/b", ContainerPath: "/b"}, {HostPath: "/srv/a", ContainerPath: "/a"}},
+		{{HostPath: "/srv/a", ContainerPath: "/a"}, {HostPath: "/srv//a/", ContainerPath: "/b"}},
+		{{HostPath: "/srv/a", ContainerPath: "relative"}},
+		{{HostPath: "/srv/a", ContainerPath: "/x:/y"}},
+		{{HostPath: "/srv/a", ContainerPath: "/x$Y"}},
+		{{HostPath: "/srv/a", ContainerPath: "/x\n"}},
+	} {
+		if _, err := validateVolumes(id, mounts); err == nil {
+			t.Errorf("validateVolumes(%v) accepted", mounts)
+		}
+	}
+}
+
+func TestEnsureManagedVolumeDir(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	base := t.TempDir()
+	if err := ensureManagedVolumeDir(base, id+"/data-abc"); err != nil {
+		t.Fatalf("ensureManagedVolumeDir: %v", err)
+	}
+	svcInfo, err := os.Stat(filepath.Join(base, id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svcInfo.Mode().Perm() != 0o700 {
+		t.Errorf("service dir mode = %o, want 0700", svcInfo.Mode().Perm())
+	}
+	leafInfo, err := os.Stat(filepath.Join(base, id, "data-abc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leafInfo.Mode().Perm() != 0o777 {
+		t.Errorf("leaf mode = %o, want 0777", leafInfo.Mode().Perm())
+	}
+
+	// A pre-existing 0755 service dir is tightened.
+	if err := os.Chmod(filepath.Join(base, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureManagedVolumeDir(base, id+"/data-abc"); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(filepath.Join(base, id)); info.Mode().Perm() != 0o700 {
+		t.Errorf("service dir not tightened: %o", info.Mode().Perm())
+	}
+}
+
+func TestEnsureManagedVolumeDirRejectsSymlinks(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.Mkdir(victim, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Symlinked leaf (e.g. planted by a container through a parent mount).
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, id), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(base, id, "data")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := ensureManagedVolumeDir(base, id+"/data"); err == nil {
+		t.Error("symlinked leaf accepted")
+	}
+
+	// Symlinked service dir.
+	base2 := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(base2, id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureManagedVolumeDir(base2, id+"/victim"); err == nil {
+		t.Error("symlinked service dir accepted")
+	}
+	if info, _ := os.Stat(victim); info.Mode().Perm() != 0o700 {
+		t.Fatalf("symlink target was chmodded to %o", info.Mode().Perm())
+	}
+	if _, err := os.Stat(filepath.Join(victim, permsHealSentinel)); !os.IsNotExist(err) {
+		t.Fatal("sentinel written through symlink")
+	}
+}
+
+func TestEnsureCustomVolumeDirRejectsNestedSymlink(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := ensureCustomVolumeDir(filepath.Join(link, "data")); err == nil {
+		t.Fatal("custom path through a nested symlink accepted")
+	}
+	if _, err := os.Stat(filepath.Join(real, "data")); !os.IsNotExist(err) {
+		t.Fatal("directory created through the symlink")
+	}
+	// A leaf that is itself a symlink is rejected too.
+	if err := ensureCustomVolumeDir(link); err == nil {
+		t.Fatal("symlink leaf accepted")
+	}
+	// Plain nested path works.
+	if err := ensureCustomVolumeDir(filepath.Join(real, "a", "b")); err != nil {
+		t.Fatalf("plain path rejected: %v", err)
+	}
+}
+
+func TestHealManagedVolumePerms_DoesNotFollowSymlinkedDirs(t *testing.T) {
+	root := withFakeManagedRoot(t)
+	outsideDir := t.TempDir()
+	secret := filepath.Join(outsideDir, "secret")
+	if err := os.WriteFile(secret, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(root, "escape-dir")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	// Plant a dangling symlink under the sentinel name: it must never be
+	// written through (it short-circuits the walk, which only costs the
+	// container its own perms fix).
+	sentinelTarget := filepath.Join(outsideDir, "planted")
+	if err := os.Symlink(sentinelTarget, filepath.Join(root, permsHealSentinel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := healManagedVolumePerms(root); err != nil {
+		t.Fatalf("heal: %v", err)
+	}
+	if _, err := os.Stat(sentinelTarget); !os.IsNotExist(err) {
+		t.Fatal("wrote through a planted sentinel symlink")
+	}
+	if err := os.Remove(filepath.Join(root, permsHealSentinel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := healManagedVolumePerms(root); err != nil {
+		t.Fatalf("heal: %v", err)
+	}
+	if info, _ := os.Stat(secret); info.Mode().Perm() != 0o600 {
+		t.Fatalf("file behind symlinked dir chmodded to %o", info.Mode().Perm())
+	}
+	if info, _ := os.Stat(outsideDir); info.Mode().Perm() == 0o777 {
+		t.Fatal("symlinked dir target chmodded")
+	}
+	if _, err := os.Stat(sentinelTarget); !os.IsNotExist(err) {
+		t.Fatal("wrote through a planted symlink")
+	}
+}
+
+func TestHealManagedVolumePerms_RejectsSymlinkRoot(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := healManagedVolumePerms(link); err == nil {
+		t.Fatal("symlinked volume root accepted")
+	}
+	if info, _ := os.Stat(target); info.Mode().Perm() == 0o777 {
+		t.Fatal("symlink target chmodded")
+	}
+}
+
+func TestHostPathPolicyExtendedDenylist(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	for _, p := range []string{
+		"/var/spool", "/var/spool/cron", "/var/lib/containerd", "/var/lib/containerd/io.containerd.x",
+		"/var/snap", "/var/snap/docker/common", "/snap", "/snap/bin", "/var/lib/kubelet", "/var/lib/kubelet/pods",
+	} {
+		if got, err := checkHostPathPolicy(id, p); err == nil {
+			t.Errorf("checkHostPathPolicy(%q) = %q, want error", p, got)
+		}
+	}
+	for _, p := range []string{"/var/spoolx", "/snapshots", "/var/lib/containerd-data", "/srv/snap"} {
+		if _, err := checkHostPathPolicy(id, p); err != nil {
+			t.Errorf("checkHostPathPolicy(%q) = %v, want ok", p, err)
+		}
+	}
+}
+
+// Rejections name the volume, the rule and where to put it instead: the
+// message goes straight to the deploy log.
+func TestHostPathPolicyErrorMessages(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	cases := map[string]string{
+		"/home/x":                      "volume host path /home/x (mounted at /data) is not allowed (system path, inside /home). Choose a path under /srv, /mnt or /data.",
+		"/":                            "volume host path / (mounted at /data) is not allowed (the filesystem root). Choose a path under /srv, /mnt or /data.",
+		"/opt/stacked/proxy":           "volume host path /opt/stacked/proxy (mounted at /data) is not allowed (Stacked's own directory /opt/stacked). Choose a path under /srv, /mnt or /data.",
+		"/srv/../etc":                  `volume host path "/srv/../etc" (mounted at /data) is not allowed (contains a '..' segment). Choose a path under /srv, /mnt or /data.`,
+		"/opt/stacked/data/services/x": "Stacked-managed storage",
+		"relative":                     "must be an absolute path",
+	}
+	for in, want := range cases {
+		_, err := validateVolumes(id, []volumeMount{{HostPath: in, ContainerPath: "/data"}})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("validateVolumes(%q) error = %v, want %q", in, err, want)
+		}
+	}
+}
+
+func TestHostPathPolicyRejectsParentsOfDeniedRoots(t *testing.T) {
+	const svc = "11111111-2222-4333-8444-555555555555"
+	for _, p := range []string{"/var", "/var/lib", "/opt", "/var/snap/.."} {
+		if _, err := checkHostPathPolicy(svc, p); err == nil {
+			t.Errorf("%s: expected rejection", p)
+		}
+	}
+	for _, p := range []string{"/srv/app", "/mnt/data", "/data/x", "/media/usb", "/var/www/site", "/opt/myapp", "/var/lib/myapp", "/opt/stacked/data/vaultwarden"} {
+		if _, err := checkHostPathPolicy(svc, p); err != nil {
+			t.Errorf("%s: unexpected rejection: %v", p, err)
+		}
+	}
+}
+
+func TestCheckResolvedHostPath(t *testing.T) {
+	cases := []struct {
+		clean, resolved string
+		ok              bool
+	}{
+		{"/srv/app", "/srv/app", true},
+		{"/mnt/data", "/var/mnt/data", true},
+		// A top-level symlink pointing at a parent of a denied root.
+		{"/mnt", "/var", false},
+		{"/mnt/lib", "/var/lib", false},
+		{"/data", "/", false},
+		{"/mnt/x", "/etc/x", false},
+		{"/mnt/x", "/var/lib/docker/volumes", false},
+		// Legacy catalog data root stays exempt.
+		{legacyCatalogDataRoot + "/app", legacyCatalogDataRoot + "/app", true},
+	}
+	for _, c := range cases {
+		err := checkResolvedHostPath(c.clean, c.resolved)
+		if (err == nil) != c.ok {
+			t.Errorf("checkResolvedHostPath(%q, %q) = %v, want ok=%v", c.clean, c.resolved, err, c.ok)
+		}
 	}
 }

@@ -3,9 +3,11 @@ package executor
 import (
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
+	"github.com/stackedapp/stacked/agent/internal/heartbeat"
 )
 
 func (e *Executor) Setup(op client.Operation) error {
@@ -33,13 +35,24 @@ func (e *Executor) Setup(op client.Operation) error {
 	return nil
 }
 
+// proxyCompose returns the proxy docker-compose.yml content: Caddy plus
+// the auth gate sidecar. The gate is always part of the definition so
+// every writer of this file (Setup, ensureProxy, proxy_config) agrees on
+// it and it can never be orphaned; with no gated domains it just denies
+// everything and costs a few MB of RAM.
+//
+// Gate isolation: the gate is only on the private `stacked-gate-internal`
+// network (internal: no outbound route), shared with Caddy alone. User
+// containers on the `stacked` network can't reach it or shadow its name
+// there, and Caddy reaches it as `stacked-gate:9876`.
+//
+// The gate runs the agent's own static binary (bind-mounted read-only)
+// inside the already-pulled Caddy image, so there is no separate gate
+// image to publish or pull. It runs as the agent's uid:gid so it can read
+// the 0600 config.json the agent writes and create its signing key. The
+// agent-version label changes on every self-update, which makes
+// `docker compose up -d` recreate the gate onto the new binary.
 func proxyCompose() string {
-	return proxyComposeWithGate(false)
-}
-
-// proxyComposeWithGate returns the proxy docker-compose.yml content.
-// When withGate is true, a gate sidecar service is included.
-func proxyComposeWithGate(withGate bool) string {
 	// `host.docker.internal:host-gateway` makes the host reachable from
 	// inside the Caddy container under a stable hostname. Required for
 	// port-bound domains where the user types host=127.0.0.1 expecting
@@ -52,9 +65,9 @@ func proxyComposeWithGate(withGate bool) string {
 	// gateway IP at container start time. Supported on Docker 20.10+
 	// (Q4 2020) on Linux; older daemons will silently fail to add the
 	// host entry but Caddy still starts. We accept that fallback.
-	base := `services:
+	return fmt.Sprintf(`services:
   caddy:
-    image: caddy:2-alpine
+    image: %[8]s
     restart: unless-stopped
     ports:
       - "80:80"
@@ -67,22 +80,33 @@ func proxyComposeWithGate(withGate bool) string {
       - caddy_config:/config
     networks:
       - stacked
-`
-
-	gateSvc := ""
-	if withGate {
-		gateSvc = `  gate:
-    image: ghcr.io/stackedhq/agent:latest
-    command: ["/stacked-agent", "gate"]
+      - gate
+  %[1]s:
+    image: %[8]s
+    container_name: %[1]s
+    entrypoint: ["/stacked-agent", "gate"]
+    user: "%[2]d:%[3]d"
     restart: unless-stopped
+    read_only: true
+    # tmpfs over the caddy image's VOLUME paths so no anonymous volumes
+    # pile up each time the gate is recreated.
+    tmpfs:
+      - /data
+      - /config
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: 64m
+    labels:
+      com.stacked.kind: gate
+      com.stacked.agent-version: %[4]q
     volumes:
-      - /opt/stacked/gate:/opt/stacked/gate
+      - %[5]s:/stacked-agent:ro
+      - %[6]s:/opt/stacked/gate
     networks:
-      - stacked
-`
-	}
+      - gate
 
-	return base + gateSvc + `
 volumes:
   caddy_data:
   caddy_config:
@@ -91,5 +115,8 @@ networks:
   stacked:
     name: stacked
     external: true
-`
+  gate:
+    name: %[7]s
+    internal: true
+`, gateServiceName, os.Getuid(), os.Getgid(), heartbeat.Version, agentBinaryPath, gateDir, gateNetworkName, CaddyImage)
 }

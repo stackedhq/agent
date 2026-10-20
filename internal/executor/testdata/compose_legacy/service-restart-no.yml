@@ -1,0 +1,16 @@
+services:
+  11111111-2222-4333-8444-555555555555:
+    container_name: 11111111-2222-4333-8444-555555555555
+    image: img:latest
+    restart: no
+    env_file:
+      - .env
+    networks:
+      - stacked
+    labels:
+      com.stacked.kind: service
+
+networks:
+  stacked:
+    name: stacked
+    external: true
