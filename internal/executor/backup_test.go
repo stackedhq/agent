@@ -3,12 +3,16 @@ package executor
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -107,5 +111,59 @@ func TestDownloadBackupToFile(t *testing.T) {
 				t.Fatalf("failed download left a temp file behind")
 			}
 		})
+	}
+}
+
+// Gzip verification honours the op deadline: an already-expired op stops
+// it before any decompression, with an error that says why.
+func TestVerifyBackupFileStopsOnCancelledOp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.gz")
+	if err := os.WriteFile(path, gzipBytes(t, strings.Repeat("row\n", 1<<20)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyBackupFile(path, "", ""); err != nil {
+		t.Fatalf("valid dump rejected: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	restore := setOpContext(ctx)
+	defer restore()
+	err := verifyBackupFile(path, "", "")
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "verification stopped") {
+		t.Fatalf("expected verification to stop on the cancelled op, got %v", err)
+	}
+}
+
+// infiniteZeros is an endless stream that cancels ctx once it has served
+// cancelAfter bytes.
+type infiniteZeros struct {
+	served, cancelAfter int64
+	cancel              func()
+}
+
+func (z *infiniteZeros) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	z.served += int64(len(p))
+	if z.served >= z.cancelAfter {
+		z.cancel()
+	}
+	return len(p), nil
+}
+
+// A deadline that expires mid-read stops the reader within one check
+// interval.
+func TestOpCtxReaderStopsWithinCheckInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	src := &infiniteZeros{cancelAfter: 3 << 20, cancel: cancel}
+	n, err := io.Copy(io.Discard, newOpCtxReader(ctx, src))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+	if n < 3<<20 || n > 3<<20+2*opCtxCheckBytes {
+		t.Fatalf("read %d bytes after cancelling at %d", n, 3<<20)
 	}
 }

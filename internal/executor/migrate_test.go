@@ -1,10 +1,14 @@
 package executor
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/stackedapp/stacked/agent/internal/logs"
 )
 
 func TestValidateMigratePathsAcceptsManagedTarget(t *testing.T) {
@@ -109,8 +113,9 @@ func TestMigrateSourceMount(t *testing.T) {
 }
 
 func TestVolumeMigrateDockerArgsAreConfined(t *testing.T) {
-	args := strings.Join(volumeMigrateDockerArgs("/etc/dokploy", "applications/a", "/opt/stacked/data/services/s/x", "vol"), " ")
+	args := strings.Join(volumeMigrateDockerArgs("stk-migrate-op1", "/etc/dokploy", "applications/a", "/opt/stacked/data/services/s/x", "vol"), " ")
 	for _, want := range []string{
+		"run --rm --name stk-migrate-op1 ",
 		"type=bind,source=/etc/dokploy,target=/src,readonly",
 		"type=bind,source=/opt/stacked/data/services/s/x,target=/dst",
 		"--network none", "--cap-drop ALL", "no-new-privileges", migrateHelperImage,
@@ -148,5 +153,178 @@ func TestRejectSymlinksInPath(t *testing.T) {
 	}
 	if err := rejectSymlinksInPath(filepath.Join(resolvedBase, "link"), false); err == nil {
 		t.Fatalf("symlink final component not rejected")
+	}
+}
+
+func TestVolumeMigrateContainerName(t *testing.T) {
+	if got := volumeMigrateContainerName("5f0c7a52-1b2c-4d3e-8f90-0123456789ab"); got != "stk-migrate-5f0c7a52-1b2c-4d3e-8f90-0123456789ab" {
+		t.Fatalf("op id name = %q", got)
+	}
+	a, b := volumeMigrateContainerName("../evil"), volumeMigrateContainerName("")
+	for _, n := range []string{a, b} {
+		if !strings.HasPrefix(n, "stk-migrate-") || !volumeMigrateNameRe.MatchString(strings.TrimPrefix(n, "stk-migrate-")) {
+			t.Fatalf("fallback name %q", n)
+		}
+	}
+	if a == b {
+		t.Fatalf("fallback names not unique: %q", a)
+	}
+}
+
+// fakeDocker puts a `docker` stub first on PATH. It logs every call to
+// <state>/calls; `run` marks a daemon-side container as present and then
+// blocks like an attached `docker run`; the container only goes away via
+// `kill` (asynchronously, like `--rm`, unless killRemoves is false) or
+// `rm -f`. `container inspect` reports it until then.
+func fakeDocker(t *testing.T, killRemoves bool) string {
+	t.Helper()
+	state := t.TempDir()
+	bin := t.TempDir()
+	removes := "1"
+	if !killRemoves {
+		removes = "0"
+	}
+	script := `#!/bin/sh
+s="$FAKE_DOCKER_STATE"
+echo "$*" >> "$s/calls"
+case "$1" in
+run)
+  touch "$s/container"
+  echo started
+  exec sleep 60
+  ;;
+kill)
+  if [ "$FAKE_DOCKER_KILL_REMOVES" = 1 ]; then
+    ( sleep 0.3; rm -f "$s/container" ) >/dev/null 2>&1 &
+  fi
+  exit 0
+  ;;
+rm)
+  rm -f "$s/container"
+  exit 0
+  ;;
+container)
+  if [ -f "$s/container" ]; then echo deadbeef; exit 0; fi
+  echo "Error response from daemon: No such container: $5" >&2
+  exit 1
+  ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_DOCKER_STATE", state)
+	t.Setenv("FAKE_DOCKER_KILL_REMOVES", removes)
+	return state
+}
+
+// expireOpOnceContainerRuns installs an op context that is cancelled (the
+// op deadline expiring) as soon as the fake container exists, so the
+// deadline always hits a running copy regardless of machine speed.
+func expireOpOnceContainerRuns(t *testing.T, state string) (restore func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := make(chan struct{})
+	go func() {
+		defer cancel()
+		for {
+			if _, err := os.Stat(filepath.Join(state, "container")); err == nil {
+				return
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}()
+	restoreCtx := setOpContext(ctx)
+	return func() {
+		close(stop)
+		cancel()
+		restoreCtx()
+	}
+}
+
+func fakeDockerCalls(t *testing.T, state string) string {
+	t.Helper()
+	b, _ := os.ReadFile(filepath.Join(state, "calls"))
+	return string(b)
+}
+
+// On op deadline the copy container is `docker kill`ed by name and
+// VolumeMigrate's copy step only returns once it has been removed.
+func TestVolumeMigrateCopyDeadlineKillsAndWaitsForRemoval(t *testing.T) {
+	state := fakeDocker(t, true)
+	name := volumeMigrateContainerName("op-1")
+	args := volumeMigrateDockerArgs(name, "/etc/dokploy", "a", "/opt/stacked/data/services/s", "vol")
+	restore := expireOpOnceContainerRuns(t, state)
+	defer restore()
+
+	start := time.Now()
+	err := runVolumeMigrateCopy(logs.NewStreamer(nil, "op"), name, args)
+	if err == nil || !strings.Contains(err.Error(), "operation deadline reached") || !strings.Contains(err.Error(), name+" was stopped") {
+		t.Fatalf("expected deadline error naming the stopped container, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("copy outlived the deadline: %s", elapsed)
+	}
+	if _, err := os.Stat(filepath.Join(state, "container")); !os.IsNotExist(err) {
+		t.Fatalf("returned while the copy container still existed")
+	}
+	calls := fakeDockerCalls(t, state)
+	for _, want := range []string{"run --rm --name " + name + " ", "\nkill " + name + "\n", "container inspect --format {{.Id}} " + name} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("missing docker call %q in:\n%s", want, calls)
+		}
+	}
+	if strings.Contains(calls, "\nrm ") {
+		t.Fatalf("container was removed by --rm; rm -f should not run:\n%s", calls)
+	}
+}
+
+// If `--rm` doesn't remove the killed container in time, it is
+// force-removed before returning.
+func TestVolumeMigrateCopyForceRemovesLingeringContainer(t *testing.T) {
+	state := fakeDocker(t, false)
+	prevWait, prevPoll := jobRemoveWait, jobRemovePoll
+	jobRemoveWait, jobRemovePoll = 500*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { jobRemoveWait, jobRemovePoll = prevWait, prevPoll })
+
+	name := volumeMigrateContainerName("op-2")
+	args := volumeMigrateDockerArgs(name, "/etc/dokploy", "a", "/opt/stacked/data/services/s", "vol")
+	restore := expireOpOnceContainerRuns(t, state)
+	defer restore()
+
+	err := runVolumeMigrateCopy(logs.NewStreamer(nil, "op"), name, args)
+	if err == nil || !strings.Contains(err.Error(), "was stopped") {
+		t.Fatalf("expected deadline error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "container")); !os.IsNotExist(err) {
+		t.Fatalf("lingering copy container not removed")
+	}
+	if calls := fakeDockerCalls(t, state); !strings.Contains(calls, "\nrm -f "+name+"\n") {
+		t.Fatalf("expected docker rm -f %s in:\n%s", name, calls)
+	}
+}
+
+// A copy that finishes before the deadline doesn't trigger kill/cleanup.
+func TestVolumeMigrateCopySuccessNoCleanup(t *testing.T) {
+	state := t.TempDir()
+	bin := t.TempDir()
+	script := "#!/bin/sh\necho \"$*\" >> \"$FAKE_DOCKER_STATE/calls\"\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_DOCKER_STATE", state)
+	name := volumeMigrateContainerName("op-3")
+	if err := runVolumeMigrateCopy(logs.NewStreamer(nil, "op"), name, volumeMigrateDockerArgs(name, "/etc/dokploy", "a", "/opt/stacked/data/services/s", "vol")); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fakeDockerCalls(t, state); !strings.HasPrefix(calls, "run --rm --name "+name) || strings.Contains(calls, "\nkill ") || strings.Contains(calls, "\nrm ") || strings.Contains(calls, "\ncontainer ") {
+		t.Fatalf("unexpected docker calls:\n%s", calls)
 	}
 }

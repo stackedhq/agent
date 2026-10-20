@@ -372,3 +372,28 @@ func TestDockerLegacyComposeSeesSyncedEnv(t *testing.T) {
 		t.Fatalf("compose resolved env %v, want the synced values", env)
 	}
 }
+
+// TestDockerBlueGreenRefreshedComposeEnv: after a recreate deploy wrote an
+// `environment:` map, a blue/green deploy regenerates docker-compose.yml so
+// the real Compose parser (what a Restart fallback uses) sees the new env.
+func TestDockerBlueGreenRefreshedComposeEnv(t *testing.T) {
+	requireDocker(t)
+	ensureStackedNetwork(t)
+	dir := filepath.Join(t.TempDir(), "stk-bgenv-"+randSuffix(t))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := generateCompose(goldenServiceID, "alpine:3", nil, resourceLimits{restartPolicy: "no"}, nil, "", map[string]string{"API_KEY": "old", "GONE": "1"})
+	if err := writeFile(filepath.Join(dir, "docker-compose.yml"), old); err != nil {
+		t.Fatal(err)
+	}
+	if err := refreshBlueGreenCompose(dir, goldenServiceID, "alpine:3", nil, nil, map[string]string{"API_KEY": "new", "HOST": "0.0.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	doc := composeConfigJSON(t, dir, composeArgs(dir))
+	svc := doc["services"].(map[string]interface{})[goldenServiceID].(map[string]interface{})
+	env := svc["environment"].(map[string]interface{})
+	if len(env) != 2 || env["API_KEY"] != "new" || env["HOST"] != "0.0.0.0" {
+		t.Fatalf("compose resolved env %v, want the blue/green deploy's env", env)
+	}
+}

@@ -473,29 +473,53 @@ func (e *Executor) ProxyConfig(op client.Operation) error {
 	parsed := sanitizeDomains(parseDomains(domains))
 	gateCfg := buildGateConfig(parsed)
 
-	if err := ensureProxy(); err != nil {
+	if err := ensureProxyFn(); err != nil {
 		return fmt.Errorf("ensure proxy: %w", err)
 	}
 
 	// The gate must know every gated domain before Caddy starts sending
-	// forward_auth for it. On failure the op fails and Caddy keeps its
-	// previous config.
+	// forward_auth for it, so it is updated first. That also means a
+	// failure after the gate write (the gate not loading it, or Caddy
+	// rejecting or failing to reload its config) would leave Caddy on its
+	// old routes behind a gate that no longer knows their domains (403).
+	// So the previous gate config is kept and put back on any failure:
+	// the gate and Caddy both end in their old state.
+	prevGate, err := snapshotGateConfig()
+	if err != nil {
+		return fmt.Errorf("auth gate: read current config: %w", err)
+	}
+	rollbackGate := func(cause error) error {
+		if rerr := restoreGateConfig(prevGate); rerr != nil {
+			log.Printf("proxy_config: restore previous auth gate config: %v", rerr)
+			return fmt.Errorf("%w (restoring the previous auth gate config also failed: %v)", cause, rerr)
+		}
+		return cause
+	}
 	if err := applyGateConfig(gateCfg); err != nil {
-		return fmt.Errorf("auth gate: %w", err)
+		return rollbackGate(fmt.Errorf("auth gate: %w", err))
 	}
 
+	if err := caddyApplyFn(parsed); err != nil {
+		return rollbackGate(err)
+	}
+
+	// Cache the domains only once Caddy runs them, so a later
+	// RegenerateCaddyfile (rolling flip) never installs a config whose
+	// gate entries were rolled back above.
 	if err := persistDomains(parsed); err != nil {
-		// Persistence failure shouldn't block the reload — the in-memory
-		// regen below still works. Log and continue.
+		// Caddy is already serving the new config; RegenerateCaddyfile
+		// just works from a staler cache until the next proxy_config.
 		log.Printf("proxy_config: persist domains.json failed (non-fatal): %v", err)
-	}
-
-	if err := writeAndReloadCaddyfile(parsed); err != nil {
-		return err
 	}
 	log.Printf("Caddy config updated for %d domain(s)", len(parsed))
 	return nil
 }
+
+// Test seams for ProxyConfig's docker-touching steps.
+var (
+	ensureProxyFn = ensureProxy
+	caddyApplyFn  = writeAndReloadCaddyfile
+)
 
 // RegenerateCaddyfile rewrites the Caddyfile from the persisted domains
 // list using current slot state, validates it, and reloads Caddy. Used

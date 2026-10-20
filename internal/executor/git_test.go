@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -204,14 +205,16 @@ func TestGitCloneSendsAuthHeaderFromEnv(t *testing.T) {
 	const token = "ghs_supersecret"
 	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
 	files := http.StripPrefix("/acme/app.git", http.FileServer(http.Dir(bare)))
-	var authed int
+	// Handlers run on server goroutines (and may still be finishing a
+	// previous clone's request), so the counter must be atomic.
+	var authed atomic.Int64
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != wantAuth {
 			w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
 			http.Error(w, "auth required", http.StatusUnauthorized)
 			return
 		}
-		authed++
+		authed.Add(1)
 		files.ServeHTTP(w, r)
 	}))
 	defer srv.Close()
@@ -234,9 +237,9 @@ func TestGitCloneSendsAuthHeaderFromEnv(t *testing.T) {
 				t.Fatalf("token in argv: %v", args)
 			}
 		}
-		authed = 0
+		authed.Store(0)
 		run(root, env, args...)
-		if authed == 0 {
+		if authed.Load() == 0 {
 			t.Fatalf("countMode=%v: server never saw the auth header", countMode)
 		}
 		cfg, err := os.ReadFile(filepath.Join(root, dest, ".git", "config"))

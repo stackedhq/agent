@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -135,8 +137,9 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	if err != nil {
 		return nil, fail(err)
 	}
-	// Blue/green doesn't rewrite docker-compose.yml, so an older one may
-	// still reference `.env`; keep it current (see syncLegacyEnvFile).
+	// docker-compose.yml is only regenerated after the flip
+	// (refreshBlueGreenCompose), so until then an older one may still
+	// reference `.env`; keep it current (see syncLegacyEnvFile).
 	if err := syncLegacyEnvFile(dir, env); err != nil {
 		return nil, fail(fmt.Errorf("update legacy .env: %w", err))
 	}
@@ -216,6 +219,15 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 	streamer.AddLine("Caddy reloaded; traffic now on " + newContainer + ".")
 	streamer.Flush()
 
+	// Keep docker-compose.yml (if a recreate deploy left one) in step
+	// with what is now live, so a Restart that falls back to `compose up`
+	// doesn't start the service with stale env/settings. Traffic has
+	// already moved, so a failure here is a warning, not a failed deploy.
+	if err := refreshBlueGreenCompose(dir, serviceID, imageName, op.Payload, creds.NetworkAliases, env); err != nil {
+		streamer.AddLine("WARN: failed to update docker-compose.yml: " + err.Error())
+		streamer.Flush()
+	}
+
 	// Phase 7: drain and remove the old slot. `docker stop --time=N`
 	// sends SIGTERM, waits up to N seconds for graceful shutdown, then
 	// SIGKILLs. The grace period is the user's `stop_grace_sec`.
@@ -253,6 +265,32 @@ func (e *Executor) deployBlueGreen(op client.Operation, streamer *logs.Streamer,
 		result["probeError"] = probeRes.Error
 	}
 	return result, nil
+}
+
+// refreshBlueGreenCompose regenerates <dir>/docker-compose.yml after a
+// blue/green deploy with the current image, env and settings, using the
+// same renderer as the recreate path. Compose is not run: the slot
+// containers are managed with `docker run`; the file only matters to a
+// later Restart that falls back to `compose up -d`. Without this, a
+// compose file written by an earlier recreate deploy keeps its old
+// `environment:` map forever. Written atomically (0600, it holds env
+// values). A service that never had a compose file is left without one,
+// so Restart's "redeploy required" behaviour for pure blue/green services
+// is unchanged. Once the new file is in place, a legacy `.env` that only
+// an older template referenced is removed (see cleanupLegacyEnvFile).
+// Blue/green never has volumes or file mounts (requiresFastRestart).
+func refreshBlueGreenCompose(dir, serviceID, imageName string, payload map[string]interface{}, aliases []string, env map[string]string) error {
+	composePath := filepath.Join(dir, "docker-compose.yml")
+	if _, err := os.Lstat(composePath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	compose := generateCompose(serviceID, imageName, nil, resourceLimitsFromPayload(payload), aliases, dockerCommandOverride(payload), env)
+	if err := writeFileAtomic(composePath, []byte(compose), 0o600); err != nil {
+		return err
+	}
+	return cleanupLegacyEnvFile(dir)
 }
 
 // blueGreenMemoryNeedMB is the extra RAM a second slot is expected to

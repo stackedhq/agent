@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -282,7 +283,7 @@ func TestDockerVolumeMigrateScript(t *testing.T) {
 	}
 
 	run := func(rel, name string) (string, error) {
-		out, err := exec.Command("docker", volumeMigrateDockerArgs(src, rel, dst, name)...).CombinedOutput()
+		out, err := exec.Command("docker", volumeMigrateDockerArgs("stk-test-migrate-"+randSuffix(t), src, rel, dst, name)...).CombinedOutput()
 		return string(out), err
 	}
 	if out, err := run("data", "vol"); err != nil {
@@ -305,6 +306,47 @@ func TestDockerVolumeMigrateScript(t *testing.T) {
 	}
 	if out, err := run("missing", "x"); err == nil || !strings.Contains(out, "does not exist") {
 		t.Fatalf("missing source: %v %s", err, out)
+	}
+}
+
+// A volume copy still running at the op deadline is killed by name and
+// removed before VolumeMigrate's copy step returns (killing only the docker
+// CLI would leave `cp -a` writing into the target).
+func TestDockerVolumeMigrateDeadlineKillsContainer(t *testing.T) {
+	requireDocker(t)
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	dst := filepath.Join(base, "dst")
+	for _, d := range []string{src, dst} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	name := volumeMigrateContainerName("test-" + randSuffix(t))
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", "-v", name).Run() })
+	// The real helper flags, with the copy script swapped for one that
+	// outlives the deadline.
+	args := volumeMigrateDockerArgs(name, src, ".", dst, "vol")
+	for i, a := range args {
+		if a == volumeMigrateScript {
+			args[i] = "echo started; sleep 120"
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	restore := setOpContext(ctx)
+	defer restore()
+	start := time.Now()
+	err := runVolumeMigrateCopy(logs.NewStreamer(nil, "op"), name, args)
+	if err == nil || !strings.Contains(err.Error(), "operation deadline reached") || !strings.Contains(err.Error(), "was stopped") {
+		t.Fatalf("expected deadline error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 60*time.Second {
+		t.Fatalf("deadline handling took %s", elapsed)
+	}
+	if out, _ := exec.Command("docker", "ps", "-a", "-q", "--filter", "name=^"+name+"$").Output(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("copy container %s still present after return", name)
 	}
 }
 

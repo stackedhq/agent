@@ -1,12 +1,16 @@
 package executor
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/stackedapp/stacked/agent/internal/client"
 	"github.com/stackedapp/stacked/agent/internal/logs"
@@ -185,8 +189,9 @@ func (e *Executor) VolumeMigrate(op client.Operation) error {
 	streamer.AddLine("Copying with `cp -a` to preserve perms/ownership…")
 	streamer.Flush()
 
-	args := volumeMigrateDockerArgs(srcMount, srcRel, tgtParent, filepath.Base(tgtPath))
-	if err := e.runCommandWithStreamer(streamer, "", "docker", args...); err != nil {
+	name := volumeMigrateContainerName(op.ID)
+	args := volumeMigrateDockerArgs(name, srcMount, srcRel, tgtParent, filepath.Base(tgtPath))
+	if err := runVolumeMigrateCopy(streamer, name, args); err != nil {
 		return fail(fmt.Errorf("volume copy: %w", err))
 	}
 
@@ -234,11 +239,44 @@ else
 fi
 `
 
+// volumeMigrateTimeout caps the copy container. The op deadline
+// (poller: 2h for volume_migrate) normally fires first; either way the
+// container is killed and removed (runJobContainer).
+const volumeMigrateTimeout = 2 * time.Hour
+
+// runVolumeMigrateCopy runs the copy helper as a job container: when the
+// op deadline expires, killing the docker CLI alone would leave the
+// daemon-side `cp -a` running and writing into the target, so it is
+// `docker kill`ed by name through the deadline-independent cleanup path
+// and waited on until removed before this returns.
+func runVolumeMigrateCopy(streamer *logs.Streamer, name string, args []string) error {
+	return runJobContainer(streamer, "", nil, name, volumeMigrateTimeout, args)
+}
+
+// volumeMigrateNameRe limits what part of an op ID goes into a container
+// name (docker: [a-zA-Z0-9][a-zA-Z0-9_.-]*).
+var volumeMigrateNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+
+// volumeMigrateContainerName returns a unique, docker-valid name for the
+// copy helper: stk-migrate-<opID>, or a random suffix when the op ID is
+// unusable.
+func volumeMigrateContainerName(opID string) string {
+	if volumeMigrateNameRe.MatchString(opID) {
+		return "stk-migrate-" + opID
+	}
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("stk-migrate-%d", time.Now().UnixNano())
+	}
+	return "stk-migrate-" + hex.EncodeToString(b)
+}
+
 // volumeMigrateDockerArgs builds the helper `docker run`. The source root is
 // mounted read-only; the target's parent is the only writable mount.
-func volumeMigrateDockerArgs(srcMount, srcRel, tgtParent, tgtName string) []string {
+func volumeMigrateDockerArgs(name, srcMount, srcRel, tgtParent, tgtName string) []string {
 	return []string{
 		"run", "--rm",
+		"--name", name,
 		"--network", "none",
 		"--cap-drop", "ALL",
 		"--cap-add", "CHOWN",

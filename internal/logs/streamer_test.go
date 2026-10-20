@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -180,11 +182,35 @@ func TestStreamDoesNotBlockOnSlowServer(t *testing.T) {
 	if len(received) == 0 {
 		t.Fatal("nothing was sent")
 	}
-	last := received[len(received)-1]
-	if !strings.Contains(last, "log lines dropped") {
-		t.Fatalf("expected a dropped-lines marker at the end, got %q", last)
+	// The flusher may emit the dropped-lines marker in any batch (and
+	// more than once) with normal lines after it, so don't look at a
+	// specific position: every input line must be either delivered or
+	// counted by some marker.
+	markers, dropped, delivered := 0, 0, 0
+	for _, l := range received {
+		if m := droppedMarkerRe.FindStringSubmatch(l); m != nil {
+			n, err := strconv.Atoi(m[1])
+			if err != nil {
+				t.Fatalf("bad marker %q", l)
+			}
+			markers++
+			dropped += n
+			continue
+		}
+		if !strings.HasSuffix(l, "] line") {
+			t.Fatalf("unexpected line %q", l)
+		}
+		delivered++
+	}
+	if markers == 0 || dropped == 0 {
+		t.Fatalf("expected a dropped-lines marker in some batch; got %d lines, none a marker", len(received))
+	}
+	if dropped+delivered != total {
+		t.Fatalf("dropped %d + delivered %d != %d lines written", dropped, delivered, total)
 	}
 }
+
+var droppedMarkerRe = regexp.MustCompile(`\] \[stacked\] (\d+) log lines dropped`)
 
 // Long lines must hit the byte cap well before the line cap: the buffer
 // stays under maxBufferedBytes while the server is stalled, and the

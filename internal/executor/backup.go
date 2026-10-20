@@ -2,6 +2,7 @@ package executor
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -355,24 +356,73 @@ func fetchToFile(url string, f *os.File) (string, error) {
 
 // verifyBackupFile checks the downloaded dump against the expected SHA-256
 // (skipped when the server didn't send one) and that it is a complete,
-// valid gzip stream.
+// valid gzip stream. Decompressing a multi-GB dump takes a while, so both
+// the compressed input and the decompressed output are read through
+// opCtxReader: the op deadline stops verification within a MiB.
 func verifyBackupFile(path, gotSha, wantSha string) error {
 	if wantSha != "" && !strings.EqualFold(gotSha, wantSha) {
 		return fmt.Errorf("backup checksum mismatch: expected sha256 %s, got %s", wantSha, gotSha)
+	}
+	ctx := currentOpContext()
+	stopped := func() error {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("backup verification stopped: %w", err)
+		}
+		return nil
+	}
+	if err := stopped(); err != nil {
+		return err
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	gzr, err := gzip.NewReader(f)
+	gzr, err := gzip.NewReader(newOpCtxReader(ctx, f))
 	if err != nil {
+		if serr := stopped(); serr != nil {
+			return serr
+		}
 		return fmt.Errorf("backup is not a valid gzip stream: %w", err)
 	}
-	if _, err := io.Copy(io.Discard, gzr); err != nil {
+	if _, err := io.Copy(io.Discard, newOpCtxReader(ctx, gzr)); err != nil {
+		if serr := stopped(); serr != nil {
+			return serr
+		}
 		return fmt.Errorf("backup gzip stream is corrupt or truncated: %w", err)
 	}
 	return gzr.Close()
+}
+
+// opCtxCheckBytes is how much data an opCtxReader passes between context
+// checks.
+const opCtxCheckBytes = 1 << 20
+
+// opCtxReader is an io.Reader that fails with ctx.Err() once ctx is done,
+// checked on the first Read and then after every opCtxCheckBytes, so long
+// in-process reads (no child process for the op deadline to kill) stop
+// promptly.
+type opCtxReader struct {
+	ctx   context.Context
+	r     io.Reader
+	since int64
+	first bool
+}
+
+func newOpCtxReader(ctx context.Context, r io.Reader) *opCtxReader {
+	return &opCtxReader{ctx: ctx, r: r, first: true}
+}
+
+func (c *opCtxReader) Read(p []byte) (int, error) {
+	if c.first || c.since >= opCtxCheckBytes {
+		if err := c.ctx.Err(); err != nil {
+			return 0, err
+		}
+		c.first, c.since = false, 0
+	}
+	n, err := c.r.Read(p)
+	c.since += int64(n)
+	return n, err
 }
 
 // restoreFromFile pipes the decompressed local dump into the engine's

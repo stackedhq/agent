@@ -28,7 +28,11 @@ import (
 //     release commands, which often run migrations or asset builds) so a
 //     runaway job can't starve the host;
 //   - time: a deadline, after which the container is `docker kill`ed
-//     (killing the docker CLI alone would leave the container running).
+//     (killing the docker CLI alone would leave the container running)
+//     and runJobContainer waits for it to be removed before returning.
+//
+// volume_migrate's copy helper also runs through runJobContainer (see
+// VolumeMigrate) for the deadline handling.
 
 const (
 	// ReleaseCommandTimeout bounds the release command itself (the build
@@ -118,12 +122,60 @@ func runJobContainer(streamer *logs.Streamer, dir string, env []string, containe
 	// A job that exited successfully right at the deadline succeeded;
 	// only a failed run is attributed to the timeout.
 	if err != nil && ctx.Err() != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) && currentOpContext().Err() == nil {
-			return fmt.Errorf("%w after %s; container %s was stopped", errJobTimedOut, timeout, containerName)
+		// Don't return while the container may still be running (a
+		// volume copy could keep writing into its target): wait for
+		// `--rm` to remove it, force-removing it if it lingers.
+		stopped := "was stopped"
+		if gone := waitJobContainerGone(containerName); gone != nil {
+			stopped = "may still be running: " + gone.Error()
 		}
-		return fmt.Errorf("%w: operation deadline reached; container %s was stopped", errJobTimedOut, containerName)
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) && currentOpContext().Err() == nil {
+			return fmt.Errorf("%w after %s; container %s %s", errJobTimedOut, timeout, containerName, stopped)
+		}
+		return fmt.Errorf("%w: operation deadline reached; container %s %s", errJobTimedOut, containerName, stopped)
 	}
 	return err
+}
+
+// jobRemoveWait bounds how long a stopped job container is given to be
+// auto-removed (`--rm`) before it is force-removed; jobRemovePoll is the
+// polling interval. Variables so tests can shorten them.
+var (
+	jobRemoveWait = cleanupTimeout
+	jobRemovePoll = 250 * time.Millisecond
+)
+
+// waitJobContainerGone waits until the named container no longer exists,
+// then returns nil. If it is still present after jobRemoveWait it is
+// force-removed (`docker rm -f` kills it first). Every docker call uses
+// cleanupCommand, so this works after the op deadline has expired.
+func waitJobContainerGone(name string) error {
+	deadline := time.Now().Add(jobRemoveWait)
+	for {
+		if jobContainerGone(name) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(jobRemovePoll)
+	}
+	out, err := cleanupCommand(cleanupTimeout, "docker", "rm", "-f", name)
+	if jobContainerGone(name) {
+		return nil
+	}
+	if err == nil {
+		err = errors.New("container still present after docker rm -f")
+	}
+	log.Printf("docker rm -f %s: %v: %s", name, err, strings.TrimSpace(out))
+	return fmt.Errorf("remove %s: %w", name, err)
+}
+
+// jobContainerGone reports whether the daemon says no such container
+// exists. Any other inspect failure (daemon unreachable) is "not gone".
+func jobContainerGone(name string) bool {
+	out, err := cleanupCommand(cleanupTimeout, "docker", "container", "inspect", "--format", "{{.Id}}", name)
+	return err != nil && strings.Contains(out, "No such container")
 }
 
 // killJobContainer stops a job container. Uses its own short deadline

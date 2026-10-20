@@ -1,9 +1,12 @@
 package executor
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -18,7 +21,10 @@ import (
 // compose project (see proxyCompose). The agent owns its config file;
 // proxy_config writes it atomically, signals the gate, and waits until
 // the gate reports it loaded exactly those bytes before reloading Caddy,
-// so Caddy never forward_auths a domain the gate doesn't know yet.
+// so Caddy never forward_auths a domain the gate doesn't know yet. If the
+// op then fails (the gate doesn't load it, or Caddy rejects or fails to
+// reload its config), the previous gate config is restored the same way
+// (restoreGateConfig), so Caddy's retained routes keep working.
 
 const (
 	// gateServiceName is the compose service, container name and DNS
@@ -122,13 +128,20 @@ func applyGateConfig(cfg gateConfig) error {
 	if err != nil {
 		return fmt.Errorf("encode gate config: %w", err)
 	}
+	return applyGateConfigBytes(data, len(cfg.Domains) > 0)
+}
+
+// applyGateConfigBytes is applyGateConfig for already-encoded config.
+// gated says whether data gates any domain (so the gate must run and be
+// seen to load it).
+func applyGateConfigBytes(data []byte, gated bool) error {
 	if err := ensureGateDir(); err != nil {
 		return err
 	}
 	if err := writeFileAtomic(gateConfigPath, data, 0o600); err != nil {
 		return fmt.Errorf("write gate config: %w", err)
 	}
-	if len(cfg.Domains) == 0 {
+	if !gated {
 		if err := gateSignalFn(); err != nil {
 			log.Printf("proxy_config: auth gate reload signal (no gated domains): %v", err)
 		}
@@ -165,6 +178,60 @@ func applyGateConfig(cfg gateConfig) error {
 		return fmt.Errorf("auth gate did not load the new config within %s (reload signal failed: %v; last status: %s)", gateLoadTimeout, sigErr, last)
 	}
 	return fmt.Errorf("auth gate did not load the new config within %s (last status: %s)", gateLoadTimeout, last)
+}
+
+// gateConfigSnapshot is the gate config file as it was before a
+// proxy_config op touched it, so a failed op can put it back.
+type gateConfigSnapshot struct {
+	data   []byte
+	exists bool
+}
+
+// snapshotGateConfig reads the current gate config file. A missing file
+// is a valid (deny-all) state and is recorded as such.
+func snapshotGateConfig() (gateConfigSnapshot, error) {
+	data, err := os.ReadFile(gateConfigPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return gateConfigSnapshot{}, nil
+	}
+	if err != nil {
+		return gateConfigSnapshot{}, err
+	}
+	return gateConfigSnapshot{data: data, exists: true}, nil
+}
+
+// restoreGateConfig puts the gate config back to snap the same way a
+// normal apply does (atomic write, SIGHUP, and for a config that gates
+// anything, waiting until the gate reports exactly those bytes), so the
+// gate again knows every domain the previous Caddy config forward_auths.
+// No-op when the file already holds snap. A snapshot of a missing file
+// removes the file (the gate then denies everything, as before).
+//
+// The docker calls run under a fresh deadline (gateLoadTimeout plus the
+// cleanup budget): restoring is cleanup and must work even when the op
+// deadline is what made the Caddy step fail.
+func restoreGateConfig(snap gateConfigSnapshot) error {
+	cur, err := snapshotGateConfig()
+	if err == nil && cur.exists == snap.exists && bytes.Equal(cur.data, snap.data) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gateLoadTimeout+cleanupTimeout)
+	defer cancel()
+	restoreCtx := setOpContext(ctx)
+	defer restoreCtx()
+
+	if !snap.exists {
+		if err := os.Remove(gateConfigPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove gate config: %w", err)
+		}
+		if err := gateSignalFn(); err != nil {
+			log.Printf("proxy_config: auth gate reload signal (restored missing config): %v", err)
+		}
+		return nil
+	}
+	var cfg gateConfig
+	gated := json.Unmarshal(snap.data, &cfg) == nil && len(cfg.Domains) > 0
+	return applyGateConfigBytes(snap.data, gated)
 }
 
 // ensureGateDir creates the gate's state dir owned by the agent, 0700.

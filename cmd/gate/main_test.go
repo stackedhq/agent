@@ -467,8 +467,27 @@ func TestSafeRedirect(t *testing.T) {
 		"evil.com":                             "/",
 		"/\t/evil.com":                         "/",
 		"/\n/evil.com":                         "/",
-		"/a/b//c":                              "/a/b//c",
+		"/a/b//c":                              "/a/b/c",
 		"/" + strings.Repeat("a", maxRedirect): "/",
+		"/./\\evil.com":                        "/",
+		"/.%5Cevil.com":                        "/",
+		"/.%5cevil.com":                        "/",
+		"/%2F/evil.com":                        "/",
+		"/%2f%2fevil.com":                      "/",
+		"/a/../\\evil":                         "/",
+		"//evil":                               "/",
+		"/\\evil":                              "/",
+		"/ok?x=1":                              "/ok?x=1",
+		"/ok?x=1&y=%2F":                        "/ok?x=1&y=%2F",
+		"/ok?next=//evil":                      "/ok?next=//evil",
+		"/ok?x=a\\b":                           "/",
+		"/%09/evil.com":                        "/",
+		"/%zz":                                 "/",
+		"/a/./b/../c/":                         "/a/c/",
+		"/a/..//evil":                          "/evil",
+		"/../evil":                             "/evil",
+		"/app/":                                "/app/",
+		"/.":                                   "/",
 	}
 	for in, want := range cases {
 		if got := SafeRedirect(in); got != want {
@@ -477,9 +496,26 @@ func TestSafeRedirect(t *testing.T) {
 	}
 }
 
+// TestSafeRedirectSurvivesHTTPRedirect checks the Location header that
+// http.Redirect actually emits (it runs path.Clean itself) is never
+// scheme-relative or backslashed.
+func TestSafeRedirectSurvivesHTTPRedirect(t *testing.T) {
+	for _, rd := range []string{
+		"/./\\evil.com", "/.%5Cevil.com", "/%2F/evil.com", "/a/../\\evil",
+		"//evil", "/\\evil", "/a/..//evil", "/.//evil", "/ok?x=1",
+	} {
+		rec := httptest.NewRecorder()
+		http.Redirect(rec, httptest.NewRequest(http.MethodPost, "/", nil), SafeRedirect(rd), http.StatusFound)
+		loc := rec.Header().Get("Location")
+		if !strings.HasPrefix(loc, "/") || strings.HasPrefix(loc, "//") || strings.ContainsRune(loc, '\\') {
+			t.Errorf("rd %q -> Location %q", rd, loc)
+		}
+	}
+}
+
 func TestLoginRejectsOpenRedirect(t *testing.T) {
 	f := newFixture(t)
-	for _, rd := range []string{"//evil.com", "/\\evil.com", "https://evil.com"} {
+	for _, rd := range []string{"//evil.com", "/\\evil.com", "https://evil.com", "/./\\evil.com", "/.%5Cevil.com", "/%2F/evil.com"} {
 		rec := f.do(t, loginPost(testDomain, "admin", "hunter22", rd, "203.0.113.5"))
 		if rec.Code != http.StatusFound {
 			t.Fatalf("rd %q: status %d", rd, rec.Code)

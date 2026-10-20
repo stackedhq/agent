@@ -45,6 +45,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -410,23 +411,55 @@ func (s *Server) validateCookie(value, domain string, g DomainGate) bool {
 
 // --- Redirect target ---
 
-// SafeRedirect returns rd if it's a same-origin absolute path (single
-// leading '/', not '//' or '/\', no control characters), else "/".
+// SafeRedirect returns rd canonicalised if it's a same-origin absolute
+// path, else "/". It rejects anything containing a backslash (raw or
+// percent-decoded: browsers treat '\' as '/'), control characters (raw
+// or decoded: browsers strip tab/CR/LF), a leading "//" (raw or decoded),
+// and invalid percent-encoding. The path part is then cleaned with
+// path.Clean (trailing slash kept, query/fragment preserved verbatim) and
+// re-checked, so http.Redirect's own path.Clean can't turn an accepted
+// value like "/./\evil.com" into the scheme-relative "/\evil.com".
 func SafeRedirect(rd string) string {
-	if rd == "" || len(rd) > maxRedirect || rd[0] != '/' {
+	if rd == "" || len(rd) > maxRedirect || !redirectCharsOK(rd) {
 		return "/"
 	}
-	if len(rd) > 1 && (rd[1] == '/' || rd[1] == '\\') {
+	decoded, err := url.PathUnescape(rd)
+	if err != nil || !redirectCharsOK(decoded) {
 		return "/"
 	}
-	for _, c := range rd {
-		// Browsers strip tab/CR/LF from URLs, so "/\t/evil" would turn
-		// into "//evil". Reject all control characters.
-		if c < 0x20 || c == 0x7f {
-			return "/"
+	if !singleLeadingSlash(rd) || !singleLeadingSlash(decoded) {
+		return "/"
+	}
+
+	p, rest := rd, ""
+	if i := strings.IndexAny(rd, "?#"); i >= 0 {
+		p, rest = rd[:i], rd[i:]
+	}
+	clean := path.Clean(p)
+	if strings.HasSuffix(p, "/") && clean != "/" {
+		clean += "/"
+	}
+	if !singleLeadingSlash(clean) {
+		return "/"
+	}
+	return clean + rest
+}
+
+// redirectCharsOK reports whether s has no backslash and no control
+// characters.
+func redirectCharsOK(s string) bool {
+	for _, c := range s {
+		if c == '\\' || c < 0x20 || c == 0x7f {
+			return false
 		}
 	}
-	return rd
+	return true
+}
+
+// singleLeadingSlash reports whether s is an absolute path that isn't
+// scheme-relative ("//host").
+func singleLeadingSlash(s string) bool {
+	return len(s) > 0 && s[0] == '/' && (len(s) == 1 || s[1] != '/')
 }
 
 // --- Client IP / rate limit ---

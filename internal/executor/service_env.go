@@ -252,7 +252,8 @@ func writeServiceEnvFile(dir string, env map[string]string) (dockerRunEnv, strin
 }
 
 // syncLegacyEnvFile is cleanupLegacyEnvFile for deploy paths that don't
-// rewrite docker-compose.yml (blue/green). While an older compose file
+// rewrite docker-compose.yml up front (blue/green rewrites it only after
+// the traffic flip, see refreshBlueGreenCompose). While an older compose file
 // still lists `.env` as `env_file:`, a later `compose restart`/`up -d`
 // (restart op fallback) would start the container with whatever `.env`
 // holds, so it's rewritten (0600) with the current values in the format
@@ -274,8 +275,8 @@ func syncLegacyEnvFile(dir string, env map[string]string) error {
 
 // cleanupLegacyEnvFile removes the pre-stacked.env `.env` from a service dir
 // once the compose file no longer references it. If an older compose file
-// still lists it as `env_file:` (e.g. a blue/green deploy, which doesn't
-// rewrite the compose file; see syncLegacyEnvFile), the file is kept so
+// still lists it as `env_file:` (e.g. a blue/green deploy that failed
+// before rewriting the compose file; see syncLegacyEnvFile), the file is kept so
 // `compose restart`/`up` keep working, but its mode is tightened to 0600.
 func cleanupLegacyEnvFile(dir string) error {
 	envPath := filepath.Join(dir, legacyEnvFileName)
