@@ -84,7 +84,9 @@ If a release changes an embedded template and you want it to land on existing in
 - Use `pnpm` / `bun` only in the server repo — this is pure Go
 - Standard library over external dependencies
 - No external frameworks — just `net/http`, `os/exec`, `encoding/json`
-- Agent runs as `stacked` user (not root) with write access to `/opt/stacked/`
+- Agent runs as `stacked` user (not uid 0) with write access to `/opt/stacked/`
+- `stacked` is in the `docker` group. That is root-equivalent on the host. systemd hardening does not contain a process that can talk to rootful `dockerd`. See `docs/trust-boundary.md`.
+- Do not "fix" this with rootless Docker (breaks :80/:443, `stacked` bridge + `host-gateway`, custom binds, existing volume data). The planned reduction is a narrow Engine-API helper and dropping `docker` group membership. That is a `REQUIRES-REINSTALL` installer change; self-update cannot `usermod`.
 - Systemd manages the process: `Restart=always`, `RestartSec=5`
 
 ## Key Patterns
