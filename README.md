@@ -59,6 +59,33 @@ Get your token from the Stacked dashboard under **Machines → Add Machine**.
 | `proxy_config` | Regenerate Caddyfile, reload Caddy |
 | `self_update` | Download a signed release from GitHub, verify it, replace, restart |
 
+## Domains and certificates
+
+Each domain row in `proxy_config` becomes one Caddy site block. By default Caddy gets
+a certificate from Let's Encrypt (eagerly, or on the first request for rows with
+`onDemandTls`, after asking the Stacked server whether the hostname is allowed).
+
+A row with `"tlsMode": "internal"` gets `tls internal` instead: Caddy signs the
+certificate with its own local CA and never contacts Let's Encrypt. This is the only
+way the agent serves a **wildcard** domain (`*.example.com`, a single leading `*`
+label), which is meant for zones proxied by Cloudflare:
+
+- In Cloudflare, add a proxied (orange cloud) `A` record named `*` pointing to the
+  machine's IP, and set SSL/TLS mode to **Full**.
+- Browsers get Cloudflare's edge certificate, which covers `*.example.com`.
+- Cloudflare connects to the machine over HTTPS and accepts Caddy's internal
+  certificate. **Full (strict)** would reject it, because it isn't signed by a public
+  CA.
+- No Let's Encrypt certificate is issued for the wildcard, so there is nothing per
+  subdomain and no rate limit to hit.
+
+The upstream receives the original `Host` header (Caddy's `reverse_proxy` default), so
+one service can route on the subdomain. A concrete host under the wildcard
+(`api.example.com`) keeps its own site block and certificate, and Caddy prefers it.
+The agent refuses (skips, with a log line) a wildcard row without `tlsMode: internal`,
+any other wildcard shape (`*.com`, `a.*.example.com`), and a wildcard on a service
+with the password gate, since the gate works per concrete hostname.
+
 ## Verifying releases
 
 Every release publishes five files:

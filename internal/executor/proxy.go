@@ -192,6 +192,16 @@ type cachedDomain struct {
 	// older payloads → false → eager issuance (unchanged behavior).
 	OnDemandTLS bool `json:"onDemandTls,omitempty"`
 
+	// TLS mode (server agent-feature WILDCARD_DOMAINS+). "internal"
+	// makes the site block `tls internal`: Caddy signs the host's
+	// certificate with its own local CA and never contacts an ACME CA.
+	// It's the only mode that allows a wildcard host (`*.example.com`),
+	// which is meant to sit behind Cloudflare's proxy: Cloudflare's edge
+	// certificate covers browsers, and Cloudflare accepts the internal
+	// origin certificate under SSL mode "Full". Empty (absent on older
+	// payloads) keeps the default automatic HTTPS.
+	TLSMode string `json:"tlsMode,omitempty"`
+
 	// Auth gate fields. When AuthGateMode is non-empty, Caddy emits
 	// forward_auth to the gate sidecar for this domain.
 	AuthGateMode         string `json:"authGateMode,omitempty"`
@@ -227,6 +237,27 @@ func (d cachedDomain) effectiveStripPrefix() bool {
 // host:port rather than a Stacked-managed service container.
 func (d cachedDomain) isPortBound() bool {
 	return d.ServiceID == "" && d.Host != "" && d.Port > 0
+}
+
+// tlsModeInternal is the only non-default TLSMode: Caddy's local CA
+// (`tls internal`) instead of ACME.
+const tlsModeInternal = "internal"
+
+// internalTLS reports whether the row asks for Caddy's internal CA.
+func (d cachedDomain) internalTLS() bool {
+	return d.TLSMode == tlsModeInternal
+}
+
+// parseTLSMode keeps only the TLS modes this agent knows how to
+// render. Anything else collapses to "" (automatic HTTPS), which also
+// means a wildcard row with an unknown mode is refused by
+// validateDomainRow instead of being rendered without a certificate
+// strategy Caddy could satisfy.
+func parseTLSMode(v string) string {
+	if v == tlsModeInternal {
+		return tlsModeInternal
+	}
+	return ""
 }
 
 // ReconcileProxy brings the on-disk proxy compose file and Caddy
@@ -677,6 +708,10 @@ func parseDomains(raw []interface{}) []cachedDomain {
 		// On-demand TLS flag. Absent → false (eager issuance).
 		onDemand, _ := dm["onDemandTls"].(bool)
 
+		// TLS mode. Absent → "" (automatic HTTPS).
+		rawTLSMode, _ := dm["tlsMode"].(string)
+		tlsMode := parseTLSMode(rawTLSMode)
+
 		// Auth gate fields.
 		authGateMode, _ := dm["authGateMode"].(string)
 		authGateUsername, _ := dm["authGateUsername"].(string)
@@ -697,6 +732,7 @@ func parseDomains(raw []interface{}) []cachedDomain {
 				Path:                 path,
 				StripPrefix:          stripPtr,
 				OnDemandTLS:          onDemand,
+				TLSMode:              tlsMode,
 				AuthGateMode:         authGateMode,
 				AuthGateUsername:     authGateUsername,
 				AuthGatePasswordHash: authGatePasswordHash,
@@ -717,6 +753,7 @@ func parseDomains(raw []interface{}) []cachedDomain {
 				Path:        path,
 				StripPrefix: stripPtr,
 				OnDemandTLS: onDemand,
+				TLSMode:     tlsMode,
 			})
 		default:
 			// Neither shape fully populated; skip.
@@ -726,8 +763,9 @@ func parseDomains(raw []interface{}) []cachedDomain {
 	return out
 }
 
-// caddyDomainRe is a strict hostname: lowercase LDH labels (no
-// wildcard; the server never sends one). Length is checked separately.
+// caddyDomainRe is a strict hostname: lowercase LDH labels, no
+// wildcard. Length is checked separately. Wildcard hosts go through
+// validCaddyWildcard instead.
 var caddyDomainRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // caddyPathUnsafe are the characters (besides whitespace and control
@@ -746,6 +784,27 @@ const maxCaddyPathLen = 1024
 
 func validCaddyDomain(d string) bool {
 	return len(d) <= 253 && caddyDomainRe.MatchString(d)
+}
+
+// wildcardPrefix is the one wildcard shape we accept: a single leading
+// `*` label (`*.example.com`). Caddy matches it against exactly one
+// label, so `*.example.com` serves `a.example.com` but not
+// `b.a.example.com` or `example.com`.
+const wildcardPrefix = "*."
+
+func isWildcardDomain(d string) bool {
+	return strings.HasPrefix(d, wildcardPrefix)
+}
+
+// validCaddyWildcard accepts `*.` followed by a strict hostname of at
+// least two labels, so `*.com` (a whole TLD) and `**.example.com` /
+// `*.*.example.com` / `a.*.example.com` are refused.
+func validCaddyWildcard(d string) bool {
+	if !isWildcardDomain(d) || len(d) > 253 {
+		return false
+	}
+	base := strings.TrimPrefix(d, wildcardPrefix)
+	return strings.Count(base, ".") >= 1 && caddyDomainRe.MatchString(base)
 }
 
 func validCaddyPath(p string) bool {
@@ -776,8 +835,26 @@ func caddyPathMatcher(path string) string {
 
 // validateDomainRow checks that a row's domain and path are safe to
 // splice into the Caddyfile.
+//
+// A wildcard host is accepted only with internal TLS: without it Caddy
+// would try to get a wildcard certificate from Let's Encrypt, which
+// needs a DNS challenge this agent can't answer. It also can't be
+// gated: the auth gate keys its config and session cookies on one
+// concrete hostname, so a gated wildcard would answer 403 everywhere.
+// The row is refused instead (and the server refuses that combination
+// up front).
 func validateDomainRow(d cachedDomain) error {
-	if !validCaddyDomain(d.Domain) {
+	if isWildcardDomain(d.Domain) {
+		if !validCaddyWildcard(d.Domain) {
+			return fmt.Errorf("invalid wildcard domain %q: only a single leading *. label is allowed", d.Domain)
+		}
+		if !d.internalTLS() {
+			return fmt.Errorf("wildcard domain %s requires tlsMode %q", d.Domain, tlsModeInternal)
+		}
+		if d.AuthGateMode != "" {
+			return fmt.Errorf("wildcard domain %s can't use the auth gate", d.Domain)
+		}
+	} else if !validCaddyDomain(d.Domain) {
 		return fmt.Errorf("invalid domain %q", d.Domain)
 	}
 	if !validCaddyPath(d.effectivePath()) {
@@ -878,6 +955,10 @@ func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot
 	// is a per-hostname (TLS) concern, not per-path, so we OR the flag
 	// across the rows that share a hostname.
 	onDemandHost := make(map[string]bool)
+	// Likewise a host uses Caddy's internal CA if any of its rows ask
+	// for it. Internal TLS wins over on-demand: an internal certificate
+	// needs no ACME issuance, so there's nothing to defer or `ask`.
+	internalHost := make(map[string]bool)
 	for _, d := range parsed {
 		if err := validateDomainRow(d); err != nil {
 			return "", err
@@ -889,6 +970,12 @@ func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot
 		if d.OnDemandTLS {
 			onDemandHost[d.Domain] = true
 		}
+		if d.internalTLS() {
+			internalHost[d.Domain] = true
+		}
+	}
+	for host := range internalHost {
+		delete(onDemandHost, host)
 	}
 
 	// Global options block for on-demand TLS. Caddy requires the
@@ -931,6 +1018,14 @@ func generateCaddyfileChecked(parsed []cachedDomain, state map[string]slots.Slot
 		})
 
 		fmt.Fprintf(&b, "%s {\n", host)
+
+		// Internal TLS: Caddy signs this host's certificate with its
+		// local CA (a wildcard certificate for a wildcard host). No
+		// ACME, no `ask`, no rate limits. Concrete hosts under a
+		// wildcard keep their own site block, which Caddy prefers.
+		if internalHost[host] {
+			b.WriteString("    tls internal\n")
+		}
 
 		// On-demand TLS for this host: defer issuance to the first
 		// live request, gated by the global `ask` endpoint. Only
